@@ -1,0 +1,14 @@
+.gradle/
+**/build/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.superpowers/
+dist/
+.env
+.env.*
+!.env.example
+**/e2e_config.json
+*.local.json
+*-result.json
