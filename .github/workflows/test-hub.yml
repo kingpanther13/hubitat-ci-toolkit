@@ -61,11 +61,21 @@ jobs:
         run: python3 scripts/run_e2e.py --config "e2e/${SCENARIO}.json" --validate-only
       - name: Acquire the hub lease
         id: lease
-        run: bash scripts/lease_acquire.sh "ci-run-${GITHUB_RUN_ID}"
+        # The preserved upstream scripts can print remote lease values. Keep their
+        # output out of public logs while preserving the acquisition exit status.
+        run: |
+          if bash scripts/lease_acquire.sh "ci-run-${GITHUB_RUN_ID}" >/dev/null 2>&1; then
+            echo 'Hub lease acquired.'
+          else
+            echo '::error::Lease acquisition failed. Check watchdog reachability and the lease Hub Variable.'
+            exit 1
+          fi
       - name: Run configured scenario and cleanup
         env:
           SCENARIO: ${{ inputs.scenario }}
         run: python3 scripts/run_e2e.py --config "e2e/${SCENARIO}.json"
       - name: Release our lease
         if: always() && steps.lease.outcome == 'success'
-        run: bash scripts/lease_release.sh "ci-run-${GITHUB_RUN_ID}"
+        run: |
+          bash scripts/lease_release.sh "ci-run-${GITHUB_RUN_ID}" >/dev/null 2>&1
+          echo 'Lease release attempted. Unconfirmed releases remain bounded by the 30-minute TTL.'

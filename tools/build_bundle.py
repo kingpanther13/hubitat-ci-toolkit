@@ -45,6 +45,15 @@ def build_bundle(manifest: Path, output: Path) -> str:
             raise ValueError('output must not overwrite an input')
         payloads[path.name] = path.read_bytes()
         lines.append(f"{entry['type']} {path.name}")
+    # Preserve the project's license in distributed source bundles when present.
+    license_path = root / 'LICENSE'
+    if license_path.exists():
+        resolved_license = license_path.resolve()
+        if not resolved_license.is_relative_to(root):
+            raise ValueError('license must stay inside the manifest directory')
+        if output == resolved_license:
+            raise ValueError('output must not overwrite the license')
+        payloads['LICENSE'] = license_path.read_bytes()
     install = ('\n'.join(lines) + '\n').encode('utf-8')
     payloads['install.txt'] = install
     payloads['update.txt'] = install

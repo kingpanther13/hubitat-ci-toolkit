@@ -20,6 +20,8 @@ class FakeHub:
         self.lease = dict(LEASE)
         self.calls = []
         self.fail_tools = set()
+        self.responses = {}
+        self.lose_lease_on_write = False
 
     def tool(self, tool, args):
         self.calls.append((tool, args))
@@ -27,6 +29,10 @@ class FakeHub:
             return {"value": json.dumps(self.lease)}
         if tool in self.fail_tools:
             raise MCPError("transport failed")
+        if tool == "write" and self.lose_lease_on_write:
+            self.lease = {"by": "other", "until": 1800001}
+        if tool in self.responses:
+            return self.responses[tool]
         if tool == "read":
             return {"source": "original", "hasMore": False}
         return {"success": True}
@@ -119,6 +125,23 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(RunError):
             self.runner(data).run()
         self.assertFalse(any(name in {"write", "restore"} for name, _ in self.hub.calls))
+
+    def test_lost_lease_blocks_cleanup_writes_and_fails_the_run(self):
+        self.hub.lose_lease_on_write = True
+        with self.assertRaises(RunError) as caught:
+            self.runner().run()
+        self.assertIn("cleanup", str(caught.exception))
+        self.assertFalse(any(name == "restore" for name, _ in self.hub.calls))
+
+    def test_domain_failure_and_wrong_json_type_fail_assertions_and_still_restore(self):
+        for result in ({"success": False, "error": "SECRET"}, {"success": 1}, {}):
+            self.hub.calls = []
+            self.hub.responses["write"] = result
+            with self.assertRaises(RunError) as caught:
+                self.runner().run()
+            self.assertIn("test", str(caught.exception))
+            self.assertNotIn("SECRET", str(caught.exception))
+            self.assertEqual(self.hub.calls[-1], ("restore", {"source": "original"}))
 
     def test_missing_environment_or_file_in_cleanup_fails_before_network(self):
         for replacement in ["${ENV:MISSING}", {"$file": "missing.groovy"}]:
