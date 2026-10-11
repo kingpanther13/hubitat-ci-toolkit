@@ -1,0 +1,5664 @@
+#!/usr/bin/env python3
+"""
+Hubitat Groovy Sandbox Linter
+
+Scans .groovy files for patterns known to crash at runtime in the Hubitat
+sandbox even though they compile fine. Also checks version consistency
+across project files.
+
+Exit 0 = clean, exit 1 = errors found.
+Outputs GitHub Actions annotations when running in CI.
+"""
+
+import hashlib
+import importlib.util
+import os
+import re
+import sys
+from pathlib import Path
+
+# Force UTF-8 on stdout/stderr so prints containing em dashes, arrows, and
+# other non-ASCII characters in messages don't crash on Windows consoles
+# whose default codepage is cp1252. The lint runs cleanly on Linux/macOS
+# (already UTF-8), CI (also UTF-8), and Windows terminals that respect
+# the env var; the only failure mode this fixes is a Windows local run
+# where the contributor doesn't pre-set PYTHONIOENCODING. errors=replace
+# (rather than strict) keeps a single mis-encoded character from masking
+# whatever the lint was actually trying to report.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Glob the whole libraries/ dir (not a hardcoded list) so every library module the app
+# #includes is sandbox-scanned automatically -- when real code (e.g. the RM tools) moves into
+# its own library file under the issue #209 modularization, the lint covers it with no edit here.
+GROOVY_FILES = [
+    REPO_ROOT / "hubitat-mcp-server.groovy",
+    REPO_ROOT / "hubitat-mcp-rule.groovy",
+    # Standalone e2e watchdog app: it runs in the Hubitat sandbox on the e2e hub, so lint it for
+    # forbidden patterns here rather than discovering a violation only at live install time.
+    # The v1 and v2 watchdogs are retired: not deployed, linted or tested. Their files stay so a
+    # revert of #485's e2e scripts could bring v2 back (re-enable together with the @Ignore on their
+    # specs); the hub keeps its v2 instance disabled.
+    # REPO_ROOT / "e2e-deadman-watchdog.groovy",
+    # REPO_ROOT / "e2e-deadman-watchdog-v2.groovy",
+    REPO_ROOT / "e2e-deadman-watchdog-v3.groovy",
+    *sorted((REPO_ROOT / "libraries").glob("*.groovy")),
+]
+
+VERSION_SOURCES = {
+    "hubitat-mcp-server.groovy header": {
+        "file": REPO_ROOT / "hubitat-mcp-server.groovy",
+        "pattern": r"^\s*\*\s*Version:\s*(\d+\.\d+\.\d+)",
+    },
+    "hubitat-mcp-server.groovy currentVersion()": {
+        "file": REPO_ROOT / "hubitat-mcp-server.groovy",
+        "pattern": r'def\s+currentVersion\s*\(\)\s*\{\s*\n\s*return\s+"(\d+\.\d+\.\d+)"',
+        "multiline": True,
+    },
+    "packageManifest.json version": {
+        "file": REPO_ROOT / "packageManifest.json",
+        "pattern": r'"version"\s*:\s*"(\d+\.\d+\.\d+)"',
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Anti-pattern rules
+# ---------------------------------------------------------------------------
+
+# Every call shape that hands a path literal to the hub's local HTTP client, matched up to (not
+# including) the path literal's opening quote: the hubInternal* client entry points, the
+# _hubRequest core (path is its SECOND argument, after the method), and the path-forwarding
+# wrappers around them. Both path-sensitive rules anchor on it (SANDBOX-016's querystring check
+# and the device-tool access gate's endpoint match), and check_native_request_wrappers derives
+# the wrapper inventory from the source so a new wrapper cannot silently fall outside either.
+NATIVE_REQUEST_PATH_CALL = (
+    r"(?:(?:hubInternal\w*|_radioGet(?:Safe)?|_radioPost|_modePost)\(\s*"
+    r"|_hubRequest\(\s*['\"][A-Z]+['\"]\s*,\s*)"
+)
+
+RULES = [
+    {
+        # Match both `getClass()` invocations and bare property-access form
+        # (`obj.getClass` in a GString triggers the no-arg method at runtime).
+        "id": "SANDBOX-001",
+        "pattern": r"\bgetClass\b",
+        "message": "getClass() blocked in Hubitat sandbox -- for a class name use getObjectClassName(obj) (firmware 2.5.2+) or the _typeName(obj) helper",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-002",
+        "pattern": r"\bLocale\s*\.\s*\w+",
+        "message": "Locale class not available in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-003",
+        "pattern": r"\.format\s*\([^)]*,\s*Locale",
+        "message": "Date.format(String, Locale) overload not available in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-004",
+        "pattern": r"\blog\s*\.\s*is\w+Enabled\s*\(",
+        "message": "log.is*Enabled() not available in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-005",
+        "pattern": r"\bEval\s*\.\s*(?:me|x|xy)\s*\(",
+        "message": "Eval not available in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-006",
+        "pattern": r"\bnew\s+Thread\b",
+        "message": "Thread creation blocked in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-007",
+        "pattern": r"\bClass\s*\.\s*forName\s*\(|\.newInstance\s*\(",
+        "message": "Reflection (Class.forName / newInstance) blocked in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-008",
+        "pattern": r"\bjava\s*\.\s*io\s*\.\s*File\b|\bnew\s+File\s*\(",
+        "message": "Filesystem access blocked in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-009",
+        "pattern": r"\bRuntime\s*\.\s*exec\s*\(|\bProcessBuilder\b",
+        "message": "Process execution blocked in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-010",
+        "pattern": r"\batomicState\s*\.\s*\w+\s*\[.*\]\s*=",
+        "message": "Nested atomicState mutation does not persist — assign the whole map back",
+        "severity": "warning",
+    },
+    {
+        "id": "SANDBOX-011",
+        "pattern": r"\bnew\s+.*HubAction\b",
+        "message": "HubAction only valid in drivers, not apps",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-012",
+        "pattern": r"\bnew\s+(?:java\s*\.\s*util\s*\.\s*)?ArrayDeque\s*\(",
+        "message": "ArrayDeque instantiation blocked in Hubitat sandbox at parse time -- use Groovy list literal `[]` (ArrayList-backed; use add(value)/remove(size() - 1) for LIFO semantics)",
+        "severity": "error",
+    },
+    {
+        "id": "SANDBOX-013",
+        "pattern": r"\bnew\s+(?:groovy\s*\.\s*lang\s*\.\s*)?GroovyShell\b|\bGroovyShell\s*\.",
+        "message": "GroovyShell blocked in Hubitat sandbox",
+        "severity": "error",
+    },
+    {
+        # The hub runs Groovy 2.4 (antlr2 parser), which rejects a bare `{ ... }`
+        # block immediately after a `case X:` label as an ambiguous
+        # parameterless-closure-vs-open-block. hubitat_ci's Groovy 3.0 (Parrot)
+        # parser accepts it, so the Spock suite compiles clean while the real hub
+        # refuses to save the app ("Ambiguous expression could be either a
+        # parameterless closure expression or an isolated open code block").
+        # Extract the case body into a helper method (or drop the wrapping braces
+        # and declare no locals) so dispatch cases stay plain statements.
+        "id": "SANDBOX-014",
+        "pattern": r"\bcase\b[^:]*:\s*\{",
+        "message": "Bare '{ }' block right after 'case X:' is rejected by the hub's Groovy 2.4 parser (ambiguous closure vs open block) even though hubitat_ci's Groovy 3.0 accepts it -- extract the case body to a method or remove the braces",
+        "severity": "error",
+    },
+    {
+        # The Hubitat sandbox forbids referencing a java.io stream/reader/writer class as a
+        # ClassExpression (e.g. `instanceof InputStream`, a cast, or a typed declaration). The hub
+        # rejects the app at PARSE time: "Expression [ClassExpression] is not allowed:
+        # java.io.InputStream". Both hubitat_ci's Groovy 3.0 (real JVM) and a plain regex compile
+        # such code fine, so ONLY a real-hub deploy catches it otherwise -- which is exactly how an
+        # `instanceof InputStream` shipped this far. Duck-type instead: branch on byte[]/CharSequence
+        # and read remaining bodies via `.bytes` / `.text` (see _readRespText), never naming the
+        # class. Scans run on comment/string-stripped source, so doc mentions of these classes are
+        # unaffected. (This is a curated list of the realistic accidental classes; the real-hub e2e
+        # deploy remains the comprehensive compile gate for sandbox ClassExpressions not listed here.)
+        "id": "SANDBOX-015",
+        "pattern": r"\b(?:InputStream|OutputStream|FileInputStream|FileOutputStream|ByteArrayInputStream|ByteArrayOutputStream|DataInputStream|DataOutputStream|BufferedInputStream|BufferedOutputStream|BufferedReader|BufferedWriter|FileReader|FileWriter|InputStreamReader|OutputStreamWriter|RandomAccessFile|PushbackInputStream|PrintStream|PrintWriter)\b",
+        "message": "java.io stream/reader/writer class referenced as a ClassExpression -- blocked by the Hubitat sandbox at parse time ('ClassExpression not allowed'). Duck-type instead: branch on byte[]/CharSequence and read via .bytes/.text rather than naming the class (e.g. avoid `instanceof InputStream`).",
+        "severity": "error",
+    },
+    {
+        # The platform client escapes a '?' in `path` into literal path content: EXACT hub routes
+        # then 404 (live, fw 2.5.0.159) while WILDCARD routes mask it by absorbing the junk, which
+        # is how it hid. The query map is mandatory and also does the URL-encoding.
+        #
+        # `raw: True` -- the match target sits inside a string literal the normal stripped scan
+        # removes; raw scanning drops line AND block comments first so _hubRequest's docblock is
+        # not flagged as the anti-pattern it documents. '?' must precede any '${' (so a ternary in
+        # an interpolation is not a false positive) and both quote styles match. Static gaps, all
+        # covered by the RUNTIME guard: '?' after an interpolation, a variable-built path, a
+        # direct _hubRequest call.
+        "id": "SANDBOX-016",
+        "pattern": NATIVE_REQUEST_PATH_CALL + r"""(?:"[^"$]*\?|'[^'$]*\?)""",
+        "message": "Querystring embedded in a hub-request PATH. The platform client escapes the '?' into the literal path -- exact hub routes 404 and wildcard routes silently swallow it. Pass the parameters as the query map instead, e.g. hubInternalGet('/device/updateLabel', [deviceId: id, label: name]), and do NOT pre-encode the values (the query map encodes them; pre-encoding double-encodes).",
+        "severity": "error",
+        "raw": True,
+    },
+    {
+        # The sandbox refuses `x.methods` as a property read, even on a parsed JSON Map ("Subscript
+        # property 'methods' is not allowed from app or driver code", live, fw 2.5.2.129) -- the
+        # hubitat_ci harness does not, so only a hub catches it. Map.get("methods") is allowed.
+        "id": "SANDBOX-017",
+        "pattern": r"\.methods\b(?!\s*\()",
+        "message": "`.methods` property read is blocked by the Hubitat sandbox at runtime, even on a Map. Use map.get(\"methods\").",
+        "severity": "error",
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Comment/string stripping
+# ---------------------------------------------------------------------------
+
+
+_BARE_GSTRING_IDENT_START = re.compile(r"[A-Za-z_]")
+_BARE_GSTRING_IDENT_CHAR = re.compile(r"[A-Za-z0-9_]")
+
+
+def _consume_bare_gstring_var(text: str, start: int) -> tuple[str, int]:
+    """Consume a bare `$identifier[.identifier]*` GString reference.
+
+    Assumes `text[start] == '$'` and `text[start + 1]` is an identifier
+    start character. Returns (preserved_text, index_past_end). The leading
+    `$` is blanked (we only care about what follows for rule matching) but
+    the identifier chain is preserved verbatim so rules like SANDBOX-001
+    can match `$foo.getClass` (a legal bare-form Groovy property access
+    that triggers the no-arg method at runtime).
+    """
+    n = len(text)
+    out = [" "]  # blank the $
+    k = start + 1
+    # First identifier
+    while k < n and _BARE_GSTRING_IDENT_CHAR.match(text[k]):
+        out.append(text[k])
+        k += 1
+    # Subsequent .identifier segments
+    while (
+        k + 1 < n
+        and text[k] == "."
+        and _BARE_GSTRING_IDENT_START.match(text[k + 1])
+    ):
+        out.append(".")
+        k += 1
+        while k < n and _BARE_GSTRING_IDENT_CHAR.match(text[k]):
+            out.append(text[k])
+            k += 1
+    return "".join(out), k
+
+
+def _consume_gstring_interpolation(text: str, start: int) -> tuple[str, int]:
+    """Walk from `start` (index of `$` in `${`) to the matching `}`, returning
+    (preserved_text, index_past_close).
+
+    The body is preserved verbatim so downstream regex rules scan the Groovy
+    expression, except that nested string literals inside the body have their
+    contents blanked (so a `}` inside `"literal }"` doesn't close the
+    interpolation early, and a stray `getClass()` inside a nested literal
+    doesn't trigger a false positive).
+
+    Assumes `text[start] == '$'` and `text[start+1] == '{'`.
+    """
+    out = ["  "]  # ${
+    depth = 1
+    k = start + 2
+    n = len(text)
+    while k < n and depth > 0:
+        ch = text[k]
+        if ch == "{":
+            depth += 1
+            out.append(ch)
+            k += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                out.append(" ")  # closing }
+                k += 1
+                break
+            out.append(ch)
+            k += 1
+        elif ch == '"' or ch == "'":
+            # Nested string literal inside the interpolation body. Skip past
+            # its contents (respecting escapes) so embedded `}` characters
+            # don't decrement our depth counter and stray sandbox-forbidden
+            # names inside literal text don't trigger false positives.
+            out.append(" ")
+            k += 1
+            while k < n:
+                if text[k] == "\\" and k + 1 < n:
+                    out.append("  ")
+                    k += 2
+                elif text[k] == ch:
+                    out.append(" ")
+                    k += 1
+                    break
+                else:
+                    out.append(" ")
+                    k += 1
+        elif ch == "\\" and k + 1 < n:
+            out.append(str(text[k]) + str(text[k + 1]))
+            k += 2
+        else:
+            out.append(ch)
+            k += 1
+    return "".join(out), k
+
+
+def strip_comments_and_strings(source: str) -> list[str]:
+    """Return lines with comments and literal string contents replaced.
+
+    Behavior:
+    - Block comments (/* ... */) → replaced with spaces (preserves line count)
+    - Line comments (// ...) → stripped from end of line
+    - Single-quoted strings ('...') → fully blanked (not GStrings in Groovy)
+    - Triple-single-quoted strings ('''...''') → fully blanked
+    - Double-quoted strings ("...") → literal text blanked; ${...}
+      interpolation bodies AND bare $identifier[.prop...] references are
+      preserved so rules scan the Groovy expression (e.g. ${foo.getClass()}
+      and $foo.getClass both trigger SANDBOX-001)
+    - Triple-double-quoted strings (\"\"\"...\"\"\") → same GString treatment
+      when closing on the same line; multi-line bodies fall back to blanked
+
+    Invariants:
+    - Output preserves the column and line count of the input so finding
+      line numbers match the original source.
+    - Spaces (not sentinel tokens like __STR__) are used so downstream regex
+      rules can't accidentally match the sentinel itself.
+
+    Known limitations (deliberate, not bugs):
+    - Slashy strings (/.../) and dollar-slashy ($/.../$/) are not recognized
+      as strings — their content is scanned as raw source. Rare in real
+      Hubitat code; the only existing use is a bare Pattern literal with no
+      interpolation. False positives would require literal sandbox-forbidden
+      names inside a regex body, which is implausible.
+    - Multi-line triple-quoted bodies (opening and closing on different
+      lines) are blanked wholesale.
+    """
+    lines = source.split("\n")
+    result: list[str] = []
+    in_block_comment = False
+
+    for line in lines:
+        if in_block_comment:
+            end = line.find("*/")
+            if end != -1:
+                in_block_comment = False
+                # Keep content after the block comment close
+                line = " " * (end + 2) + line[end + 2 :]
+            else:
+                result.append("")
+                continue
+
+        # Process the line character by character
+        cleaned = []
+        i = 0
+        while i < len(line):
+            # Block comment start
+            if line[i : i + 2] == "/*":
+                end = line.find("*/", i + 2)
+                if end != -1:
+                    cleaned.append(" " * (end + 2 - i))
+                    i = end + 2
+                else:
+                    in_block_comment = True
+                    break
+            # Line comment
+            elif line[i : i + 2] == "//":
+                break
+            # Triple-double-quoted GString (may contain ${...})
+            elif line[i : i + 3] == '"""':
+                end = line.find('"""', i + 3)
+                if end != -1:
+                    cleaned.append("   ")
+                    cleaned.append(_scrub_gstring_body(line[i + 3 : end]))
+                    cleaned.append("   ")
+                    i = end + 3
+                else:
+                    # Multi-line triple-quoted body — rare; fall back to blanks
+                    cleaned.append(" " * (len(line) - i))
+                    i = len(line)
+            # Triple-single-quoted (plain string, no interpolation)
+            elif line[i : i + 3] == "'''":
+                end = line.find("'''", i + 3)
+                if end != -1:
+                    cleaned.append(" " * (end + 3 - i))
+                    i = end + 3
+                else:
+                    cleaned.append(" " * (len(line) - i))
+                    i = len(line)
+            # Double-quoted GString — preserve ${...} bodies, blank literal text
+            elif line[i] == '"':
+                cleaned.append(" ")  # opening quote
+                j = i + 1
+                while j < len(line):
+                    if line[j] == "\\" and j + 1 < len(line):
+                        cleaned.append("  ")
+                        j += 2
+                    elif line[j] == '"':
+                        cleaned.append(" ")
+                        j += 1
+                        break
+                    elif line[j] == "$" and j + 1 < len(line) and line[j + 1] == "{":
+                        body, j = _consume_gstring_interpolation(line, j)
+                        cleaned.append(body)
+                    elif (
+                        line[j] == "$"
+                        and j + 1 < len(line)
+                        and _BARE_GSTRING_IDENT_START.match(line[j + 1])
+                    ):
+                        body, j = _consume_bare_gstring_var(line, j)
+                        cleaned.append(body)
+                    else:
+                        cleaned.append(" ")
+                        j += 1
+                i = j
+            # Single-quoted string — plain string in Groovy, no interpolation
+            elif line[i] == "'":
+                cleaned.append(" ")
+                j = i + 1
+                while j < len(line):
+                    if line[j] == "\\" and j + 1 < len(line):
+                        cleaned.append("  ")
+                        j += 2
+                    elif line[j] == "'":
+                        cleaned.append(" ")
+                        j += 1
+                        break
+                    else:
+                        cleaned.append(" ")
+                        j += 1
+                i = j
+            else:
+                cleaned.append(line[i])
+                i += 1
+
+        result.append("".join(cleaned))
+
+    return result
+
+
+def _scrub_gstring_body(body: str) -> str:
+    """Blank literal text in a triple-double-quoted GString body while
+    preserving ${...} interpolations and bare `$identifier[.prop...]`
+    references. Shares nested-string-aware brace handling with the
+    single-line GString walker via _consume_gstring_interpolation."""
+    out = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i] == "\\" and i + 1 < n:
+            out.append("  ")
+            i += 2
+        elif body[i] == "$" and i + 1 < n and body[i + 1] == "{":
+            preserved, i = _consume_gstring_interpolation(body, i)
+            out.append(preserved)
+        elif (
+            body[i] == "$"
+            and i + 1 < n
+            and _BARE_GSTRING_IDENT_START.match(body[i + 1])
+        ):
+            preserved, i = _consume_bare_gstring_var(body, i)
+            out.append(preserved)
+        else:
+            out.append(" ")
+            i += 1
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Scanning
+# ---------------------------------------------------------------------------
+
+RETIRED_PERSISTED_DERIVED_KEYS = (
+    "toolSearchCorpus",
+    "toolSearchTokens",
+    "toolSearchCorpusVersion",
+    "toolSearchCorpusFingerprint",
+    "requiredParamsByTool",
+    "requiredParamsByToolFingerprint",
+)
+_RETIRED_KEY_PATTERN = "|".join(map(re.escape, RETIRED_PERSISTED_DERIVED_KEYS))
+# Include compound writes while leaving equality and regex comparisons readable.
+_RETIRED_ASSIGNMENT = r"\s*(?:\*\*|>>>|>>|<<|[+\-*/%&|^])?=(?![=~])"
+_RETIRED_DOT_WRITE = re.compile(
+    rf"\b(?P<store>atomicState|state)\s*\??\.\s*(?P<key>{_RETIRED_KEY_PATTERN})\b"
+    r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+# The bracket regexes run on masked source, where a string literal is blanked to
+# spaces (quotes included); the key is recovered from the original line at the span.
+_RETIRED_BRACKET_WRITE = re.compile(
+    r"\b(?P<store>atomicState|state)\s*\[(?P<literal>[ \t]*)\]"
+    r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+_RETIRED_BRACKET_LITERAL = re.compile(
+    rf"\s*(?P<quote>['\"])(?P<key>{_RETIRED_KEY_PATTERN})(?P=quote)\s*"
+)
+_STATE_QUOTED_PROPERTY_WRITE = re.compile(
+    r"(?<![.\w])(?P<store>atomicState|state)\s*\??\.(?P<literal>[ \t]+)"
+    r"(?:\s*(?:\[[^]]*\]|\??\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+
+
+def _literal_state_writes(line: str, original: str, dot_re, bracket_re, literal_re) -> list[tuple[str, str]]:
+    """(store, key) pairs assigned on one masked line; bracket keys are recovered from the original."""
+    # Interpolation remains executable in the mask: state."${name}" must not
+    # masquerade as a literal state.name assignment.
+    writes = []
+    for match in dot_re.finditer(line):
+        prefix = re.sub(r"/\*.*?\*/", "", original[match.end("store"):match.start("key")])
+        if not any(quote in prefix for quote in ("'", '"')):
+            writes.append((match.group("store"), match.group("key")))
+    for pattern in (bracket_re, _STATE_QUOTED_PROPERTY_WRITE):
+        for match in pattern.finditer(line):
+            start, end = match.span("literal")
+            literal = literal_re.fullmatch(original[start:end])
+            if literal:
+                writes.append((match.group("store"), literal.group("key")))
+    return writes
+
+
+def _scan_retired_persisted_key_writes(display_path: str, source: str) -> list[dict]:
+    """Reject assignments that put retired code-derived caches back in app state."""
+    findings = []
+    source_lines = source.split("\n")
+    for line_num, (line, original) in enumerate(
+        zip(strip_comments_and_strings(source), source_lines, strict=True), start=1
+    ):
+        for _store, key in _literal_state_writes(
+            line, original, _RETIRED_DOT_WRITE, _RETIRED_BRACKET_WRITE, _RETIRED_BRACKET_LITERAL
+        ):
+            findings.append({
+                "file": display_path,
+                "line": line_num,
+                "rule": "PERSISTED_DERIVED_KEY",
+                "message": (
+                    f"Do not persist retired code-derived cache `{key}` in state/atomicState; "
+                    "keep derived metadata in class memory. Reads and remove-based migration "
+                    "cleanup remain allowed."
+                ),
+                "severity": "error",
+                "source": original.strip(),
+            })
+    return findings
+
+
+# New durable structures require an explicit storage-contract review, even when
+# their name differs from a retired cache. Keep it in sync with the table in
+# docs/state-storage-audit.md.
+PERSISTED_STATE_INVENTORY = {
+    "state": {
+        "accessToken", "ruleToDelete", "customEngineMigrated", "ruleVariables",
+        "headersReadable", "originLocalIpReadable", "updateCheck",
+        "lastBackupTimestamp", "debugLogs", "hubSecurityRetired", "hubSecurityFwUnreadable", "setupVersion",
+    },
+    "atomicState": {
+        "mrtrRequests", "packageDeployInFlight", "lastSelfDeploy", "reportErrors",
+        "hubSecurityCookie", "hubSecurityCookieExpiry", "itemBackupManifest",
+        "debugLogGeneration", "parentAppIds", "inUseHubVars", "variableHistory",
+        "hubVarsAppId", "predClearPending", "protectedAppsPolicy",
+    },
+}
+# `(?<![.\w])` keeps a member chain such as node.state.x from reading as app state.
+_INVENTORY_DOT_WRITE = re.compile(
+    r"(?<![.\w])(?P<store>atomicState|state)\s*\??\.\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+_INVENTORY_BRACKET_WRITE = re.compile(
+    r"(?<![.\w])(?P<store>atomicState|state)\s*\[(?P<literal>[ \t]*)\]"
+    r"(?:\s*(?:\[[^]]*\]|\.\s*[A-Za-z_][A-Za-z0-9_]*))*" + _RETIRED_ASSIGNMENT
+)
+_INVENTORY_BRACKET_LITERAL = re.compile(r"\s*(?P<quote>['\"])(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)\s*")
+
+
+def _scan_persisted_state_inventory(display_path: str, source: str) -> list[dict]:
+    """Flag new literal state assignments outside the reviewed inventory in the server and included libraries."""
+    path = display_path.replace("\\", "/")
+    if path != "hubitat-mcp-server.groovy" and not path.startswith("libraries/"):
+        return []
+    findings = []
+    for line_num, (line, original) in enumerate(
+        zip(strip_comments_and_strings(source), source.split("\n"), strict=True), start=1
+    ):
+        for store, key in _literal_state_writes(
+            line, original, _INVENTORY_DOT_WRITE, _INVENTORY_BRACKET_WRITE, _INVENTORY_BRACKET_LITERAL
+        ):
+            if key in PERSISTED_STATE_INVENTORY[store] or key in RETIRED_PERSISTED_DERIVED_KEYS:
+                continue
+            findings.append({
+                "file": display_path,
+                "line": line_num,
+                "rule": "PERSISTED_STATE_INVENTORY",
+                "message": (
+                    f"Review new durable `{store}.{key}`: document growth, write frequency and "
+                    "durability in docs/state-storage-audit.md before adding it to the lint inventory. "
+                    "Keep bulk per-call caches in class memory."
+                ),
+                "severity": "error",
+                "source": original.strip(),
+            })
+    return findings
+
+
+def _strip_line_comment(line: str) -> str:
+    """Drop a trailing `//` line comment, leaving `://` (a URL) alone.
+
+    Only used by `raw: True` rules, which match the original source line and would otherwise
+    fire on a comment that merely describes the anti-pattern it is looking for.
+    """
+    idx = 0
+    while True:
+        idx = line.find("//", idx)
+        if idx == -1:
+            return line
+        if idx > 0 and line[idx - 1] == ":":
+            idx += 2      # part of a scheme (http://), keep scanning
+            continue
+        return line[:idx]
+
+
+def _block_comment_mask(source_lines):
+    """One flag per line: True when the line sits inside a `/* */` (or `/** */`) block comment.
+
+    `raw: True` rules match ORIGINAL source, so documentation that spells out the very
+    anti-pattern being detected would fire the rule -- _hubRequest's docblock does exactly that.
+    A line that merely opens or closes a block is masked too; code sharing a line with a comment
+    delimiter is not worth the extra precision.
+    """
+    inside = False
+    mask = []
+    for line in source_lines:
+        opens = "/*" in line
+        closes = "*/" in line
+        mask.append(inside or opens)
+        if opens and not closes:
+            inside = True
+        elif closes:
+            inside = False
+    return mask
+
+
+def scan_source(source: str, display_path: str) -> list[dict]:
+    """Scan Groovy source text for sandbox anti-patterns.
+
+    Separated from scan_file so the self-test can exercise the same code
+    path without touching disk.
+    """
+    findings = []
+    stripped_lines = strip_comments_and_strings(source)
+    source_lines = source.split("\n")
+    block_mask = _block_comment_mask(source_lines)
+
+    for line_num, line in enumerate(stripped_lines, start=1):
+        # A `raw: True` rule matches against the ORIGINAL line, because the text it looks for
+        # lives inside a string literal that stripping removes (see SANDBOX-016). Comments are
+        # dropped first -- the line tail here, whole `/* */` blocks via block_mask -- so prose
+        # describing the anti-pattern isn't flagged as it.
+        raw_line = (
+            "" if block_mask[line_num - 1]
+            else _strip_line_comment(source_lines[line_num - 1])
+        )
+        for rule in RULES:
+            target = raw_line if rule.get("raw") else line
+            if re.search(rule["pattern"], target):
+                findings.append(
+                    {
+                        "file": display_path,
+                        "line": line_num,
+                        "rule": rule["id"],
+                        "message": rule["message"],
+                        "severity": rule["severity"],
+                        "source": source_lines[line_num - 1].strip(),
+                    }
+                )
+
+    findings.extend(_scan_retired_persisted_key_writes(display_path, source))
+    findings.extend(_scan_persisted_state_inventory(display_path, source))
+    return findings
+
+
+def scan_file(filepath: Path) -> list[dict]:
+    """Scan a single groovy file for sandbox anti-patterns."""
+    source = filepath.read_text(encoding="utf-8", errors="replace")
+    rel_path = str(filepath.relative_to(REPO_ROOT))
+    return scan_source(source, rel_path)
+
+
+# ---------------------------------------------------------------------------
+# Version consistency
+# ---------------------------------------------------------------------------
+
+
+def check_versions() -> list[dict]:
+    """Extract versions from all sources and flag mismatches."""
+    versions: dict[str, str] = {}
+    findings = []
+
+    for label, spec in VERSION_SOURCES.items():
+        filepath = spec["file"]
+        if not filepath.exists():
+            findings.append(
+                {
+                    "file": str(filepath.relative_to(REPO_ROOT)),
+                    "line": 0,
+                    "rule": "VERSION",
+                    "message": f"Version source file not found: {label}",
+                    "severity": "error",
+                    "source": "",
+                }
+            )
+            continue
+
+        content = filepath.read_text(encoding="utf-8", errors="replace")
+        flags = re.MULTILINE
+        if spec.get("multiline"):
+            flags |= re.DOTALL
+
+        match = re.search(spec["pattern"], content, flags)
+        if match:
+            versions[label] = match.group(1)
+        else:
+            # Find approximate line for the expected pattern
+            findings.append(
+                {
+                    "file": str(filepath.relative_to(REPO_ROOT)),
+                    "line": 0,
+                    "rule": "VERSION",
+                    "message": f"Could not extract version from: {label}",
+                    "severity": "error",
+                    "source": "",
+                }
+            )
+
+    # Check all versions match
+    unique_versions = set(versions.values())
+    if len(unique_versions) > 1:
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(versions.items()))
+        findings.append(
+            {
+                "file": "packageManifest.json",
+                "line": 0,
+                "rule": "VERSION",
+                "message": f"Version mismatch across files: {detail}",
+                "severity": "error",
+                "source": "",
+            }
+        )
+
+    # Check strict semver (catches typos like 0.10.0-rc1, v0.10.0, stray whitespace)
+    # that would silently break isNewerVersion() on user hubs.
+    strict_re = re.compile(r"^\d+\.\d+\.\d+$")
+    for label, version in versions.items():
+        if not strict_re.match(version):
+            findings.append(
+                {
+                    "file": str(VERSION_SOURCES[label]["file"].relative_to(REPO_ROOT)),
+                    "line": 0,
+                    "rule": "VERSION",
+                    "message": (
+                        f"Version {version!r} in {label} is not strict semver "
+                        "(X.Y.Z only, no prefixes or suffixes). "
+                        "Non-numeric versions silently break the update checker."
+                    ),
+                    "severity": "error",
+                    "source": "",
+                }
+            )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Tool-count consistency check
+# ---------------------------------------------------------------------------
+#
+# Tool counts are quoted across many docs (README, SKILL, TOOL_GUIDE,
+# the agent-skill SKILL.md, BAT-v2). Without a check, every tool-adding PR has
+# to manually update them in lockstep, and drift is silent until someone
+# notices. This check derives the canonical counts from the Groovy source
+# (getGatewayConfig + getAllToolDefinitions) and flags any current-state
+# claim in docs that disagrees.
+#
+# Historical references in version-history sections, migration tables, and
+# version-pinned phrasings (e.g. "v0.8.0 had 21 core tools") are skipped
+# so the lint doesn't false-fire on accurate history.
+
+DOC_FILES_FOR_COUNTS = [
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "SKILL.md",
+    REPO_ROOT / "TOOL_GUIDE.md",
+    REPO_ROOT / "agent-skill" / "hubitat-mcp" / "SKILL.md",
+    REPO_ROOT / "tests" / "BAT-v2.md",
+    # tests/e2e_test.py hardcodes a tools/list count assertion + descriptive
+    # message; the message string contains "(N core + M gateways)" forms
+    # the existing patterns match.
+    REPO_ROOT / "tests" / "e2e_test.py",
+    # tests/BAT.md is intentionally NOT in scope. It's the legacy v1 suite,
+    # explicitly documented at the top as describing the pre-v0.8.0
+    # architecture for historical reference. Every count there is meant to
+    # be a snapshot of an older release, and the prose phrasings ("pre-v0.8.0
+    # architecture (8 gateways, ...)") don't fit clean line-level historical
+    # patterns without false negatives elsewhere. BAT-v2.md is the current
+    # source of truth and remains in scope.
+]
+
+# Two tiers of historical-line markers:
+#
+# WIDE (line-scope) — markers that essentially never appear on a live
+# count line. A line containing one of these is almost certainly
+# documenting historical state, so we skip the entire line.
+#   - Version-pin markers like `**v0.7.7**:` or `(v0.8.0)` always scope
+#     a count to a past release.
+# NARROW (window-scope) — markers that CAN legitimately appear on a
+# live-count line, scoping only a nearby clause. We check these only
+# within the HISTORICAL_NEAR_MATCH_WINDOW chars that PRECEDE the matched
+# count (look-back only). Historical markers describe past state that
+# comes before a live claim; checking forward would silently swallow live
+# counts whose trailing clause references old values — e.g.
+# "22 core tools today, was 18 previously" would incorrectly skip the
+# live "22 core" if the window extended past match_start into the "was 18"
+# that follows.
+HISTORICAL_NEAR_MATCH_WINDOW = 20  # chars of look-back window ending immediately before the matched count
+HISTORICAL_LINE_PATTERNS_WIDE = [
+    # "v0.7.7 (all 74 tools)" — version followed by paren-count is the
+    # canonical historical scoping shape; counts within the parens are
+    # always scoped to the version.
+    re.compile(r"\bv\d+\.\d+(?:\.\d+)?\s*\("),
+    # "**v0.7.7**: 74 tools listed" — bold-version + colon is also a
+    # canonical historical-scoping shape (definitional clause).
+    re.compile(r"\*\*v\d+\.\d+(?:\.\d+)?\*\*\s*:"),
+]
+HISTORICAL_LINE_PATTERNS_NARROW = [
+    re.compile(r"→"),                              # migration arrows
+    re.compile(r"\bwas\s+\d+\b", re.IGNORECASE),  # "was 90"
+    re.compile(r"\bpreviously\s+\d+\b", re.IGNORECASE),
+    re.compile(r"\bbefore\s*[:=]\s*\d+\b", re.IGNORECASE),
+    # `(v0.7.7` / `(v0.8.0)` — bare parenthesized version. NARROW because
+    # this shape ALSO appears as a feature-availability marker in live
+    # text (e.g. "T120 — All N gateways in one session (v0.8.0)" where
+    # the version-pin is just provenance, not historical scoping). Only
+    # treat as historical if the version-paren sits within ±window of
+    # the count it would scope.
+    re.compile(r"\(v\d+\.\d+(?:\.\d+)?"),
+]
+# Backward-compat alias: the union exists for any external caller that
+# imports HISTORICAL_LINE_PATTERNS directly.
+HISTORICAL_LINE_PATTERNS = HISTORICAL_LINE_PATTERNS_WIDE + HISTORICAL_LINE_PATTERNS_NARROW
+
+# Section headings that flip the file into "history mode" — counts inside
+# the section (or any DESCENDANT subsection) are historical. The ancestor
+# walk in `_is_historical_at` traverses the full heading stack so a `###
+# v1.0.0 (2026-01-15)` sub-section under `## Version History` correctly
+# inherits historical status. We deliberately do NOT include a
+# parenthesized-version-anywhere pattern here — that flagged live
+# scenario titles like the original "T120 — All N gateways in one session
+# (v0.8.0)". When a real version-pinned subsection exists, the ancestor
+# walk picks up the parent Version History / Changelog heading.
+HISTORICAL_SECTION_HEADINGS = [
+    re.compile(r"^#+\s*Version\s+History\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#+\s*Changelog\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#+\s*Changes\s+from\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#+\s*Migration\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#+\s*Release\s+Notes\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^#+\s*History\b", re.IGNORECASE | re.MULTILINE),
+]
+
+
+def _extract_canonical_counts() -> dict | None:
+    """Parse hubitat-mcp-server.groovy to derive canonical tool counts.
+
+    Returns a dict {total, core, gateways, tools_list, proxied,
+    per_gateway: {name: op_count}} or None if extraction fails.
+    """
+    srv_path = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if not srv_path.exists():
+        return None
+    src = srv_path.read_text(encoding="utf-8", errors="replace")
+
+    # Tool DEFINITIONS now live partly in #include'd library modules (issue #209): a domain's defs
+    # sit in its libraries/*.groovy alongside its impl, contributed via _getAllToolDefinitions_part<Name>()
+    # chunk methods. The app #includes every library module, so the canonical tool surface =
+    # main + all library modules; concatenate them so those def chunks are parsed + counted. The
+    # gateway config (getGatewayConfig) lives only in main, so the first-match carve below is unaffected.
+    _lib_dir = REPO_ROOT / "libraries"
+    if _lib_dir.is_dir():
+        for _lib in sorted(_lib_dir.glob("*.groovy")):
+            src += "\n" + _lib.read_text(encoding="utf-8", errors="replace")
+
+    # Comment-stripping intentionally NOT done. Reasoning: this codebase's
+    # tool description heredocs commonly contain both `//` (URLs like
+    # `https://...`) and `/* ... */`-shaped tokens (regex example syntax,
+    # quoted Hubitat doc snippets). A naive regex strip mangles those
+    # strings and breaks the canonical extraction more often than it helps.
+    # The hypothetical case of "tool definition commented out for
+    # deprecation" would produce an over-count (lint reports doc N vs
+    # canonical N+1, which is loud and recoverable), so the trade-off
+    # favors a simpler parser. A real Groovy AST walk would be the right
+    # fix if commented-out definitions ever become a recurring class.
+
+    # Carve out the getGatewayConfig() body
+    gw_match = re.search(
+        r"^def getGatewayConfig\(\) \{(.*?)^}",
+        src,
+        re.DOTALL | re.MULTILINE,
+    )
+    if not gw_match:
+        return None
+    gw_block = gw_match.group(1)
+
+    per_gateway: dict[str, int] = {}
+    gateway_members: dict[str, set[str]] = {}
+    proxied_names: set[str] = set()
+    # Two-stage anchor:
+    #   1. `^\s+([a-z_]+):\s*\[\s*description:` — gateway-key indented
+    #      AND immediately opens with `description:`. This is the
+    #      structural anchor that prevents matching nested map keys
+    #      like `summaries:` or `searchHints:` as gateways (every
+    #      gateway in this codebase opens with description; the inner
+    #      maps don't).
+    #   2. `\".*?\".*?\btools:\s*\[([^\]]+)\]` — capture the tools
+    #      array regardless of what other keys (`category:`, comments,
+    #      etc.) appear between description and tools. `\btools:` with
+    #      word-boundary avoids false matches on suffixes like
+    #      `subtools:`.
+    # Escaped quotes inside description aren't currently used in this
+    # codebase; if a future maintainer adds one, the inner `\".*?\"`
+    # would terminate early — flag it then if it actually breaks.
+    for m in re.finditer(
+        r"^\s+([a-z_]+):\s*\[\s*description:\s*\".*?\".*?\btools:\s*\[([^\]]+)\]",
+        gw_block,
+        re.MULTILINE | re.DOTALL,
+    ):
+        name = m.group(1)
+        # Strip line-comments BEFORE comma-splitting. A trailing `//`
+        # comment on a tool line (e.g. `"foo", // disabled\n "bar"`)
+        # would otherwise put part of the comment AND the next entry
+        # into the same comma-separated chunk; per-entry split-on-`//`
+        # would then keep only the empty pre-comment whitespace and
+        # silently drop the next tool. Today's source has no inline
+        # comments inside tools[], but this is forward-compat.
+        no_comments = re.sub(r"//[^\n]*", "", m.group(2))
+        tool_list = [
+            t.strip().strip("\"'")
+            for t in no_comments.split(",")
+            if t.strip()
+        ]
+        per_gateway[name] = len(tool_list)
+        gateway_members[name] = set(tool_list)
+        proxied_names.update(tool_list)
+
+    if not per_gateway:
+        return None
+
+    # Carve out getAllToolDefinitions() and its chunk helpers, then extract tool
+    # names. PR1C split the over-64KB-bytecode getAllToolDefinitions() body into
+    # _getAllToolDefinitions_part<Name>() chunk methods that the public method just
+    # concatenates; the tool defs now live in those chunks, so gather them all.
+    # (The dispatcher body carries no `name:` lines, so including it is harmless;
+    # a pre-split source with all defs in getAllToolDefinitions() still matches.)
+    all_bodies = re.findall(
+        r"^def (?:getAllToolDefinitions|_getAllToolDefinitions_part\w+)\(\) \{(.*?)^}",
+        src,
+        re.DOTALL | re.MULTILINE,
+    )
+    if not all_bodies:
+        return None
+    all_defs_text = "\n".join(all_bodies)
+    # Keep raw list separate from the set so a duplicate `name:` entry
+    # in getAllToolDefinitions() is detectable: the count check sees
+    # total = len(list) > len(docs) and fires; the self-test cross-
+    # checks list-len vs set-len. If we collapsed both into len(set),
+    # duplicate-name regressions would be silent on both gates.
+    raw_name_list = re.findall(r"^\s*name:\s*['\"]([a-z0-9_]+)['\"]", all_defs_text, re.MULTILINE)
+    tool_names: set[str] = set(raw_name_list)
+    total = len(raw_name_list)
+
+    # Count DISTINCT proxied tools, not the sum of per-gateway tool counts:
+    # a tool may belong to more than one gateway (multi-gateway membership --
+    # reads are listed in both their mixed manage_ gateway and a read_ gateway),
+    # so sum(per_gateway.values()) over-counts and would drive `core` negative.
+    proxied = len(proxied_names)
+
+    # Developer-Mode-only tools (getDeveloperModeOnlyToolNames) are hidden from the DEFAULT
+    # tools/list -- they appear only with the dev toggle on. A dev-only TOP-LEVEL tool (one
+    # not proxied behind a gateway) is not part of the default advertised surface, so exclude
+    # it from `core`/`tools_list` for the default-catalog math -- the same way a gateway
+    # sub-tool is excluded. (Issue #250 moved hub_update_package out of the hub_manage_mcp
+    # gateway to exactly this: a dev-only top-level tool. It still counts in `total`.)
+    # Like the read-only set, this is an aggregator since the #209 full split: union the
+    # main getter's literals with every library-contributed _developerModeOnlyToolNames_part
+    # chunk (libraries are already concatenated into `src`).
+    dev_only_names: set[str] = set()
+    dev_bodies = re.findall(
+        r"def (?:getDeveloperModeOnlyToolNames|_developerModeOnlyToolNames_part\w+)\(\) \{(.*?)^}",
+        src, re.DOTALL | re.MULTILINE,
+    )
+    # Format-drift guard: a part method that is declared but no longer matched by the body
+    # regex would silently drop out of the union, under-counting dev_only_top_level and
+    # over-counting core while the invariant stays self-consistent. Fail the extraction
+    # (None -> check_tool_counts emits a loud TOOL_COUNT finding) instead of drifting.
+    dev_declared = len(set(re.findall(r"def (_developerModeOnlyToolNames_part\w+)\s*\(", src)))
+    dev_parsed = len(re.findall(r"def _developerModeOnlyToolNames_part\w+\(\) \{(?:.*?)^}", src, re.DOTALL | re.MULTILINE))
+    if dev_declared != dev_parsed:
+        print(
+            f"sandbox_lint: canonical-count extraction failed -- {dev_declared} "
+            f"_developerModeOnlyToolNames_part* declared but {dev_parsed} parsed (format drift)",
+            file=sys.stderr,
+        )
+        return None
+    for body in dev_bodies:
+        dev_only_names |= set(re.findall(r"['\"]([a-z0-9_]+)['\"]", body))
+    dev_only_top_level = dev_only_names - proxied_names
+
+    core = total - proxied - len(dev_only_top_level)
+    gateways = len(per_gateway)
+    tools_list = core + gateways
+
+    return {
+        "total": total,
+        "core": core,
+        "gateways": gateways,
+        "tools_list": tools_list,
+        "proxied": proxied,
+        # Dev-mode-only TOP-LEVEL tools, excluded from `core`/`tools_list` (default catalog):
+        # total == core + proxied + dev_only_top_level (see the self-test invariant).
+        "dev_only_top_level": len(dev_only_top_level),
+        "per_gateway": per_gateway,
+        "gateway_members": gateway_members,  # {gateway: set(member tools)} for attribution checks
+        # Name sets for tool-name consistency check (separate from counts):
+        "tool_names": tool_names,           # all tool identifiers in getAllToolDefinitions()
+        "gateway_names": set(per_gateway.keys()),  # gateway facade identifiers (manage_X)
+        "proxied_names": proxied_names,     # tools enumerated under any gateway's `tools:` list
+    }
+
+
+def _is_historical_at(content: str, match_start: int, match_end: int | None = None) -> bool:
+    """Return True if the match falls inside a historical / migration
+    context that should be skipped by the count lint.
+
+    Two layers:
+      (1) Per-match window: HISTORICAL_LINE_PATTERNS are checked only
+          within ±HISTORICAL_NEAR_MATCH_WINDOW chars of the match itself,
+          NOT the entire enclosing line. A live count line that happens
+          to mention "was 90" elsewhere should not silently disable lint
+          for the live count next to it.
+      (2) Section-level ancestor walk: walks backward through ALL
+          preceding headings tracking heading level. Any ancestor (a
+          heading at strictly lower level than the smallest level seen
+          so far) matching HISTORICAL_SECTION_HEADINGS marks the match
+          as historical. This correctly handles `### v1.0.0 ...` sub-
+          headings under a `## Version History` parent.
+    """
+    if match_end is None:
+        match_end = match_start
+
+    # Layer 1a: WIDE markers — version-pins anywhere on the line. These
+    # scope the entire line to historical context.
+    line_start = content.rfind("\n", 0, match_start) + 1
+    line_end_pos = content.find("\n", match_start)
+    if line_end_pos == -1:
+        line_end_pos = len(content)
+    line = content[line_start:line_end_pos]
+    for pat in HISTORICAL_LINE_PATTERNS_WIDE:
+        if pat.search(line):
+            return True
+
+    # Layer 1b: NARROW markers — only inside the look-back window ending at
+    # match_start. Historical markers describe PAST state that precedes a live
+    # claim; a trailing "was N" or "previously N" appearing AFTER the count
+    # describes the live count's own history and should not suppress the live
+    # count. Anchoring the window to [match_start - window, match_start]
+    # (look-back only) correctly reflects this semantic.
+    win_start = max(0, match_start - HISTORICAL_NEAR_MATCH_WINDOW)
+    win_end = match_start  # exclusive — do not extend past the count itself
+    window = content[win_start:win_end]
+    for pat in HISTORICAL_LINE_PATTERNS_NARROW:
+        if pat.search(window):
+            return True
+
+    # Layer 2: ancestor walk through preceding headings. Track the
+    # smallest level seen so far — only a heading at strictly smaller
+    # level (i.e. an ancestor section) can mark this match as historical.
+    # Sibling/descendant historical headings don't propagate.
+    preceding = content[:match_start]
+    min_level = float("inf")
+    for m in reversed(list(re.finditer(r"^(#+)\s+\S", preceding, re.MULTILINE))):
+        level = len(m.group(1))
+        if level >= min_level:
+            continue  # sibling or descendant; not an ancestor of the match
+        min_level = level
+        line_end = preceding.find("\n", m.start())
+        if line_end == -1:
+            line_end = len(preceding)
+        heading_line = preceding[m.start():line_end]
+        for pat in HISTORICAL_SECTION_HEADINGS:
+            if pat.match(heading_line):
+                return True
+    return False
+
+
+# Backward-compat alias: callers that pass only match_start still work.
+_is_historical_line = _is_historical_at
+
+
+# Patterns to scan in docs. Each entry: (regex, count_kind).
+# count_kind keys map to canonical fields above ("total", "core",
+# "gateways", "tools_list", "proxied").
+COUNT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Total
+    (re.compile(r"\((\d+)\s+total\b"), "total"),
+    (re.compile(r"\b(\d+)\s+tools?\s+total\b", re.IGNORECASE), "total"),
+    (re.compile(r"\bcovering\s+(\d+)\s+(?:total\s+)?tools?\b", re.IGNORECASE), "total"),
+    (re.compile(r"\bMCP\s+Tools?\s+\((\d+)\s+total\b", re.IGNORECASE), "total"),
+    (re.compile(r"\bexposes?\s+(\d+)\s+tools?\b", re.IGNORECASE), "total"),
+    (re.compile(r"\bexposing\s+(\d+)\s+tools?\b", re.IGNORECASE), "total"),
+    (re.compile(r"\bhas\s+(\d+)\s+tools?\s+total\b", re.IGNORECASE), "total"),
+    (re.compile(r"\b(\d+)\s+MCP\s+tools?\b", re.IGNORECASE), "total"),
+    # "N (total) distinct (MCP) tools" — the word "distinct" between the number and
+    # "tools" defeats the "N tools" / "N MCP tools" / "N total" patterns above, so this
+    # class of total-count drift used to escape the lint (issue #250 review finding).
+    (re.compile(r"\b(\d+)\s+(?:total\s+)?distinct\s+(?:MCP\s+)?tools?\b", re.IGNORECASE), "total"),
+    # "search across all N tools" / "for all N tools" — catalog references.
+    (re.compile(r"\b(?:across|for|reference\s+for)\s+all\s+(\d+)\s+(?:MCP\s+)?tools?\b", re.IGNORECASE), "total"),
+    # "All N tools are covered" — BAT test-coverage claim that tracks the
+    # total tool count (covered = total minus excluded destructives).
+    (re.compile(r"\bAll\s+(\d+)\s+tools?\s+are\s+covered\b", re.IGNORECASE), "total"),
+    (re.compile(r"\b(\d+)\s+additional\s+tools?\b", re.IGNORECASE), "proxied"),
+    # "returns all N tool definitions" — getAllToolDefinitions() phrasing.
+    (re.compile(r"\b(\d+)\s+tool\s+definitions?\b", re.IGNORECASE), "total"),
+    # "from N items to M" — gateway-pattern explanation phrasing.
+    (re.compile(r"\bfrom\s+(\d+)\s+items?\s+to\s+\d+\b", re.IGNORECASE), "total"),
+    # "N proxied" anywhere (not just paren-prefix) — covers compact-summary
+    # phrasings like "(... 80 proxied, 103 total)".
+    (re.compile(r"\b(\d+)\s+proxied\b(?!\s+tools)", re.IGNORECASE), "proxied"),
+    # "N total" when followed by punctuation or end-of-clause — catches
+    # the BAT-v2 header-style "80 proxied, 103 total)" without firing on
+    # "30 total scenarios" / "13 total messages" qualifying-noun forms.
+    (re.compile(r"\b(\d+)\s+total\b(?=\s*[.)\n,])"), "total"),
+    # Core
+    (re.compile(r"\b(\d+)\s+core\s+tools?\b", re.IGNORECASE), "core"),
+    (re.compile(r"\b(\d+)\s+core\s*\+\s*\d+\s+gateways?\b", re.IGNORECASE), "core"),
+    # Gateways
+    (re.compile(r"\b\d+\s+core\s*\+\s*(\d+)\s+gateways?\b", re.IGNORECASE), "gateways"),
+    (re.compile(r"(?<!\.)\b(\d+)\s+gateways?\b", re.IGNORECASE), "gateways"),
+    # tools/list count
+    (re.compile(r"\b(\d+)\s+on\s+`?tools/list`?\b"), "tools_list"),
+    (re.compile(r"\b(\d+)\s+items?\s+on\s+`?tools/list`?\b"), "tools_list"),
+    # Proxied count
+    (re.compile(r"\((\d+)\s+proxied\b"), "proxied"),
+    (re.compile(r"\b(\d+)\s+proxied\s+tools?\b"), "proxied"),
+    # Table-row form: "Total tools in codebase | 90", etc. Each fixes the
+    # phrasing tightly so a stray two-column table elsewhere can't match
+    # by accident.
+    (re.compile(r"\btotal\s+tools?\s+in\s+codebase\s*\|?\s*(\d+)\b", re.IGNORECASE), "total"),
+    (re.compile(r"\btools?\s+proxied\s+behind\s+gateways?\s*\|?\s*(\d+)\b", re.IGNORECASE), "proxied"),
+    (re.compile(r"\btotal\s+visible\s+on\s+`?tools/list`?\s*\|?\s*(\d+)\b", re.IGNORECASE), "tools_list"),
+    # Architecture-table component-row phrasings used in BAT-v2 §
+    # "Architecture": "Core tools on `tools/list` | 23" and "Gateways on
+    # `tools/list` | 12". Requires either the pipe table separator or the
+    # backtick around tools/list so bare prose like "core tools on
+    # tools/list 23" (no anchor) doesn't false-fire on future doc drift.
+    (re.compile(r"\bcore\s+tools?\s+on\s+(?:`tools/list`|\|?\s*tools/list\s*\|)\s*\|?\s*(\d+)\b", re.IGNORECASE), "core"),
+    (re.compile(r"\bgateways?\s+on\s+(?:`tools/list`|\|?\s*tools/list\s*\|)\s*\|?\s*(\d+)\b", re.IGNORECASE), "gateways"),
+]
+
+# Per-gateway pattern: "hub_manage_X (N)", "`hub_read_X` (N)", "manage_X (N)",
+# "### manage_X (N tools)", "manage_X (N tools, 7 original + 3 library tools)".
+# The canonical `hub_` prefix is tolerated but excluded from the capture
+# (docs use the full `hub_manage_X` / `hub_read_X` names; `\b` can't anchor
+# inside "hub_manage", so the prefix must be matched explicitly) — captures
+# are re-prefixed via _normalize_gateway_name before the canonical lookup.
+# Covers BOTH gateway families: `manage_` and the pure-read `read_` gateways.
+# The 0-10 char window between the gateway name and the open paren
+# tolerates backticks and short HTML tags without matching across
+# unrelated text. The trailing class allows `)` (bare or `(N tools)`),
+# `,` (qualifier follows like "(N tools, 7 original + ...)"), or
+# whitespace + non-paren (e.g. "(N tools generic across...)").
+PER_GATEWAY_PATTERN = re.compile(
+    r"\b(?:hub_)?((?:manage|read)_[a-z_]+)\b[^(\n]{0,10}\((\d+)(?:\s+tools?)?(?:[,)]|\s+(?:tools?|original|library|read|write))"
+)
+
+# Per-gateway in markdown tables: "| `hub_manage_X` | N |" — the count lives
+# in a separate column from the name, so the parenthesis-anchored pattern
+# above misses these.
+PER_GATEWAY_TABLE_PATTERN = re.compile(
+    r"\|\s*`?(?:hub_)?((?:manage|read)_[a-z_]+)`?\s*\|\s*(\d+)\s*\|"
+)
+
+# "AI calls `hub_manage_X` ... sees N tools" — gateway op-count claim where
+# the gateway name and the count are separated by descriptive prose. The
+# 1-80 char window is loose enough to cover phrasings like "AI calls
+# `manage_native_rules_and_apps` with no args, sees 12 tools" without
+# crossing sentence boundaries (terminated by `.` or newline).
+PER_GATEWAY_SEES_PATTERN = re.compile(
+    r"`(?:hub_)?((?:manage|read)_[a-z_]+)`[^.\n]{1,80}\bsees?\s+(?:catalog\s+of\s+)?(\d+)\s+tools?\b"
+)
+
+# Gateway-family subtotals: "Read gateways (8):" / "Manage gateways (15):"
+# (the TOOL_GUIDE.md gateway-inventory lines). Checked against the count of
+# hub_read_* / hub_manage_* keys in canonical per_gateway.
+GATEWAY_FAMILY_PATTERN = re.compile(
+    r"\b(read|manage)\s+gateways\s*\((\d+)\)", re.IGNORECASE
+)
+
+
+def _normalize_gateway_name(captured: str) -> str:
+    """Map a per-gateway pattern capture (bare `manage_X` / `read_X`) to the
+    canonical `hub_`-prefixed key used by per_gateway. Kept as a shared
+    helper so check_tool_counts and the self-test harness cannot diverge."""
+    return "hub_" + captured
+
+
+def _gateway_family_expected(canonical: dict, family: str) -> int:
+    """Canonical number of gateways in a family ('read' or 'manage'),
+    derived from the per_gateway keys."""
+    return sum(
+        1 for k in canonical["per_gateway"] if k.startswith(f"hub_{family}_")
+    )
+
+
+def check_tool_counts() -> list[dict]:
+    """Verify documented tool counts match the canonical counts derived
+    from hubitat-mcp-server.groovy. Skips historical / migration
+    contexts."""
+    findings: list[dict] = []
+    canonical = _extract_canonical_counts()
+    if canonical is None:
+        findings.append(
+            {
+                "file": "hubitat-mcp-server.groovy",
+                "line": 0,
+                "rule": "TOOL_COUNT",
+                "message": (
+                    "Could not extract canonical tool counts from "
+                    "getGatewayConfig() / getAllToolDefinitions(). The "
+                    "lint can't verify doc consistency until the parser "
+                    "is updated to handle the current source layout."
+                ),
+                "severity": "error",
+                "source": "",
+            }
+        )
+        return findings
+
+    for doc_path in DOC_FILES_FOR_COUNTS:
+        if not doc_path.exists():
+            continue
+        rel = str(doc_path.relative_to(REPO_ROOT)).replace("\\", "/")
+        content = doc_path.read_text(encoding="utf-8", errors="replace")
+
+        # High-level counts. Track (line, kind, actual) so the same drift
+        # surfaced by two overlapping patterns doesn't dupe.
+        seen: set[tuple[int, str, int]] = set()
+        for pat, kind in COUNT_PATTERNS:
+            expected = canonical[kind]
+            for m in pat.finditer(content):
+                if _is_historical_at(content, m.start(), m.end()):
+                    continue
+                actual = int(m.group(1))
+                if actual == expected:
+                    continue
+                line_no = content[:m.start()].count("\n") + 1
+                dedup_key = (line_no, kind, actual)
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                line_start = content.rfind("\n", 0, m.start()) + 1
+                line_end = content.find("\n", m.start())
+                if line_end == -1:
+                    line_end = len(content)
+                line_text = content[line_start:line_end].strip()
+                findings.append(
+                    {
+                        "file": rel,
+                        "line": line_no,
+                        "rule": "TOOL_COUNT",
+                        "message": (
+                            f"{kind} count claims {actual}, canonical is "
+                            f"{expected}. Update doc or check that the "
+                            "claim isn't historical (add a v0.X.Y marker, "
+                            "→ migration arrow, or 'was N' phrasing to "
+                            "skip)."
+                        ),
+                        "severity": "error",
+                        "source": line_text[:200],
+                    }
+                )
+
+        # Gateway-family subtotals: "Read gateways (8):" / "Manage gateways (15):".
+        family_seen: set[tuple[int, str, int]] = set()
+        for m in GATEWAY_FAMILY_PATTERN.finditer(content):
+            if _is_historical_at(content, m.start(), m.end()):
+                continue
+            family = m.group(1).lower()
+            actual = int(m.group(2))
+            expected = _gateway_family_expected(canonical, family)
+            if actual == expected:
+                continue
+            line_no = content[:m.start()].count("\n") + 1
+            dedup_key = (line_no, family, actual)
+            if dedup_key in family_seen:
+                continue
+            family_seen.add(dedup_key)
+            line_start = content.rfind("\n", 0, m.start()) + 1
+            line_end = content.find("\n", m.start())
+            if line_end == -1:
+                line_end = len(content)
+            findings.append(
+                {
+                    "file": rel,
+                    "line": line_no,
+                    "rule": "TOOL_COUNT",
+                    "message": (
+                        f"{family} gateway subtotal claims {actual}, "
+                        f"canonical is {expected}."
+                    ),
+                    "severity": "error",
+                    "source": content[line_start:line_end].strip()[:200],
+                }
+            )
+
+        # Per-gateway op counts: parenthesized form, markdown table form,
+        # and "AI ... sees N tools" gateway-context form.
+        per_gw_seen: set[tuple[int, str, int]] = set()
+        for m in (
+            list(PER_GATEWAY_PATTERN.finditer(content))
+            + list(PER_GATEWAY_TABLE_PATTERN.finditer(content))
+            + list(PER_GATEWAY_SEES_PATTERN.finditer(content))
+        ):
+            if _is_historical_at(content, m.start(), m.end()):
+                continue
+            gw_name = _normalize_gateway_name(m.group(1))
+            actual = int(m.group(2))
+            line_no_dedup = content[:m.start()].count("\n") + 1
+            dedup_key = (line_no_dedup, gw_name, actual)
+            if dedup_key in per_gw_seen:
+                continue
+            per_gw_seen.add(dedup_key)
+            expected = canonical["per_gateway"].get(gw_name)
+            if expected is None:
+                # Unknown gateway name in docs — likely a renamed or
+                # removed gateway; surface the canonical list to make
+                # the typo / stale-rename obvious.
+                line_no = content[:m.start()].count("\n") + 1
+                known = ", ".join(sorted(canonical["per_gateway"].keys()))
+                findings.append(
+                    {
+                        "file": rel,
+                        "line": line_no,
+                        "rule": "TOOL_COUNT",
+                        "message": (
+                            f"Doc references unknown gateway {gw_name!r}. "
+                            "Either the gateway was renamed/removed in "
+                            "the Groovy source, or the doc reference is "
+                            f"stale. Known gateways: {{{known}}}."
+                        ),
+                        "severity": "error",
+                        "source": "",
+                    }
+                )
+                continue
+            if actual != expected:
+                line_no = content[:m.start()].count("\n") + 1
+                line_start = content.rfind("\n", 0, m.start()) + 1
+                line_end = content.find("\n", m.start())
+                if line_end == -1:
+                    line_end = len(content)
+                line_text = content[line_start:line_end].strip()
+                findings.append(
+                    {
+                        "file": rel,
+                        "line": line_no,
+                        "rule": "TOOL_COUNT",
+                        "message": (
+                            f"{gw_name} claims {actual} ops, canonical "
+                            f"is {expected}."
+                        ),
+                        "severity": "error",
+                        "source": line_text[:200],
+                    }
+                )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Tool-name consistency check
+# ---------------------------------------------------------------------------
+#
+# Catches a different drift class than tool-counts: stale tool-name
+# references in docs (e.g., `get_rule_diagnostics` after the v0.X rename
+# to `custom_get_rule_diagnostics`). Tool-counts are silent on names —
+# the count was right but the rename wasn't propagated. This check scans
+# markdown table rows that reference a tool by backtick-wrapped identifier
+# in first-column position, and flags any name not in the canonical set
+# extracted from `getAllToolDefinitions()` + `getGatewayConfig()`.
+
+# Files in scope: ones with proper tool tables. BAT-v2 excluded — it
+# references tools by name in test prose (not first-column table position),
+# so a first-column scan would miss its mentions and a prose scan would
+# false-positive on intentional historical references.
+DOC_FILES_FOR_TOOL_NAMES = [
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "TOOL_GUIDE.md",
+]
+
+# Markdown table row in the form `| `name` | description |` — the leading
+# `|` + whitespace + backtick + snake_case identifier + closing backtick
+# anchors the tool-table-cell shape. Lookahead for `|` ensures we're in
+# table column 1, not just any backtick-wrapped reference in prose.
+TOOL_TABLE_ROW_PATTERN = re.compile(
+    r"^\s*\|\s*`([a-z_]+)`\s*(?=\|)",
+    re.MULTILINE,
+)
+
+# Markdown table separator (`|---|---|`) — anchors backward search for the
+# header row. Tolerant of optional `:` alignment markers and varying dash
+# counts.
+TABLE_SEPARATOR_PATTERN = re.compile(
+    r"^\s*\|(?:\s*:?-{2,}:?\s*\|)+\s*$",
+    re.MULTILINE,
+)
+
+# Header text in column 1 that signals "this table lists MCP tools" —
+# matched case-insensitively, whole-cell. RM action/condition/comparison
+# tables use "Type"/"Comparison"/etc. and are correctly excluded.
+TOOL_TABLE_HEADER_NAMES = {"tool", "name", "mcp tool", "tool name"}
+
+# Identifiers that legitimately appear in tool-table-shaped rows even
+# under a "Tool"/"Name" header but are not in getAllToolDefinitions(). Add
+# entries here when a future doc legitimately uses a tool-table shape for
+# non-tool entries. Keep small — every entry here is a blind spot for
+# the lint.
+TOOL_NAME_ALLOWLIST: set[str] = set()
+
+
+def _table_header_for_match(content: str, match_start: int) -> str | None:
+    """Return the column-1 header text for the markdown table containing
+    `match_start`, or None if no table-header context is found.
+
+    Scans backward for the nearest table-separator line (`|---|---|`).
+    The line immediately above the separator is the header row; column 1
+    is everything between the leading `|` and the next `|`. Returns the
+    header text lowercased and stripped of `**` emphasis."""
+    sep_match = None
+    for m in TABLE_SEPARATOR_PATTERN.finditer(content, 0, match_start):
+        sep_match = m
+    if sep_match is None:
+        return None
+    header_end = content.rfind("\n", 0, sep_match.start())
+    if header_end == -1:
+        return None
+    header_start = content.rfind("\n", 0, header_end) + 1
+    header_line = content[header_start:header_end]
+    cells = header_line.split("|")
+    if len(cells) < 2:
+        return None
+    col1 = cells[1].strip().strip("*").strip().lower()
+    return col1
+
+
+def check_tool_name_consistency() -> list[dict]:
+    """Verify tool-name references in doc tables match canonical names.
+
+    For each markdown table row in the form `| `<name>` | ...`, check
+    that `<name>` is a valid tool name (in `getAllToolDefinitions()`),
+    a gateway name (in `getGatewayConfig()`), or in the explicit
+    allowlist. Flag stale references that look like renamed tools.
+
+    HTML-comment scope (`<!-- ... -->`) is NOT respected — same trade-off
+    as the comment-stripping decision documented in
+    `_extract_canonical_counts()`. A future doc author who wraps a tool
+    table in an HTML comment to suppress it would still have its rows
+    linted; today's docs don't trigger this."""
+    findings: list[dict] = []
+    canonical = _extract_canonical_counts()
+    if canonical is None:
+        # check_tool_counts already flagged this with a clearer message.
+        return findings
+
+    valid_names = canonical["tool_names"] | canonical["gateway_names"] | TOOL_NAME_ALLOWLIST
+
+    for doc_path in DOC_FILES_FOR_TOOL_NAMES:
+        if not doc_path.exists():
+            continue
+        rel = str(doc_path.relative_to(REPO_ROOT)).replace("\\", "/")
+        content = doc_path.read_text(encoding="utf-8", errors="replace")
+
+        seen: set[tuple[int, str]] = set()
+        for m in TOOL_TABLE_ROW_PATTERN.finditer(content):
+            if _is_historical_line(content, m.start()):
+                continue
+            name = m.group(1)
+            if name in valid_names:
+                continue
+            header_col1 = _table_header_for_match(content, m.start())
+            if header_col1 not in TOOL_TABLE_HEADER_NAMES:
+                # This row is in a non-tool table (RM action types,
+                # condition operators, gateway op lists with their own
+                # naming scheme, etc.). Skip — outside scope of this lint.
+                continue
+            line_no = content[:m.start()].count("\n") + 1
+            dedup_key = (line_no, name)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            line_start = content.rfind("\n", 0, m.start()) + 1
+            line_end = content.find("\n", m.start())
+            if line_end == -1:
+                line_end = len(content)
+            line_text = content[line_start:line_end].strip()
+            findings.append(
+                {
+                    "file": rel,
+                    "line": line_no,
+                    "rule": "TOOL_NAME",
+                    "message": (
+                        f"Tool table references `{name}` which is not in "
+                        f"`getAllToolDefinitions()` or `getGatewayConfig()`. "
+                        "Likely a stale rename or typo. If this is "
+                        "intentionally a non-tool identifier in a tool-"
+                        "table-shaped row, add to TOOL_NAME_ALLOWLIST in "
+                        "tests/sandbox_lint.py."
+                    ),
+                    "severity": "error",
+                    "source": line_text[:200],
+                }
+            )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Gateway-attribution consistency check
+# ---------------------------------------------------------------------------
+#
+# Catches a third drift class the count and name checks are blind to: a doc
+# claiming a tool lives in the WRONG gateway (both names real, membership
+# stale). Real instance: TOOL_GUIDE.md said "hub_restore_backup (in
+# `hub_manage_code`)" long after the tool moved to hub_manage_backup — counts
+# and names were all valid, so nothing fired. This scans the attribution
+# idiom "`hub_tool` (in `hub_gw`)" / "(via `hub_gw` / `hub_gw2`)" and checks
+# EVERY claimed gateway's membership in getGatewayConfig(). A claim whose
+# subject isn't a known tool is skipped; a claimed name that is a known TOOL
+# is skipped as prose (e.g. "(via `hub_update_mcp_settings`)"); a claimed name
+# that is NEITHER fires as unknown_gateway (a renamed-away gateway must fire,
+# not skip).
+GATEWAY_ATTRIBUTION_PATTERN = re.compile(
+    r"`(hub_[a-z_]+)`\**\s*\((?:in|via)\s+((?:`hub_[a-z_]+`(?:\s*[/,]\s*)?)+)"
+)
+
+
+def _scan_gateway_attributions(
+    content: str, tool_names: set, gateway_members: dict
+) -> list[tuple[int, str, str, str, str]]:
+    """Return (line_no, tool, claimed_gateway, kind, line_text) for every bad
+    attribution. kind='wrong_gateway' when the claimed gateway exists but does
+    not contain the tool; kind='unknown_gateway' when the claimed name is
+    neither a gateway nor a tool (a renamed-away gateway must fire, not skip —
+    only a claimed name that is a KNOWN tool is legitimate prose to skip)."""
+    bad: list[tuple[int, str, str, str, str]] = []
+    for m in GATEWAY_ATTRIBUTION_PATTERN.finditer(content):
+        if _is_historical_at(content, m.start(), m.end()):
+            continue
+        tool = m.group(1)
+        if tool not in tool_names:
+            continue
+        line_no = content[:m.start()].count("\n") + 1
+        line_start = content.rfind("\n", 0, m.start()) + 1
+        line_end = content.find("\n", m.start())
+        if line_end == -1:
+            line_end = len(content)
+        line_text = content[line_start:line_end].strip()
+        for claimed in re.findall(r"`(hub_[a-z_]+)`", m.group(2)):
+            members = gateway_members.get(claimed)
+            if members is None:
+                if claimed in tool_names:
+                    continue  # prose naming another tool, not a gateway claim
+                bad.append((line_no, tool, claimed, "unknown_gateway", line_text))
+            elif tool not in members:
+                bad.append((line_no, tool, claimed, "wrong_gateway", line_text))
+    return bad
+
+
+def check_gateway_attributions(docs_override: list | None = None,
+                               canonical_override: dict | None = None) -> list[dict]:
+    """Verify doc attribution claims ("`tool` (in `gateway`)") against
+    getGatewayConfig() membership.
+
+    docs_override ([(rel_name, content), ...]) and canonical_override
+    ({"tool_names", "gateway_members"}) let the self-test route must-catch
+    fixtures through THIS function — the doc loop and the finding-dict
+    construction, not just the scan helper."""
+    findings: list[dict] = []
+    canonical = canonical_override or _extract_canonical_counts()
+    if canonical is None:
+        return findings  # check_tool_counts already reports the extractor failure
+    if docs_override is not None:
+        docs = docs_override
+    else:
+        docs = [
+            (str(p.relative_to(REPO_ROOT)).replace("\\", "/"),
+             p.read_text(encoding="utf-8", errors="replace"))
+            for p in DOC_FILES_FOR_COUNTS if p.exists()
+        ]
+    for rel, content in docs:
+        for line_no, tool, claimed, kind, line_text in _scan_gateway_attributions(
+            content, canonical["tool_names"], canonical["gateway_members"]
+        ):
+            actual = sorted(
+                g for g, members in canonical["gateway_members"].items()
+                if tool in members
+            )
+            if kind == "unknown_gateway":
+                message = (
+                    f"Doc claims `{tool}` is in `{claimed}`, which is neither "
+                    f"a gateway nor a tool — likely a renamed/removed gateway. "
+                    f"getGatewayConfig() puts `{tool}` in: "
+                    f"{actual or '(no gateway — flat tool)'}."
+                )
+            else:
+                message = (
+                    f"Doc claims `{tool}` is in `{claimed}`, but "
+                    f"getGatewayConfig() puts it in: {actual or '(no gateway — flat tool)'}. "
+                    "Stale attribution — update the doc."
+                )
+            findings.append(
+                {
+                    "file": rel,
+                    "line": line_no,
+                    "rule": "GATEWAY_ATTRIBUTION",
+                    "message": message,
+                    "severity": "error",
+                    "source": line_text[:200],
+                }
+            )
+    return findings
+
+
+# Must-catch / must-not-catch fixtures: (description, content, members_override,
+# expected (tool, gateway) pairs). Routed through _scan_gateway_attributions with
+# a synthetic tool set + membership map.
+GATEWAY_ATTRIBUTION_SELF_TEST_CASES = [
+    (
+        "wrong single-gateway attribution fires",
+        "Use `hub_restore_backup` (in `hub_manage_code`) to roll back.",
+        [("hub_restore_backup", "hub_manage_code", "wrong_gateway")],
+    ),
+    (
+        "correct single-gateway attribution is silent",
+        "Use `hub_restore_backup` (in `hub_manage_backup`) to roll back.",
+        [],
+    ),
+    (
+        "multi-gateway claim checks EVERY listed gateway",
+        "**`hub_list_backups`** (in `hub_read_apps_code` / `hub_manage_code`) enumerates.",
+        [("hub_list_backups", "hub_manage_code", "wrong_gateway")],
+    ),
+    (
+        "comma-separated multi-gateway claim checks EVERY listed gateway",
+        "`hub_list_backups` (in `hub_read_apps_code`, `hub_manage_code`) enumerates.",
+        [("hub_list_backups", "hub_manage_code", "wrong_gateway")],
+    ),
+    (
+        "via-phrasing fires too",
+        "`hub_restore_backup` (via `hub_manage_code` gateway) restores.",
+        [("hub_restore_backup", "hub_manage_code", "wrong_gateway")],
+    ),
+    (
+        "claimed name that is a tool, not a gateway, is skipped",
+        "`hub_restore_backup` (via `hub_update_mcp_settings`) — nonsense prose, but not a gateway claim.",
+        [],
+    ),
+    (
+        "renamed-away gateway (neither gateway nor tool) fires as unknown",
+        "Use `hub_restore_backup` (in `hub_manage_apps_code`) to roll back.",
+        [("hub_restore_backup", "hub_manage_apps_code", "unknown_gateway")],
+    ),
+    (
+        "unknown subject tool is skipped",
+        "`hub_totally_fake` (in `hub_manage_code`) does not exist.",
+        [],
+    ),
+]
+
+_ATTRIBUTION_SELF_TEST_TOOLS = {
+    "hub_restore_backup", "hub_list_backups", "hub_update_mcp_settings",
+}
+_ATTRIBUTION_SELF_TEST_MEMBERS = {
+    "hub_manage_backup": {"hub_restore_backup", "hub_list_backups"},
+    "hub_manage_code": {"hub_create_app"},
+    "hub_read_apps_code": {"hub_list_backups"},
+}
+
+
+def _run_gateway_attribution_self_test() -> int:
+    failures = 0
+    for i, (desc, content, expected) in enumerate(
+        GATEWAY_ATTRIBUTION_SELF_TEST_CASES, start=1
+    ):
+        got = [
+            (tool, claimed, kind)
+            for _, tool, claimed, kind, _ in _scan_gateway_attributions(
+                content, _ATTRIBUTION_SELF_TEST_TOOLS, _ATTRIBUTION_SELF_TEST_MEMBERS
+            )
+        ]
+        if got != expected:
+            failures += 1
+            print(
+                f"ATTRIBUTION-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected: {expected}\n"
+                f"  actual:   {got}\n"
+                f"  content: {content!r}"
+            )
+
+    # Route one must-catch through the REAL check function (doc loop +
+    # finding-dict construction) and render it with format_finding, so a
+    # malformed finding dict fails HERE instead of KeyError-ing in CI the
+    # first time a real stale attribution appears.
+    prod_findings = check_gateway_attributions(
+        docs_override=[
+            ("selftest.md",
+             "Use `hub_restore_backup` (in `hub_manage_code`) to roll back.")
+        ],
+        canonical_override={
+            "tool_names": _ATTRIBUTION_SELF_TEST_TOOLS,
+            "gateway_members": _ATTRIBUTION_SELF_TEST_MEMBERS,
+        },
+    )
+    prod_ok = (
+        len(prod_findings) == 1
+        and prod_findings[0]["rule"] == "GATEWAY_ATTRIBUTION"
+        and prod_findings[0]["file"] == "selftest.md"
+    )
+    if prod_ok:
+        try:
+            format_finding(prod_findings[0])
+        except Exception as exc:  # any render failure IS the self-test finding
+            prod_ok = False
+            print(f"ATTRIBUTION-SELF-TEST FAIL [production-path render]: {exc!r}")
+    if not prod_ok:
+        failures += 1
+        print(
+            "ATTRIBUTION-SELF-TEST FAIL [production-path must-catch]\n"
+            f"  findings: {prod_findings!r}"
+        )
+
+    # Extractor tripwire: the synthetic fixtures above never touch
+    # _extract_canonical_counts(), so a regression in the gateway_members
+    # extraction would leave them green while check_gateway_attributions
+    # silently under-checks the real docs. Pin membership to the count
+    # extraction (which has its own guards): same gateway keys, and each
+    # member-set's size equals the counted per-gateway length.
+    canonical = _extract_canonical_counts()
+    if canonical is not None:
+        members = canonical["gateway_members"]
+        per_gateway = canonical["per_gateway"]
+        if set(members) != set(per_gateway) or any(
+            len(members[g]) != per_gateway[g] for g in members
+        ):
+            failures += 1
+            print(
+                "ATTRIBUTION-SELF-TEST FAIL [gateway-members extractor]\n"
+                "  gateway_members diverged from per_gateway "
+                f"(keys {sorted(set(members) ^ set(per_gateway))} or set-size vs count mismatch) — "
+                "the attribution check is under-checking real docs."
+            )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+IS_CI = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def check_tool_guide_pointers(src_override: str | None = None,
+                              lib_pointer_override: list | None = None) -> list[dict]:
+    """Verify every get_tool_guide(section='X') pointer in the .groovy (app and libraries)
+    names a key in getToolGuideSections() or a sub-key in getToolGuideSubSections().
+    A pointer that misses gets a 'section not found' from hub_get_tool_guide, so it is
+    emitted as `tool-guide-broken-pointer`.
+
+    src_override / lib_pointer_override let the self-test drive this function with
+    synthetic corpora through the production finding-dict construction.
+    TOOL_GUIDE.md parity is check_tool_guide_generated's job.
+    """
+    findings: list[dict] = []
+    server = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if src_override is not None:
+        src = src_override
+    else:
+        if not server.exists():
+            return findings
+        src = server.read_text(encoding="utf-8", errors="replace")
+
+    # 1. Extract every section key from getToolGuideSections().
+    #    Match lines like `        device_authorization: '''## Device Authorization (CRITICAL)`
+    sections_block_match = re.search(
+        r"def getToolGuideSections\(\)\s*\{\s*return\s*\[(.*?)\n\s*\]\s*\}",
+        src,
+        re.DOTALL,
+    )
+    if not sections_block_match:
+        findings.append({
+            "file": str(server.relative_to(REPO_ROOT)),
+            "line": 1,
+            "severity": "error",
+            "rule": "tool-guide-no-sections",
+            "message": "Could not locate getToolGuideSections() return literal -- has the function shape changed?",
+            "source": "",
+        })
+        return findings
+
+    sections_block = sections_block_match.group(1)
+    # Match exactly the 8-space top-level indentation inside `return [ ... ]` so a stray
+    # `something: '''` inside one of the baked markdown bodies (deeper indentation, or
+    # mid-paragraph) can't be mistaken for a real section key.
+    section_keys = set(re.findall(r"^ {8}([a-z_][a-z0-9_]*):\s*'''", sections_block, re.MULTILINE))
+    # 1b. A section whose text lives in its domain library reads `key: _fooGuideSection(),`.
+    #     Resolving that method's body is check_tool_guide_generated's job.
+    section_keys.update(re.findall(r"^ {8}([a-z_][a-z0-9_]*):\s*_\w+\(\)",
+                                   sections_block, re.MULTILINE))
+
+    # 1c. Sub-section keys (issue #392): getToolGuideSubSections() splits the oversized
+    #     sections into narrower keys hub_get_tool_guide also accepts, so a pointer at one is
+    #     valid.
+    sub_section_keys = set()
+    sub_block_match = re.search(
+        r"def getToolGuideSubSections\(\)\s*\{\s*return\s*\[(.*?)\n\s*\]\s*\}",
+        src,
+        re.DOTALL,
+    )
+    if sub_block_match:
+        sub_section_keys = set(re.findall(r"^ {12}([a-z_][a-z0-9_]*):\s*\[",
+                                          sub_block_match.group(1), re.MULTILINE))
+
+    # 2. Extract every get_tool_guide(section='X') reference from the .groovy -- the app file AND
+    #    every library. A domain's guide body now travels with its domain (section 1b), so a
+    #    pointer written beside it in libraries/*.groovy is exactly as breakable as one in the app
+    #    and was previously unchecked: hub_get_tool_guide answers an unknown section with
+    #    success:false, and only this lint stands between that and a user.
+    #    Tolerate both single and double quotes; whitespace around the `=`.
+    pointer_re = re.compile(r"get_tool_guide\(section\s*=\s*['\"]([a-z_][a-z0-9_]*)['\"]\)")
+    pointer_sources = [(str(server.relative_to(REPO_ROOT)), src)]
+    lib_dir = REPO_ROOT / "libraries"
+    if lib_pointer_override is not None:
+        pointer_sources.extend(lib_pointer_override)
+    elif src_override is not None:
+        # Synthetic-corpus path: the real libraries point at real sections the synthetic
+        # one-section corpus does not have, so scanning them here would fire on every
+        # fixture. A self-test that wants library pointers passes them explicitly.
+        pass
+    elif lib_dir.is_dir():
+        for lib in sorted(lib_dir.glob("*.groovy")):
+            pointer_sources.append((f"libraries/{lib.name}",
+                                    lib.read_text(encoding="utf-8", errors="replace")))
+    for rel, text in pointer_sources:
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            for ptr in pointer_re.findall(line):
+                if ptr not in section_keys and ptr not in sub_section_keys:
+                    findings.append({
+                        "file": rel,
+                        "line": line_no,
+                        "severity": "error",
+                        "rule": "tool-guide-broken-pointer",
+                        "message": (
+                            f"get_tool_guide(section='{ptr}') points at a section that is NOT a key "
+                            f"in getToolGuideSections() nor a sub-key in getToolGuideSubSections(). "
+                            f"Either add the section to the dispatcher or fix the pointer. "
+                            f"Known sections: {sorted(section_keys)}. "
+                            f"Known sub-sections: {sorted(sub_section_keys)}."
+                        ),
+                        "source": line.strip()[:200],
+                    })
+
+    return findings
+
+
+def _load_tool_guide_builder():
+    """Import tools/build-tool-guide.py (the dashes in its name rule out a plain import)."""
+    path = Path(__file__).resolve().parent.parent / "tools" / "build-tool-guide.py"
+    spec = importlib.util.spec_from_file_location("build_tool_guide", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def check_tool_guide_generated() -> list[dict]:
+    """TOOL_GUIDE.md must be exactly what tools/build-tool-guide.py renders from
+    getToolGuideSections(); required API guidance must also remain in the served source."""
+    server = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if not server.exists():
+        return []
+    builder = _load_tool_guide_builder()
+    # Aim the builder at REPO_ROOT (not its own location) so tests can run it on a tmp tree.
+    builder.SERVER = server
+    builder.LIB_DIR = REPO_ROOT / "libraries"
+    finding = {"file": "TOOL_GUIDE.md", "line": 1, "severity": "error",
+               "rule": "tool-guide-not-generated", "source": ""}
+    try:
+        sources = builder.read_sources()
+        expected = builder.render(*sources)
+        sections = dict(builder.served_sections(*sources))
+    except ValueError as exc:
+        return [dict(finding, file="hubitat-mcp-server.groovy",
+                     message=f"tools/build-tool-guide.py cannot render getToolGuideSections(): {exc}")]
+    # Parity alone cannot catch guidance removed from both source and regenerated output.
+    anchors = {
+        "best_practice_reference": [
+            "If you are calling one of these tools, you must read its section for that section's key:",
+            "native Rule Machine",
+        ],
+        "set_rule_reference": [
+            "setVariable", "modeName", "discrete events", "Variable comparison", "lowercase",
+            "Extended per-capability spec shapes", "selectTriggers", "nested subExpression",
+            "expressionNotLive", "subscriptionsNotLive",
+        ],
+    }
+    findings = []
+    for section, required in anchors.items():
+        if section not in sections:
+            findings.append(dict(finding, file="hubitat-mcp-server.groovy",
+                rule="tool-guide-required-section-missing",
+                message=f"Required served section '{section}' is missing. "
+                        "Restore it in getToolGuideSections() before regenerating TOOL_GUIDE.md."))
+            continue
+        for anchor in required:
+            if anchor not in sections[section]:
+                findings.append(dict(finding, file="hubitat-mcp-server.groovy",
+                    rule="tool-guide-anchor-missing-source",
+                    message=f"Required API guidance '{anchor}' is missing from served section '{section}'. "
+                            "Restore it in the served source before regenerating TOOL_GUIDE.md."))
+    tool_guide = REPO_ROOT / "TOOL_GUIDE.md"
+    actual = tool_guide.read_text(encoding="utf-8", errors="replace") if tool_guide.exists() else ""
+    if actual.replace("\r\n", "\n") == expected.replace("\r\n", "\n"):
+        return findings
+    findings.append(dict(finding, message=(
+        "TOOL_GUIDE.md does not match what tools/build-tool-guide.py renders. Do not edit it by "
+        "hand: edit getToolGuideSections() in hubitat-mcp-server.groovy (or the library method a "
+        "section delegates to), then run `python tools/build-tool-guide.py`.")))
+    return findings
+
+
+def check_discrete_event_caps_doc_parity(
+    src_override: str | None = None,
+    doc_surfaces_override: dict | None = None,
+) -> list[dict]:
+    """Verify every doc surface that lists discrete-event sensor capabilities
+    only names capabilities that are in production's DISCRETE_EVENT_CAPS map.
+
+    Production code's authoritative class predicate lives in the
+    DISCRETE_EVENT_CAPS map literal in hubitat-mcp-server.groovy. Doc surfaces
+    that list capabilities as discrete-event (the inline addRE schema
+    description, the inline get_tool_guide content block, TOOL_GUIDE.md, and
+    docs/rm_action_subtype_schemas.md) MUST cite a subset of that production
+    set -- otherwise agents copy a doc example that the live walker rejects.
+
+    Scope of what this rule catches: capability-NAME presence parity ONLY.
+    The lint extracts capability keys from the DISCRETE_EVENT_CAPS map and
+    flags any cap name in a doc-surface positive-claim region that is NOT in
+    that canonical set (e.g. the CO2-symmetric-to-CO pitfall). It catches:
+    (a) adding a new doc cap that production does not accept,
+    (b) the well-known pitfall caps drift (Carbon dioxide sensor).
+    It does NOT catch: state-value drift (doc says `'tested'` but production
+    only accepts `["detected", "clear"]`); removal drift (cap dropped from
+    production but still in docs flags only as a no-finding because the doc
+    cap is no longer in the canonical set and is silently treated as
+    out-of-scope). State-value parity + removal parity are TODO -- track
+    those separately rather than overclaiming this rule.
+
+    Implementation note: the doc-surface scan uses a fixed 800-char window
+    after a discrete-event phrase to bound the search; a markdown table
+    spanning more than ~30 rows could trail past the window. The known doc
+    surfaces today are all under that limit.
+
+    src_override / doc_surfaces_override let the self-test drive this with
+    synthetic corpora. doc_surfaces_override is a dict {label: text}.
+    """
+    findings: list[dict] = []
+    server = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if src_override is not None:
+        src = src_override
+    else:
+        if not server.exists():
+            return findings
+        src = server.read_text(encoding="utf-8", errors="replace")
+        # DISCRETE_EVENT_CAPS now lives in the McpNativeRulesLib #include library
+        # (issue #209 native-RM extraction); the app includes every libraries/*.groovy,
+        # so append them so the map is found wherever it resides. The src_override path
+        # stays main-only for the synthetic self-test corpora.
+        _lib_dir = REPO_ROOT / "libraries"
+        if _lib_dir.is_dir():
+            for _lib in sorted(_lib_dir.glob("*.groovy")):
+                src += "\n" + _lib.read_text(encoding="utf-8", errors="replace")
+
+    # 1. Extract the canonical DISCRETE_EVENT_CAPS set from production.
+    #    The map literal shape is:
+    #        def DISCRETE_EVENT_CAPS = [
+    #            "Water sensor":                ["wet", "dry"],
+    #            ...
+    #        ]
+    map_match = re.search(
+        r"def\s+DISCRETE_EVENT_CAPS\s*=\s*\[(.*?)\n\s*\]",
+        src,
+        re.DOTALL,
+    )
+    if not map_match:
+        findings.append({
+            "file": str(server.relative_to(REPO_ROOT)),
+            "line": 1,
+            "severity": "error",
+            "rule": "discrete-event-caps-no-map",
+            "message": (
+                "Could not locate `def DISCRETE_EVENT_CAPS = [ ... ]` literal -- "
+                "has the map shape changed? Update the check_discrete_event_caps_doc_parity "
+                "extractor regex or remove the lint rule if intentionally restructured."
+            ),
+            "source": "",
+        })
+        return findings
+    canonical_caps = set(re.findall(r'"([^"]+)"\s*:', map_match.group(1)))
+    if not canonical_caps:
+        findings.append({
+            "file": str(server.relative_to(REPO_ROOT)),
+            "line": 1,
+            "severity": "error",
+            "rule": "discrete-event-caps-empty",
+            "message": "DISCRETE_EVENT_CAPS map literal parsed but yielded zero capabilities.",
+            "source": "",
+        })
+        return findings
+
+    # 2. Build the doc-surface map. Each surface is the full text of the source
+    #    block to scan; the check is "for each capability mentioned in a
+    #    discrete-event context, verify it's in canonical_caps".
+    if doc_surfaces_override is not None:
+        doc_surfaces = doc_surfaces_override
+    else:
+        tool_guide = REPO_ROOT / "TOOL_GUIDE.md"
+        action_schemas = REPO_ROOT / "docs" / "rm_action_subtype_schemas.md"
+        doc_surfaces = {}
+        # Two inline surfaces in the server source: extract narrow scope so we
+        # only scan the "discrete events" / "discrete-event" notes, not the
+        # whole 800KB file (which mentions caps in many unrelated contexts).
+        for m in re.finditer(
+            r"(?:report discrete events|discrete-event capability|some sensor capabilities).{0,800}",
+            src,
+            re.DOTALL,
+        ):
+            label = f"hubitat-mcp-server.groovy:{src[:m.start()].count(chr(10)) + 1}"
+            doc_surfaces[label] = m.group(0)
+        if tool_guide.exists():
+            tg = tool_guide.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(
+                r"(?:report discrete events|discrete-event capability|some sensor capabilities).{0,800}",
+                tg,
+                re.DOTALL,
+            ):
+                label = f"TOOL_GUIDE.md:{tg[:m.start()].count(chr(10)) + 1}"
+                doc_surfaces[label] = m.group(0)
+        if action_schemas.exists():
+            as_text = action_schemas.read_text(encoding="utf-8", errors="replace")
+            # The discrete-event table in this file is the authoritative table.
+            m = re.search(
+                r"###\s*Sensor capabilities with discrete event states.*?(?=\n##|\Z)",
+                as_text,
+                re.DOTALL,
+            )
+            if m:
+                label = f"docs/rm_action_subtype_schemas.md:{as_text[:m.start()].count(chr(10)) + 1}"
+                doc_surfaces[label] = m.group(0)
+
+    # 3. The set of all capability names this lint cares about: production's
+    #    canonical set + the well-known pitfall caps that are NOT in production
+    #    but might be accidentally added to a doc surface (Carbon dioxide sensor
+    #    is the documented pitfall).
+    pitfall_caps = {"Carbon dioxide sensor"}
+    caps_to_check = canonical_caps | pitfall_caps
+
+    # 4. For each doc surface, isolate the *positive claim* region -- the
+    #    parenthesized list of capabilities adjacent to the "report discrete
+    #    events" phrase, OR the markdown-table rows under a "discrete event"
+    #    heading. Only claims inside that narrow region count as the doc
+    #    asserting the capability is discrete-event. Mentions in surrounding
+    #    explanatory / exclusion text (e.g. "Carbon dioxide sensor is
+    #    intentionally EXCLUDED because ...") do NOT count.
+    #
+    #    Two positive-claim shapes we recognize:
+    #    (a) "(Water sensor, Smoke detector, ...) report discrete events"
+    #        -- the parenthetical immediately preceding the phrase.
+    #    (b) "report discrete events" with no parenthetical immediately
+    #        before -- treat the immediately-following inline list (up to
+    #        the next sentence-end period) as the positive claim region.
+    #    (c) Markdown-table rows of the form `| `<cap>` |` under a heading
+    #        that contains "discrete event" -- the table rows are the
+    #        positive claim region.
+    paren_before_phrase_re = re.compile(
+        r"\(([^()]*?)\)\s*report discrete events"
+    )
+    table_row_re = re.compile(r"\|\s*`([^`]+)`\s*\|")
+    for label, surface_text in doc_surfaces.items():
+        positive_claim_regions = []
+        for m in paren_before_phrase_re.finditer(surface_text):
+            positive_claim_regions.append(m.group(1))
+        # Markdown-table form (only fires when surface starts with the table heading)
+        if "discrete event" in surface_text.lower() and "|" in surface_text:
+            for tr in table_row_re.finditer(surface_text):
+                positive_claim_regions.append(tr.group(1))
+        positive_claim_text = " ".join(positive_claim_regions)
+        if not positive_claim_text:
+            # No positive-claim region detected -- this doc surface mentions
+            # discrete events but doesn't carry a parenthetical / table-row
+            # cap list. Skip; the heading-presence checks elsewhere cover
+            # structural drift.
+            continue
+        for cap in caps_to_check:
+            if cap in positive_claim_text and cap not in canonical_caps:
+                file_part, _, line_part = label.partition(":")
+                findings.append({
+                    "file": file_part,
+                    "line": int(line_part) if line_part.isdigit() else 1,
+                    "severity": "error",
+                    "rule": "discrete-event-caps-doc-drift",
+                    "message": (
+                        f"Doc surface lists capability '{cap}' as a discrete-event "
+                        f"capability (inside a positive-claim region), but '{cap}' "
+                        f"is NOT in production's DISCRETE_EVENT_CAPS map (canonical "
+                        f"set: {sorted(canonical_caps)}). Agents copying this doc "
+                        f"would build a condition the live walker rejects. Either "
+                        f"remove '{cap}' from the positive-claim list or add it to "
+                        f"the production DISCRETE_EVENT_CAPS map."
+                    ),
+                    "source": positive_claim_text[:160].replace("\n", " "),
+                })
+
+    return findings
+
+
+# Self-test fixtures for check_discrete_event_caps_doc_parity. Drives the real
+# check function with synthetic corpora to cover must-catch + must-not-catch
+# cases (PIPELINE.md Rule 13).
+DISCRETE_EVENT_CAPS_SELF_TEST_CASES = [
+    # (description, synthetic_src, doc_surfaces, expected_codes)
+    (
+        "doc surface positive-claim region lists only canonical caps -- no finding (must-not-catch)",
+        'def DISCRETE_EVENT_CAPS = [\n    "Water sensor": ["wet", "dry"],\n    "Smoke detector": ["detected", "clear"]\n]',
+        {"surface1": "some sensor capabilities (Water sensor, Smoke detector) report discrete events"},
+        set(),
+    ),
+    (
+        "positive-claim region lists pitfall cap NOT in canonical -- flags drift (must-catch)",
+        'def DISCRETE_EVENT_CAPS = [\n    "Water sensor": ["wet", "dry"]\n]',
+        {"surface_drift": "some sensor capabilities (Water sensor, Carbon dioxide sensor) report discrete events"},
+        {"discrete-event-caps-doc-drift"},
+    ),
+    (
+        "no DISCRETE_EVENT_CAPS map in synthetic source -- flags no-map (extractor regression guard)",
+        "def someOtherMap = [:]",
+        {"surface_noop": "some sensor capabilities report discrete events"},
+        {"discrete-event-caps-no-map"},
+    ),
+    (
+        "explanatory-exclusion text mentioning pitfall cap OUTSIDE positive-claim region -- no false positive",
+        'def DISCRETE_EVENT_CAPS = [\n    "Water sensor": ["wet", "dry"]\n]',
+        # The positive-claim region is just `(Water sensor)`; the explanatory text after
+        # mentions Carbon dioxide sensor but to explain its EXCLUSION, not to claim it as
+        # discrete-event. The classifier must scope to the parenthetical region only.
+        {"surface_exclusion": "some sensor capabilities (Water sensor) report discrete events. Carbon dioxide sensor is intentionally EXCLUDED because CarbonDioxideMeasurement is numeric ppm."},
+        set(),
+    ),
+    (
+        "markdown-table positive-claim region with pitfall cap row -- flags drift (must-catch)",
+        'def DISCRETE_EVENT_CAPS = [\n    "Water sensor": ["wet", "dry"]\n]',
+        {"surface_table": "### Sensor capabilities with discrete event states\n\n| Capability | State values |\n|---|---|\n| `Water sensor` | wet, dry |\n| `Carbon dioxide sensor` | detected, clear |\n"},
+        {"discrete-event-caps-doc-drift"},
+    ),
+]
+
+
+def _run_discrete_event_caps_self_test() -> int:
+    """Drive check_discrete_event_caps_doc_parity with synthetic corpora and verify:
+    (a) the right rule codes fire (dispatch correctness)
+    (b) every finding is format_finding-renderable (finding-dict shape correctness)
+    """
+    failures = 0
+    for i, (desc, src, surfaces, expected_codes) in enumerate(
+        DISCRETE_EVENT_CAPS_SELF_TEST_CASES, start=1
+    ):
+        findings = check_discrete_event_caps_doc_parity(
+            src_override=src,
+            doc_surfaces_override=surfaces,
+        )
+        # Shape check first: every finding must render through format_finding.
+        shape_ok = True
+        for f in findings:
+            try:
+                _ = format_finding(f)
+            except KeyError as ke:
+                failures += 1
+                shape_ok = False
+                print(
+                    f"DISCRETE-EVENT-CAPS-SELF-TEST FAIL [{i}] {desc}\n"
+                    f"  finding dict missing required key for format_finding: {ke}\n"
+                    f"  finding keys present: {sorted(f.keys())}\n"
+                    f"  finding: {f!r}"
+                )
+        if not shape_ok:
+            continue
+        actual_codes = {f["rule"] for f in findings}
+        if actual_codes != expected_codes:
+            failures += 1
+            print(
+                f"DISCRETE-EVENT-CAPS-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected codes: {sorted(expected_codes)}\n"
+                f"  actual codes:   {sorted(actual_codes)}\n"
+                f"  all findings: {findings!r}"
+            )
+    return failures
+
+
+def check_trailing_updaterule_envelope_parity(
+    src_override: str | None = None,
+) -> list[dict]:
+    """Verify every `catch (Exception updateExc)` block in the RM dispatcher
+    is followed by the full 5-slot trailing-updateRule envelope shape:
+    `updateRuleFailed`, one of the `*NotLive` slots (subscriptionsNotLive /
+    expressionNotLive / variableNotLive / patchesNotLive), `updateRuleError`,
+    `repairHints`, and `partial`.
+
+    Failure mode this catches: a future dispatcher that wires a trailing
+    updateRule click + catch block but forgets to thread the dedicated slots
+    into the return shape. The catch block silently sets a local boolean and
+    the response never surfaces the regression, so callers cannot detect the
+    not-live state without log-grep -- the exact bug class B3 fixed.
+
+    Known scope caveat: this is a textual proximity check, not an AST walk.
+    The check uses a fixed 4500-char vicinity window around each catch block
+    to detect required slots. A dispatcher whose try / catch / return spans
+    more than 4500 chars (roughly 120 lines of Groovy with comments) could
+    silently lint-pass even if the return shape is missing slots. Today's
+    dispatchers all fit. If the codebase outgrows the window, replace the
+    fixed-char scan with brace-balanced block detection rather than just
+    enlarging the window.
+    """
+    findings: list[dict] = []
+    server = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if src_override is not None:
+        src = src_override
+    else:
+        if not server.exists():
+            return findings
+        src = server.read_text(encoding="utf-8", errors="replace")
+
+    # Each match marks the start of a trailing-updateRule catch block. Scope
+    # to the literal handler shape so we don't false-positive on broader
+    # catch-Exception patterns elsewhere in the file.
+    catch_pattern = re.compile(r"catch\s*\(\s*Exception\s+updateExc\s*\)")
+    # Required envelope slots. At least one of NOTLIVE_SLOT_VARIANTS must
+    # appear in the vicinity (different dispatchers use different slot names).
+    REQUIRED_SLOTS = ["updateRuleFailed", "updateRuleError", "repairHints", "partial"]
+    NOTLIVE_SLOT_VARIANTS = [
+        "subscriptionsNotLive",
+        "expressionNotLive",
+        "variableNotLive",
+        "patchesNotLive",
+    ]
+    # Vicinity window: large enough to span declaration -> catch -> return,
+    # small enough to avoid bleeding into the next dispatcher's return shape.
+    LOOKAHEAD_CHARS = 4500
+
+    for m in catch_pattern.finditer(src):
+        # Also look BEHIND a bit because some dispatchers declare the booleans
+        # before the try (so updateRuleFailed/etc. live in the def block above
+        # the catch). Use a small backward window plus the forward window.
+        scope_start = max(0, m.start() - 1500)
+        scope_end = min(len(src), m.end() + LOOKAHEAD_CHARS)
+        vicinity = src[scope_start:scope_end]
+
+        missing = [slot for slot in REQUIRED_SLOTS if slot not in vicinity]
+        if not any(slot in vicinity for slot in NOTLIVE_SLOT_VARIANTS):
+            missing.append(f"one of {NOTLIVE_SLOT_VARIANTS}")
+
+        if missing:
+            line_no = src[:m.start()].count("\n") + 1
+            findings.append({
+                "file": str(server.relative_to(REPO_ROOT)),
+                "line": line_no,
+                "severity": "error",
+                "rule": "trailing-updaterule-envelope-incomplete",
+                "message": (
+                    f"`catch (Exception updateExc)` at L{line_no} is missing one or more "
+                    f"trailing-updateRule envelope slots in its return shape: {missing}. "
+                    f"Callers cannot detect the not-live state without log-grep. Pattern "
+                    f"reference: addRequiredExpression / addTrigger / bulk addTriggers "
+                    f"dispatchers all set the 5-slot envelope on the catch path."
+                ),
+                "source": src[m.start():m.start() + 120].replace("\n", " "),
+            })
+
+    return findings
+
+
+# Self-test fixtures for check_trailing_updaterule_envelope_parity. Drives
+# the real check function with synthetic corpora to cover must-catch +
+# must-not-catch cases (PIPELINE.md Rule 13).
+ENVELOPE_PARITY_SELF_TEST_CASES = [
+    # (description, synthetic_src, expected_codes)
+    (
+        "complete envelope -- no finding (must-not-catch)",
+        """
+        def updateRuleFailed = false
+        def subscriptionsNotLive = false
+        def updateRuleError = null
+        try { _rmClickAppButton(appId, "updateRule") }
+        catch (Exception updateExc) {
+            updateRuleFailed = true
+            subscriptionsNotLive = true
+            updateRuleError = updateExc.message
+        }
+        def repairHints = []
+        return [
+            success: false,
+            partial: true,
+            updateRuleFailed: updateRuleFailed,
+            subscriptionsNotLive: subscriptionsNotLive,
+            updateRuleError: updateRuleError,
+            repairHints: repairHints
+        ]
+        """,
+        set(),
+    ),
+    (
+        "missing repairHints in envelope -- flags incomplete (must-catch)",
+        """
+        def updateRuleFailed = false
+        def subscriptionsNotLive = false
+        try { _rmClickAppButton(appId, "updateRule") }
+        catch (Exception updateExc) {
+            updateRuleFailed = true
+            subscriptionsNotLive = true
+        }
+        return [
+            success: false,
+            partial: true,
+            updateRuleFailed: updateRuleFailed,
+            subscriptionsNotLive: subscriptionsNotLive,
+            updateRuleError: null
+        ]
+        """,
+        {"trailing-updaterule-envelope-incomplete"},
+    ),
+    (
+        "missing ANY NotLive slot -- flags incomplete (must-catch)",
+        """
+        def updateRuleFailed = false
+        try { _rmClickAppButton(appId, "updateRule") }
+        catch (Exception updateExc) {
+            updateRuleFailed = true
+        }
+        return [
+            success: false,
+            partial: true,
+            updateRuleFailed: updateRuleFailed,
+            updateRuleError: null,
+            repairHints: []
+        ]
+        """,
+        {"trailing-updaterule-envelope-incomplete"},
+    ),
+    (
+        "no `catch (Exception updateExc)` block at all -- no finding (rule never fires)",
+        "def foo = 1\ntry { stuff() } catch (Exception e) { log.error e.message }",
+        set(),
+    ),
+    (
+        "missing `partial` slot in envelope -- flags incomplete (must-catch)",
+        """
+        def updateRuleFailed = false
+        def subscriptionsNotLive = false
+        def updateRuleError = null
+        try { _rmClickAppButton(appId, "updateRule") }
+        catch (Exception updateExc) {
+            updateRuleFailed = true
+            subscriptionsNotLive = true
+            updateRuleError = updateExc.message
+        }
+        def repairHints = []
+        return [
+            success: false,
+            updateRuleFailed: updateRuleFailed,
+            subscriptionsNotLive: subscriptionsNotLive,
+            updateRuleError: updateRuleError,
+            repairHints: repairHints
+        ]
+        """,
+        {"trailing-updaterule-envelope-incomplete"},
+    ),
+]
+
+
+def _run_envelope_parity_self_test() -> int:
+    """Drive check_trailing_updaterule_envelope_parity with synthetic corpora
+    and verify dispatch correctness + finding-dict shape correctness.
+    """
+    failures = 0
+    for i, (desc, src, expected_codes) in enumerate(
+        ENVELOPE_PARITY_SELF_TEST_CASES, start=1
+    ):
+        findings = check_trailing_updaterule_envelope_parity(src_override=src)
+        shape_ok = True
+        for f in findings:
+            try:
+                _ = format_finding(f)
+            except KeyError as ke:
+                failures += 1
+                shape_ok = False
+                print(
+                    f"ENVELOPE-PARITY-SELF-TEST FAIL [{i}] {desc}\n"
+                    f"  finding dict missing required key for format_finding: {ke}\n"
+                    f"  finding keys present: {sorted(f.keys())}"
+                )
+        if not shape_ok:
+            continue
+        actual_codes = {f["rule"] for f in findings}
+        if actual_codes != expected_codes:
+            failures += 1
+            print(
+                f"ENVELOPE-PARITY-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected codes: {sorted(expected_codes)}\n"
+                f"  actual codes:   {sorted(actual_codes)}\n"
+                f"  all findings: {findings!r}"
+            )
+    return failures
+
+
+def check_read_write_split(src_override: str | None = None) -> list[dict]:
+    """Enforce BOTH directions of the gateway read/write-split invariant
+    (AGENTS.md "Gateway read/write split" -- a hard CI failure):
+
+      (A) No stranded read. Every tool in getReadOnlyToolNames() MUST be
+          reachable from a hub_read_* gateway OR be a flat top-level tool. It may
+          NEVER be reachable ONLY through a hub_manage_* gateway.
+          -> rule "read-write-split-stranded-read".
+      (B) No write in a read gateway. Every tool inside a hub_read_* gateway MUST
+          be in getReadOnlyToolNames() (read-only). A single write flips the
+          gateway's rolled-up readOnlyHint to write+destructive
+          (annotationsForGateway), mislabeling the whole read surface.
+          -> rule "read-write-split-write-in-read-gateway".
+
+    Rationale: clients route read-only browsing through the hub_read_* gateways
+    and surface those tools under readOnlyHint=true. A read that lives ONLY inside
+    a hub_manage_* gateway is invisible on the read-browse surface AND inherits
+    the write annotation -- a read mislabeled as a write and hidden from the read
+    path. Multi-gateway membership is fine: a read MAY co-live in a hub_manage_*
+    gateway as long as it is ALSO in a hub_read_* gateway (or is flat).
+
+    Both directions derive the read gateways by the `hub_read_` name prefix (NOT a
+    hard-coded list), so an Nth read gateway is covered automatically -- unlike
+    McpToolAnnotationsSpec's gateway-rollup assertion, which hard-codes its read
+    gateway names. Ships with must-catch + must-not-catch self-test fixtures
+    (READ_WRITE_SPLIT_SELF_TEST_CASES) so the guard provably fires and can never
+    silently no-op.
+
+    src_override lets the self-test drive this with synthetic corpora.
+    """
+    findings: list[dict] = []
+    server = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if src_override is not None:
+        src = src_override
+    else:
+        if not server.exists():
+            return findings
+        src = server.read_text(encoding="utf-8", errors="replace")
+        # Tool defs now live partly in #include'd library modules (issue #209); the app includes
+        # every libraries/*.groovy, so append them so moved def chunks (e.g.
+        # _getAllToolDefinitions_partRooms) are seen by the gateway-vs-defs reachability checks
+        # below. The src_override path stays main-only for the synthetic self-test corpora.
+        _lib_dir = REPO_ROOT / "libraries"
+        if _lib_dir.is_dir():
+            for _lib in sorted(_lib_dir.glob("*.groovy")):
+                src += "\n" + _lib.read_text(encoding="utf-8", errors="replace")
+
+    rel = str(server.relative_to(REPO_ROOT))
+
+    def _fail(rule: str, message: str) -> list[dict]:
+        findings.append({
+            "file": rel, "line": 1, "severity": "error",
+            "rule": rule, "message": message, "source": "",
+        })
+        return findings
+
+    # 1. getGatewayConfig() -> {gateway_name: [tool, ...]}. Same two-stage anchor
+    #    _extract_canonical_counts() uses, but we keep the full tool LISTS (not
+    #    just counts) and the gateway names (to split hub_read_ vs hub_manage_).
+    gw_match = re.search(r"^def getGatewayConfig\(\) \{(.*?)^}", src, re.DOTALL | re.MULTILINE)
+    if not gw_match:
+        return _fail(
+            "read-write-split-no-gateway-config",
+            "Could not locate getGatewayConfig() return literal -- has the function shape "
+            "changed? The read/write-split guard cannot run until the parser is updated.",
+        )
+    gateway_tools: dict[str, list[str]] = {}
+    gateway_pos: dict[str, int] = {}  # absolute src offset of each gateway, for line numbers
+    for m in re.finditer(
+        r"^\s+([a-z_]+):\s*\[\s*description:\s*\".*?\".*?\btools:\s*\[([^\]]+)\]",
+        gw_match.group(1), re.MULTILINE | re.DOTALL,
+    ):
+        no_comments = re.sub(r"//[^\n]*", "", m.group(2))
+        gateway_tools[m.group(1)] = [t.strip().strip("\"'") for t in no_comments.split(",") if t.strip()]
+        gateway_pos[m.group(1)] = gw_match.start(1) + m.start()
+    if not gateway_tools:
+        return _fail(
+            "read-write-split-no-gateway-config",
+            "getGatewayConfig() parsed but yielded zero gateways -- parser/source shape mismatch.",
+        )
+
+    # 2. getReadOnlyToolNames() -> the read-only tool set (the source of truth
+    #    that feeds the readOnlyHint annotations). Since the #209 full split the main
+    #    getter is an AGGREGATOR: each library contributes its own tools via a
+    #    _readOnlyToolNames_part<Name>() chunk (the libraries are concatenated into
+    #    `src` above), and the main body keeps only the main-resident remainder -- so
+    #    the read set is the union of literals across the getter AND every part method.
+    ro_match = re.search(r"^def getReadOnlyToolNames\(\) \{(.*?)^}", src, re.DOTALL | re.MULTILINE)
+    if not ro_match:
+        return _fail(
+            "read-write-split-no-readonly-list",
+            "Could not locate getReadOnlyToolNames() return literal -- has the function shape changed?",
+        )
+    part_bodies = re.findall(
+        r"^def _readOnlyToolNames_part\w+\(\) \{(.*?)^}", src, re.DOTALL | re.MULTILINE,
+    )
+    # Format-drift guard: if part methods are MENTIONED (declared or called in the
+    # aggregator) but the body regex parses fewer, the read set would silently
+    # under-count and the split check would quietly stop enforcing -- fail loud instead.
+    declared = len(set(re.findall(r"def (_readOnlyToolNames_part\w+)\s*\(", src)))
+    if declared != len(part_bodies):
+        return _fail(
+            "read-write-split-part-format-drift",
+            f"{declared} _readOnlyToolNames_part* method(s) declared but {len(part_bodies)} parsed -- "
+            "the part-method body regex no longer matches the declaration format; the read-only set "
+            "would silently under-count. Align the declaration shape or update the regex.",
+        )
+    ro_bodies = [ro_match.group(1), *part_bodies]
+    read_only: set[str] = set()
+    for body in ro_bodies:
+        read_only |= set(re.findall(r'"([a-z_]+)"', re.sub(r"//[^\n]*", "", body)))
+    if not read_only:
+        return _fail(
+            "read-write-split-no-readonly-list",
+            "getReadOnlyToolNames() parsed but yielded zero tool names -- parser/source shape mismatch.",
+        )
+
+    # 3. Flat (top-level) tools = every getAllToolDefinitions() tool that no
+    #    gateway proxies. A read-only tool that is flat satisfies the invariant.
+    #    The defs are split across per-domain _getAllToolDefinitions_part<Name>() chunk
+    #    methods (64KB-method-bytecode cap); gather names from all of them.
+    all_bodies = re.findall(
+        r"^def (?:getAllToolDefinitions|_getAllToolDefinitions_part\w+)\(\) \{(.*?)^}",
+        src, re.DOTALL | re.MULTILINE,
+    )
+    if not all_bodies:
+        return _fail(
+            "read-write-split-no-tool-definitions",
+            "Could not locate getAllToolDefinitions() return literal -- has the function shape changed?",
+        )
+    all_tool_names = set(re.findall(r"^\s*name:\s*['\"]([a-z_]+)['\"]", "\n".join(all_bodies), re.MULTILINE))
+    proxied: set[str] = set()
+    for tools in gateway_tools.values():
+        proxied.update(tools)
+    flat_tools = all_tool_names - proxied
+
+    # 4. Read-gateway reach: every tool surfaced by a gateway whose name carries
+    #    the hub_read_ prefix (derived, not hard-coded).
+    read_gateway_tools: set[str] = set()
+    for name, tools in gateway_tools.items():
+        if name.startswith("hub_read_"):
+            read_gateway_tools.update(tools)
+
+    # 5. The invariant. A read-only tool is stranded iff it is neither flat nor in
+    #    any hub_read_* gateway -- i.e. reachable ONLY through hub_manage_*.
+    ro_body_start = ro_match.start(1)
+    for tool in sorted(read_only):
+        if tool in read_gateway_tools or tool in flat_tools:
+            continue
+        holders = sorted(n for n, ts in gateway_tools.items() if tool in ts)
+        where = f"only via hub_manage_* gateway(s) {holders}" if holders else "by no gateway at all (and it is not flat)"
+        idx = src.find(f'"{tool}"', ro_body_start)
+        line_no = (src[:idx].count("\n") + 1) if idx != -1 else (src[:ro_match.start()].count("\n") + 1)
+        findings.append({
+            "file": rel,
+            "line": line_no,
+            "severity": "error",
+            "rule": "read-write-split-stranded-read",
+            "message": (
+                f"Read-only tool '{tool}' is reachable {where}; it is in NO hub_read_* gateway and is "
+                f"not a flat top-level tool. AGENTS.md 'Gateway read/write split' makes this a hard "
+                f"failure: a read-only tool MUST be in a hub_read_* gateway (multi-gateway membership "
+                f"alongside a hub_manage_* gateway is fine) or be flat. Fix: add '{tool}' to the "
+                f"matching hub_read_* gateway's tools[] list, or -- if it is actually a write -- remove "
+                f"it from getReadOnlyToolNames()."
+            ),
+            "source": "",
+        })
+
+    # 6. Mirror invariant (B): a hub_read_* gateway must contain ONLY read-only
+    #    tools. Derived by prefix so an Nth read gateway is covered too (the Spock
+    #    rollup hard-codes its read-gateway names; this does not).
+    for name in sorted(gateway_tools):
+        if not name.startswith("hub_read_"):
+            continue
+        for tool in gateway_tools[name]:
+            if tool in read_only:
+                continue
+            g_abs = gateway_pos.get(name, ro_match.start())
+            idx = src.find(f'"{tool}"', g_abs)
+            line_no = (src[:idx].count("\n") + 1) if idx != -1 else (src[:g_abs].count("\n") + 1)
+            findings.append({
+                "file": rel,
+                "line": line_no,
+                "severity": "error",
+                "rule": "read-write-split-write-in-read-gateway",
+                "message": (
+                    f"Tool '{tool}' is in read gateway '{name}' but is NOT in getReadOnlyToolNames() "
+                    f"(i.e. it is treated as a write). A hub_read_* gateway must contain only "
+                    f"read-only tools -- a single write flips the gateway's rolled-up readOnlyHint to "
+                    f"write+destructive (annotationsForGateway), mislabeling the entire read surface. "
+                    f"Fix: move '{tool}' to the appropriate hub_manage_* gateway, or -- if it is "
+                    f"genuinely read-only -- add it to getReadOnlyToolNames()."
+                ),
+                "source": "",
+            })
+    return findings
+
+
+def _build_read_write_split_corpus(gateways: dict, read_only: list, all_tools: list) -> str:
+    """Construct a minimal Groovy corpus satisfying check_read_write_split's three
+    extractors (getGatewayConfig / getReadOnlyToolNames / getAllToolDefinitions)
+    so self-test fixtures can drive the REAL check. `gateways` maps gateway-name
+    -> list of proxied tool names."""
+    lines = ["def getGatewayConfig() {", "    return ["]
+    for name, tools in gateways.items():
+        csv = ", ".join(f'"{t}"' for t in tools)
+        lines += [
+            f"        {name}: [",
+            f'            description: "{name} facade",',
+            f"            tools: [{csv}]",
+            "        ],",
+        ]
+    lines += ["    ]", "}", "", "def getReadOnlyToolNames() {", "    return ["]
+    lines.append("        " + ", ".join(f'"{t}"' for t in read_only))
+    lines += ["    ] as Set", "}", "", "def getAllToolDefinitions() {", "    return ["]
+    for t in all_tools:
+        lines += ["        [", f'            name: "{t}"', "        ],"]
+    lines += ["    ]", "}"]
+    return "\n".join(lines) + "\n"
+
+
+# Self-test fixtures for check_read_write_split. Drive the real check with
+# synthetic Groovy corpora to cover must-catch + must-not-catch cases
+# (PIPELINE.md Rule 13) so the guard provably fires and never silently no-ops.
+READ_WRITE_SPLIT_SELF_TEST_CASES = [
+    # (description, groovy source, expected_rule_codes)
+    (
+        "read surfaced by a hub_read_* gateway -- no finding (must-not-catch)",
+        _build_read_write_split_corpus(
+            {"hub_read_devices": ["hub_get_device"],
+             "hub_manage_devices": ["hub_get_device", "hub_update_device"]},
+            ["hub_get_device"],
+            ["hub_get_device", "hub_update_device"],
+        ),
+        set(),
+    ),
+    (
+        "read is flat (proxied by no gateway) -- no finding (must-not-catch)",
+        _build_read_write_split_corpus(
+            {"hub_manage_devices": ["hub_update_device"]},
+            ["hub_get_info"],
+            ["hub_get_info", "hub_update_device"],
+        ),
+        set(),
+    ),
+    (
+        "read in BOTH a read and a manage gateway -- multi-membership OK (must-not-catch)",
+        _build_read_write_split_corpus(
+            {"hub_read_rules": ["hub_get_custom_rule"],
+             "hub_manage_custom_rules": ["hub_get_custom_rule", "hub_delete_custom_rule"]},
+            ["hub_get_custom_rule"],
+            ["hub_get_custom_rule", "hub_delete_custom_rule"],
+        ),
+        set(),
+    ),
+    (
+        "read reachable ONLY through a hub_manage_* gateway -- flags stranded (must-catch)",
+        _build_read_write_split_corpus(
+            {"hub_manage_logs": ["hub_get_logs", "hub_delete_debug_logs"]},
+            ["hub_get_logs"],
+            ["hub_get_logs", "hub_delete_debug_logs"],
+        ),
+        {"read-write-split-stranded-read"},
+    ),
+    (
+        "read in no gateway at all and not flat -- flags stranded, empty holders (must-catch)",
+        _build_read_write_split_corpus(
+            {"hub_manage_logs": ["hub_delete_debug_logs"]},
+            ["hub_ghost_read"],
+            ["hub_delete_debug_logs"],
+        ),
+        {"read-write-split-stranded-read"},
+    ),
+    (
+        "no getGatewayConfig() in source -- flags extractor guard (must-catch)",
+        'def getReadOnlyToolNames() {\n    return [ "hub_get_device" ] as Set\n}\n',
+        {"read-write-split-no-gateway-config"},
+    ),
+    (
+        "read contributed via a library _readOnlyToolNames_part method -- unioned, no finding (must-not-catch)",
+        _build_read_write_split_corpus(
+            {"hub_read_files": ["hub_list_files"],
+             "hub_manage_files": ["hub_list_files", "hub_delete_file"]},
+            [],  # main getter body keeps no literal for this tool
+            ["hub_list_files", "hub_delete_file"],
+        ) + '\ndef _readOnlyToolNames_partFiles() {\n    return ["hub_list_files"]\n}\n',
+        set(),
+    ),
+    (
+        "library part method read stranded in a manage gateway -- still flags (must-catch)",
+        _build_read_write_split_corpus(
+            {"hub_manage_files": ["hub_list_files", "hub_delete_file"]},
+            [],
+            ["hub_list_files", "hub_delete_file"],
+        ) + '\ndef _readOnlyToolNames_partFiles() {\n    return ["hub_list_files"]\n}\n',
+        {"read-write-split-stranded-read"},
+    ),
+    (
+        "part method declared in a drifted format the body regex misses -- flags drift, not a silent under-count (must-catch)",
+        _build_read_write_split_corpus(
+            {"hub_read_files": ["hub_list_files"],
+             "hub_manage_files": ["hub_list_files", "hub_delete_file"]},
+            ["hub_get_info"],
+            ["hub_list_files", "hub_delete_file", "hub_get_info"],
+        ) + '\ndef _readOnlyToolNames_partFiles(){\n    return ["hub_list_files"]\n}\n',  # no space before { -- body regex misses it
+        {"read-write-split-part-format-drift"},
+    ),
+    # --- Mirror invariant (B): no write tool inside a hub_read_* gateway ---
+    (
+        "write tool inside a hub_read_* gateway -- flags write-in-read (must-catch)",
+        _build_read_write_split_corpus(
+            {"hub_read_devices": ["hub_get_device", "hub_update_device"]},
+            ["hub_get_device"],
+            ["hub_get_device", "hub_update_device"],
+        ),
+        {"read-write-split-write-in-read-gateway"},
+    ),
+    (
+        "only read-only tools inside a hub_read_* gateway -- no finding (must-not-catch)",
+        _build_read_write_split_corpus(
+            {"hub_read_files": ["hub_list_files", "hub_read_file"]},
+            ["hub_list_files", "hub_read_file"],
+            ["hub_list_files", "hub_read_file"],
+        ),
+        set(),
+    ),
+]
+
+
+def _run_read_write_split_self_test() -> int:
+    """Drive check_read_write_split with synthetic corpora and verify dispatch
+    correctness + finding-dict shape correctness."""
+    failures = 0
+    for i, (desc, src, expected_codes) in enumerate(READ_WRITE_SPLIT_SELF_TEST_CASES, start=1):
+        findings = check_read_write_split(src_override=src)
+        shape_ok = True
+        for f in findings:
+            try:
+                _ = format_finding(f)
+            except KeyError as ke:
+                failures += 1
+                shape_ok = False
+                print(
+                    f"READ-WRITE-SPLIT-SELF-TEST FAIL [{i}] {desc}\n"
+                    f"  finding dict missing required key for format_finding: {ke}\n"
+                    f"  finding keys present: {sorted(f.keys())}"
+                )
+        if not shape_ok:
+            continue
+        actual_codes = {f["rule"] for f in findings}
+        if actual_codes != expected_codes:
+            failures += 1
+            print(
+                f"READ-WRITE-SPLIT-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected codes: {sorted(expected_codes)}\n"
+                f"  actual codes:   {sorted(actual_codes)}\n"
+                f"  all findings: {findings!r}"
+            )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Device-tool access gate placement (issue: authorization was a per-call-site
+# convention; format validation had a chokepoint but authorization did not)
+# ---------------------------------------------------------------------------
+
+# Native per-device reads/writes. A device tool whose body reaches one of these must
+# ALSO call the access gate (_requireDeviceToolAccess), or carry an explicit exemption
+# below with the reason. _fetchDeviceFullJson validates the id FORMAT for every caller;
+# it deliberately does not authorize, so the gate is what a new tool has to remember.
+DEVICE_NATIVE_ACCESS_TOKENS = (
+    # per-device helpers
+    "_fetchDeviceFullJson(",
+    "_fetchBypassDeviceEvents(",
+    "_postBypassDeviceModel(",
+    "_fireBypassCommand(",
+    # whole-population (bulk) helpers: the path the device tools now read through
+    "_mcpVisibleDevices(",
+    "_fetchAllHubDeviceRecords(",
+    "_seedNativeInventoryFromTree(",
+    "_loadContextResourcePopulation(",
+)
+# Endpoint paths live inside string literals, which the body scan blanks; they are matched on a
+# comments-blanked copy of the body instead, and only as the path argument of a native request
+# call (NATIVE_REQUEST_PATH_CALL: hubInternal*, _hubRequest and every path-forwarding wrapper),
+# so a path named in a comment or a log message never counts.
+DEVICE_NATIVE_ENDPOINT_PATHS = ("/device/", "updatePingDevice")
+_NATIVE_CALL_ARG = NATIVE_REQUEST_PATH_CALL + r"['\"]"
+
+
+def _device_native_tokens(body_code: str, body_strings: str) -> list[str]:
+    hits = [t for t in DEVICE_NATIVE_ACCESS_TOKENS if t in body_code]
+    for p in DEVICE_NATIVE_ENDPOINT_PATHS:
+        # A slash path must START the call's literal; a bare endpoint name may sit anywhere in it.
+        pattern = _NATIVE_CALL_ARG + (re.escape(p) if p.startswith("/") else r"[^'\"\n]*" + re.escape(p))
+        if re.search(pattern, body_strings):
+            hits.append(p)
+    return hits
+
+
+def _device_gate_libraries() -> list[str]:
+    """Every #include library is scanned -- no hand-kept list to fall out of date."""
+    lib_dir = REPO_ROOT / "libraries"
+    return sorted(f"libraries/{p.name}" for p in lib_dir.glob("*.groovy")) if lib_dir.is_dir() else []
+
+# tool method -> why it reaches native device endpoints without the per-device gate.
+# Every entry is a documented scope decision, not a convenience.
+DEVICE_GATE_EXEMPT = {
+    "toolListDevices": "population is _mcpVisibleDevices (selection + MCP children, or the bypass inventory); no caller-supplied device id",
+    "toolDeleteDevice": "administrative force-delete keeps its documented broader scope behind confirm + backup",
+    "toolCreateDevice": "creates the device it then reads; there is no pre-existing device to authorize",
+    "toolCreateVirtualDevice": "MCP-child ownership scoped (reads only the child it created)",
+    "toolListVirtualDevices": "MCP-child ownership scoped",
+    "toolDeleteVirtualDevice": "MCP-child ownership scoped",
+    "toolGetHubLogs": "hub-wide diagnostics by design; deviceId is a log filter and the identity probe returns a boolean only",
+    "toolListHubDrivers": "/device/drivers is the driver catalog, not a device",
+    "toolUpdateHubMesh": "the /device/ Hub Mesh endpoints (setHubMeshFullRefreshInterval, followModes, setHubMeshToken) configure HUB-WIDE mesh settings; no caller-supplied device id is involved",
+}
+
+
+# Public tool declarations: `def toolX(`, or a typed form such as `Map toolX(`. Private/protected
+# helpers are deliberately excluded -- they are reached only through a public tool, which is
+# where the gate belongs.
+_DEVICE_TOOL_DECL = re.compile(r"^(?:def|Map|List|String|Object|boolean|void)\s+(tool\w+)\s*\(", re.M)
+
+
+def _blank_comments(src: str) -> str:
+    """Replace comment CONTENT with spaces (same length, newlines kept); string literals stay."""
+    pattern = re.compile(r'"""(?:\\.|[^\\])*?"""|\'\'\'(?:\\.|[^\\])*?\'\'\''
+                         r'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.S)
+    return pattern.sub(lambda m: m.group(0) if m.group(0)[0] in "\"'" else re.sub(r"[^\n]", " ", m.group(0)), src)
+
+
+def _blank_noncode(src: str) -> str:
+    """Replace the CONTENT of comments and string literals with spaces (same length, newlines
+    kept) so brace matching and token scanning never see a `{` inside a string or comment.
+    Triple-quoted strings, single/double-quoted strings (with escapes), // and /* */ comments."""
+    pattern = re.compile(
+        r'"""(?:\\.|[^\\])*?"""|\'\'\'(?:\\.|[^\\])*?\'\'\''
+        r'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\''
+        r'|//[^\n]*|/\*.*?\*/',
+        re.S,
+    )
+    return pattern.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), src)
+
+
+def _device_tool_bodies(src: str) -> list[tuple[str, int, str, str]]:
+    """(tool name, 1-based line, body) for every top-level public `tool<Name>(` declaration in
+    src. Bodies are scanned with comments and string contents blanked, so a brace or a gate
+    token inside a string or comment neither shifts the boundary nor counts as code."""
+    out: list[tuple[str, int, str, str]] = []
+    code = _blank_noncode(src)
+    strings = _blank_comments(src)
+    for m in _DEVICE_TOOL_DECL.finditer(code):
+        name = m.group(1)
+        i = code.find("{", m.end())
+        if i < 0:
+            continue
+        depth = 0
+        j = i
+        while j < len(code):
+            c = code[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        out.append((name, code.count("\n", 0, m.start()) + 1, code[i:j], strings[i:j]))
+    return out
+
+
+def check_device_tool_access_gate(src_override: dict[str, str] | None = None) -> list[dict]:
+    """Every device tool that reaches a native per-device endpoint must call
+    _requireDeviceToolAccess in its own body, or be listed in DEVICE_GATE_EXEMPT
+    with the reason. Both directions:
+      (A) native access without the gate and without an exemption
+          -> rule "device-tool-access-gate-missing".
+      (B) an exemption for a tool that does not exist or no longer reaches a
+          native endpoint (a stale exemption would silently cover a future tool of
+          that name) -> rule "device-tool-access-gate-stale-exemption".
+    Ships with must-catch + must-not-catch fixtures (DEVICE_GATE_SELF_TEST_CASES).
+    """
+    findings: list[dict] = []
+    sources: dict[str, str]
+    if src_override is not None:
+        sources = src_override
+    else:
+        sources = {}
+        for rel in _device_gate_libraries():
+            sources[rel] = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+    seen_native: set[str] = set()
+    for rel, src in sources.items():
+        for name, line, body, raw in _device_tool_bodies(src):
+            native = _device_native_tokens(body, raw)
+            if not native:
+                continue
+            seen_native.add(name)
+            if "_requireDeviceToolAccess(" in body or name in DEVICE_GATE_EXEMPT:
+                continue
+            findings.append({
+                "file": rel, "line": line, "rule": "device-tool-access-gate-missing",
+                "severity": "error", "source": "",
+                "message": (f"{name} reaches a native device endpoint ({native[0]}) without calling "
+                            "_requireDeviceToolAccess; gate it at tool entry or add a DEVICE_GATE_EXEMPT "
+                            "entry with the scope reason"),
+            })
+    for name in sorted(DEVICE_GATE_EXEMPT):
+        if src_override is not None and name not in {b[0] for src in sources.values() for b in _device_tool_bodies(src)}:
+            continue
+        if name not in seen_native:
+            findings.append({
+                "file": "tests/sandbox_lint.py", "line": 1, "rule": "device-tool-access-gate-stale-exemption",
+                "severity": "error", "source": "",
+                "message": f"DEVICE_GATE_EXEMPT lists {name}, which does not reach a native device endpoint (or no longer exists); remove the entry",
+            })
+    return findings
+
+
+DEVICE_GATE_SELF_TEST_CASES = [
+    # (description, {file: groovy source}, expected_rule_codes)
+    (
+        "native fullJson read without the gate -- must-catch",
+        {"libraries/x.groovy": 'def toolPingDevice(args) {\n    def fj = _fetchDeviceFullJson(args.deviceId)\n    return [ok: fj != null]\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "gate at tool entry -- must-not-catch",
+        {"libraries/x.groovy": 'def toolPingDevice(args) {\n    _requireDeviceToolAccess(args.deviceId)\n    def fj = _fetchDeviceFullJson(args.deviceId)\n    return [ok: fj != null]\n}\n'},
+        set(),
+    ),
+    (
+        "native write via /device/ endpoint without the gate -- must-catch",
+        {"libraries/x.groovy": 'def toolPokeDevice(args) {\n    hubInternalGet("/device/updateLabel", [deviceId: args.id, label: "x"])\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "exempted tool without the gate -- must-not-catch",
+        {"libraries/x.groovy": 'def toolListHubDrivers(args) {\n    return hubInternalGet("/device/drivers")\n}\n'},
+        set(),
+    ),
+    (
+        "no native access at all -- must-not-catch",
+        {"libraries/x.groovy": 'def toolHello(args) {\n    return [hi: findDevice(args.id)?.label]\n}\n'},
+        set(),
+    ),
+    (
+        "typed public declaration without the gate -- must-catch",
+        {"libraries/x.groovy": 'Map toolPingDevice(args) {\n    return [ok: _fetchDeviceFullJson(args.deviceId) != null]\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "gate named only in a string and a comment, braces inside strings -- must-catch (not fooled)",
+        {"libraries/x.groovy": 'def toolPingDevice(args) {\n    // _requireDeviceToolAccess(args.deviceId) is documented here only\n'
+                               '    def note = "call _requireDeviceToolAccess( first { not here }"\n'
+                               '    def fj = _fetchDeviceFullJson(args.deviceId)\n    return [ok: fj != null, note: note]\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "private typed helper is not a tool surface -- must-not-catch",
+        {"libraries/x.groovy": 'private Map toolInstallItem(String type, args) {\n    return _fetchDeviceFullJson(args.id)\n}\n'},
+        set(),
+    ),
+    (
+        "bulk-population read without the gate -- must-catch",
+        {"libraries/x.groovy": 'def toolCountDevices(args) {\n    return [count: _mcpVisibleDevices().size()]\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "endpoint name only in a comment, no native call -- must-not-catch",
+        {"libraries/x.groovy": 'def toolPingNote(args) {\n    // legacy: updatePingDevice was removed here; /device/ping too\n    return [ok: true]\n}\n'},
+        set(),
+    ),
+    (
+        "radio endpoint carrying a device id without the gate -- must-catch",
+        {"libraries/x.groovy": 'def toolPingDevice(args) {\n    return _radioGet("/hub/zigbee/updatePingDevice/${args.id}/true")\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "endpoint name only in a message string, no native call -- must-not-catch (pins the call anchor)",
+        {"libraries/x.groovy": 'def toolPingNote(args) {\n    log.warn("updatePingDevice is gone; /device/ping too")\n    return [ok: true]\n}\n'},
+        set(),
+    ),
+    (
+        "radio endpoint reached through the non-throwing wrapper without the gate -- must-catch",
+        {"libraries/x.groovy": 'def toolPingDevice(args) {\n    return _radioGetSafe("/hub/zigbee/updatePingDevice/${args.id}/true")\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "device endpoint reached through the request core without the gate -- must-catch",
+        {"libraries/x.groovy": 'def toolPokeDevice(args) {\n    return _hubRequest(\'GET\', "/device/fullJson/${args.id}")\n}\n'},
+        {"device-tool-access-gate-missing"},
+    ),
+    (
+        "stale exemption (exempt tool present but reaches no native endpoint) -- must-catch",
+        {"libraries/x.groovy": 'def toolListHubDrivers(args) {\n    return [drivers: []]\n}\n'},
+        {"device-tool-access-gate-stale-exemption"},
+    ),
+]
+
+
+# Path-forwarding wrappers the anchor deliberately does NOT read: name -> why a caller-supplied
+# path literal can never reach the hub through them. Every entry is checked for staleness.
+NATIVE_WRAPPER_UNANCHORED = {
+    "_deleteItemViaEndpoint": "path is its third argument and toolDeleteItem fixes it to the app/driver code-editor delete endpoints; no caller-supplied literal reaches it",
+}
+
+_NATIVE_WRAPPER_DECL = re.compile(
+    r"^(?:(?:private|protected|public|static)\s+)*(?:def|\w+(?:<[^>]*>)?)\s+(\w+)\s*\(([^)]*)\)\s*\{", re.M
+)
+# The request core and its client entry points: the roots every wrapper is derived from.
+_NATIVE_REQUEST_ROOTS = r"hubInternal\w*|_hubRequest"
+
+
+def _native_wrapper_bodies(src: str) -> list[tuple[str, int, list[str], str]]:
+    """(name, 1-based line, parameter names, comments-blanked body) for every top-level function."""
+    out: list[tuple[str, int, list[str], str]] = []
+    code = _blank_noncode(src)
+    strings = _blank_comments(src)
+    for m in _NATIVE_WRAPPER_DECL.finditer(code):
+        params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+        names = [re.split(r"\s*=", p)[0].split()[-1] for p in params]
+        i = m.end() - 1
+        depth = 0
+        j = i
+        while j < len(code):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        out.append((m.group(1), code.count("\n", 0, m.start()) + 1, names, strings[i:j]))
+    return out
+
+
+def check_native_request_wrappers(src_override: dict[str, str] | None = None,
+                                  exempt_override: dict[str, str] | None = None) -> list[dict]:
+    """Derive the native-request wrapper inventory from the source and hold it against
+    NATIVE_REQUEST_PATH_CALL. A wrapper is any function that forwards one of its own parameters
+    as an argument of hubInternal*/_hubRequest or of an already-derived wrapper (to a fixed
+    point, so a wrapper of a wrapper counts). Each one must be recognised by the anchor with
+    the path in its real argument position -- probed by matching the anchor against
+    `name(<placeholder args>, <quote>` -- or carry a NATIVE_WRAPPER_UNANCHORED reason:
+      (A) unrecognised, no reason -> rule "native-wrapper-unanchored" (an endpoint reached
+          through it is invisible to SANDBOX-016 and to the device-tool access gate).
+      (B) a reason for a function that is not a wrapper (or no longer exists)
+          -> rule "native-wrapper-stale-exemption".
+    Ships with must-catch + must-not-catch fixtures (NATIVE_WRAPPER_SELF_TEST_CASES).
+    """
+    findings: list[dict] = []
+    exempt = NATIVE_WRAPPER_UNANCHORED if exempt_override is None else exempt_override
+    if src_override is not None:
+        sources = src_override
+    else:
+        sources = {rel: (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+                   for rel in ["hubitat-mcp-server.groovy", *_device_gate_libraries()]}
+    functions: list[tuple[str, str, int, list[str], str]] = []
+    for rel, src in sources.items():
+        functions.extend((rel, *fn) for fn in _native_wrapper_bodies(src))
+    # callee name pattern -> the argument position its path occupies
+    known: list[tuple[str, int]] = [(r"hubInternal\w*", 0), (r"_hubRequest", 1)]
+    wrappers: dict[str, tuple[str, int, int]] = {}  # name -> (file, line, path param index)
+    grew = True
+    while grew:
+        grew = False
+        # One pattern per path position: the identifier that opens the callee's PATH argument,
+        # bare or opening an interpolated path. A path literal with a parameter appended stays
+        # visible to the rules (the literal is in this body), so it is not forwarding.
+        by_position: dict[int, list[str]] = {}
+        for callee, pos in known:
+            by_position.setdefault(pos, []).append(callee)
+        patterns = [
+            re.compile(r"\b(?:" + "|".join(callees) + r")\(\s*" + r"(?:[^(),\n]*,\s*)" * pos
+                       + r"(?:\"\$\{)?([A-Za-z_]\w*)\b")
+            for pos, callees in by_position.items()
+        ]
+        for rel, name, line, params, body in functions:
+            if name in wrappers or re.fullmatch(_NATIVE_REQUEST_ROOTS, name):
+                continue
+            forwarded = next((m.group(1) for pattern in patterns for m in pattern.finditer(body)
+                              if m.group(1) in params), None)
+            if forwarded is not None:
+                wrappers[name] = (rel, line, params.index(forwarded))
+                known.append((re.escape(name), params.index(forwarded)))
+                grew = True
+    for name, (rel, line, idx) in sorted(wrappers.items()):
+        if name in exempt:
+            continue
+        probe = name + "(" + "'x', " * idx + '"'
+        if re.fullmatch(NATIVE_REQUEST_PATH_CALL + r"['\"]", probe):
+            continue
+        findings.append({
+            "file": rel, "line": line, "rule": "native-wrapper-unanchored",
+            "severity": "error", "source": "",
+            "message": (f"{name} forwards its argument {idx + 1} as a hub request path but "
+                        "NATIVE_REQUEST_PATH_CALL does not read it there; an endpoint reached through it "
+                        "is invisible to SANDBOX-016 and to the device-tool access gate. Add it to the "
+                        "anchor (path in that position) or to NATIVE_WRAPPER_UNANCHORED with the reason"),
+        })
+    present = {fn[1] for fn in functions}
+    for name in sorted(exempt):
+        # A fixture that overrides the exemptions checks the "no longer exists" half too.
+        if src_override is not None and exempt_override is None and name not in present:
+            continue
+        if name not in wrappers:
+            findings.append({
+                "file": "tests/sandbox_lint.py", "line": 1, "rule": "native-wrapper-stale-exemption",
+                "severity": "error", "source": "",
+                "message": f"NATIVE_WRAPPER_UNANCHORED lists {name}, which forwards no hub request path (or no longer exists); remove the entry",
+            })
+    return findings
+
+
+NATIVE_WRAPPER_SELF_TEST_CASES = [
+    # (description, {file: groovy source}, expected_rule_codes)
+    (
+        "anchored wrappers, one forwarding through the other -- must-not-catch",
+        {"libraries/x.groovy": 'private _radioGetSafe(String path, Map query = null) {\n    return _radioGet(path, query)\n}\n'
+                               'private _radioGet(String path, Map query = null) {\n    return hubInternalGet(path, query)\n}\n'},
+        set(),
+    ),
+    (
+        "new wrapper the anchor does not know -- must-catch",
+        {"libraries/x.groovy": 'private _zigbeeGet(String path) {\n    return hubInternalGet(path)\n}\n'},
+        {"native-wrapper-unanchored"},
+    ),
+    (
+        "wrapper of a wrapper, forwarding an interpolated path -- must-catch (transitive)",
+        {"libraries/x.groovy": 'private _pingGet(String p) {\n    return _radioGetSafe("${p}/true")\n}\n'
+                               'private _radioGetSafe(String path) {\n    return _radioGet(path)\n}\n'
+                               'private _radioGet(String path) {\n    return hubInternalGet(path)\n}\n'},
+        {"native-wrapper-unanchored"},
+    ),
+    (
+        "anchored name whose path is not where the anchor reads it -- must-catch",
+        {"libraries/x.groovy": 'private _modePost(Map body, String path) {\n    return hubInternalPostJson(path, body.toString())\n}\n'},
+        {"native-wrapper-unanchored"},
+    ),
+    (
+        "core entry point forwarding to the request core with the path second -- must-not-catch",
+        {"hubitat-mcp-server.groovy": 'def hubInternalGet(String path, Map query = null) {\n    _hubRequest(\'GET\', path, [query: query])\n}\n'},
+        set(),
+    ),
+    (
+        "documented unanchored wrapper -- must-not-catch",
+        {"libraries/x.groovy": 'private Map _deleteItemViaEndpoint(String type, String idParam, String deletePath, args) {\n    return hubInternalGet("${deletePath}${args.id}")\n}\n'},
+        set(),
+    ),
+    (
+        "stale exemption (documented wrapper present but forwards no path) -- must-catch",
+        {"libraries/x.groovy": 'private Map _deleteItemViaEndpoint(String type, args) {\n    return [ok: true]\n}\n'},
+        {"native-wrapper-stale-exemption"},
+    ),
+    (
+        "stale exemption (documented wrapper no longer exists) -- must-catch",
+        {"libraries/x.groovy": 'private _radioGet(String path) {\n    return hubInternalGet(path)\n}\n'},
+        {"native-wrapper-stale-exemption"},
+        {"_ghostGet": "a wrapper that was removed"},
+    ),
+]
+
+
+# Map-subscript rule fixtures: (description, {file: groovy source}, expected (file, line) findings).
+# The scope-model cases pin what a method-wide set got wrong: a closure-local declaration must not
+# classify the enclosing method's name, and an app @Field Map is in scope for every library.
+MAP_SUBSCRIPT_SELF_TEST_CASES = [
+    (
+        "definite Map-to-List reassignment -- must-not-catch",
+        {"libraries/x.groovy": "def read(int index) {\n def rows = [:]\n rows = []\n return rows[index]\n}\n"},
+        [],
+    ),
+    (
+        "branch Map reassignment invalidates outer List proof -- must-catch",
+        {"libraries/x.groovy": "def read(String key, boolean flag) {\n def rows = []\n if (flag) { rows = [:] }\n return rows[key]\n}\n"},
+        [("libraries/x.groovy", 4)],
+    ),
+    (
+        "dynamic read on a def-declared Map -- must-catch",
+        {"libraries/x.groovy": "def read(String key) {\n def m = [:]\n return m[key]\n}\n"},
+        [("libraries/x.groovy", 3)],
+    ),
+    (
+        "dynamic write on a typed Map -- must-catch",
+        {"libraries/x.groovy": "def write(Map m, String key) {\n m[key] = 1\n}\n"},
+        [("libraries/x.groovy", 2)],
+    ),
+    (
+        "dynamic read on a typed Map (measured typed-read exception) -- must-not-catch",
+        {"libraries/x.groovy": "def read(Map m, String key) {\n return m[key]\n}\n"},
+        [],
+    ),
+    (
+        "literal-list bounded key -- must-not-catch",
+        {"libraries/x.groovy": "def copy(Map src) {\n def m = [:]\n ['a', 'b'].each { k -> m[k] = src.get(k) }\n return m\n}\n"},
+        [],
+    ),
+    ('unquoted composed Map key -- must-catch', {"libraries/x.groovy": 'def f(k, suffix) {\n def m = [:]\n m[k + suffix] = 1\n}\n'}, [("libraries/x.groovy", 3)]),
+    ('unquoted composed List key -- must-not-catch', {"libraries/x.groovy": 'def f(k, suffix) {\n def m = []\n m[k + suffix] = 1\n}\n'}, []),
+    ('qualified Map field -- must-catch', {"hubitat-mcp-server.groovy": '@groovy.transform.Field static final java.util.Map CACHE = [:]\n', "libraries/x.groovy": 'def f(key) {\n CACHE[key] = 1\n}\n'}, [("libraries/x.groovy", 2)]),
+    ('inferred Map field -- must-catch', {"hubitat-mcp-server.groovy": '@groovy.transform.Field static final def CACHE = [:]\n', "libraries/x.groovy": 'def f(key) {\n CACHE[key] = 1\n}\n'}, [("libraries/x.groovy", 2)]),
+    ('inferred List field -- must-not-catch', {"hubitat-mcp-server.groovy": '@groovy.transform.Field static final def CACHE = []\n', "libraries/x.groovy": 'def f(key) {\n CACHE[key] = 1\n}\n'}, []),
+    (
+        "app @Field Map written with a dynamic key from a library -- must-catch",
+        {"hubitat-mcp-server.groovy": "@groovy.transform.Field static final Map CACHE = new java.util.HashMap()\n",
+         "libraries/x.groovy": "def remember(String key) {\n CACHE[key] = 1\n}\n"},
+        [("libraries/x.groovy", 2)],
+    ),
+    (
+        "closure-local typed Map does not classify the enclosing method's List -- must-not-catch",
+        {"libraries/x.groovy": "def f(String idx) {\n def x = []\n items.each { Map x = [:] }\n x[idx] = 1\n}\n"},
+        [],
+    ),
+    (
+        "closure Map parameter does not classify an outer name -- must-not-catch",
+        {"libraries/x.groovy": "def f(String idx, List src) {\n def cfg = []\n src.each { Map cfg -> cfg.size() }\n cfg[idx] = 1\n}\n"},
+        [],
+    ),
+    (
+        "closure-local typed Map is still classified inside its own closure -- must-catch",
+        {"libraries/x.groovy": "def f(String idx) {\n items.each { Map x = [:]\n  x[idx] = 1 }\n}\n"},
+        [("libraries/x.groovy", 3)],
+    ),
+    (
+        "GString key with no fixed part -- must-catch",
+        {"libraries/x.groovy": 'def f(String k) {\n def m = [:]\n m["${k}"] = 1\n}\n'},
+        [("libraries/x.groovy", 3)],
+    ),
+    (
+        "GString key whose fixed parts exclude every measured collision -- must-not-catch",
+        {"libraries/x.groovy": 'def f(String k) {\n def m = [:]\n m["switch${k}.@N"] = 1\n}\n'},
+        [],
+    ),
+    (
+        "concatenated key that can still spell a collision -- must-catch",
+        {"libraries/x.groovy": 'def f(String k) {\n def m = [:]\n m[k + "s"] = 1\n}\n'},
+        [("libraries/x.groovy", 3)],
+    ),
+    (
+        "bounded branch broken by a non-short-circuit OR -- must-catch",
+        {"libraries/x.groovy": "def f(String key, boolean flag) {\n def m = [:]\n if (key == 'a' | flag) { m[key] = 1 }\n}\n"},
+        [("libraries/x.groovy", 3)],
+    ),
+    (
+        "safe-navigation receiver -- must-catch",
+        {"libraries/x.groovy": "def f(String key) {\n state.result = [:]\n state?.result[key] = 1\n}\n"},
+        [("libraries/x.groovy", 3)],
+    ),
+]
+
+
+def _run_device_gate_self_test() -> int:
+    failures = 0
+    for i, (desc, src, expected_codes) in enumerate(DEVICE_GATE_SELF_TEST_CASES, start=1):
+        findings = check_device_tool_access_gate(src_override=src)
+        for f in findings:
+            format_finding(f)
+        actual_codes = {f["rule"] for f in findings}
+        if actual_codes != expected_codes:
+            failures += 1
+            print(
+                f"DEVICE-GATE-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected codes: {sorted(expected_codes)}\n"
+                f"  actual codes:   {sorted(actual_codes)}"
+            )
+    return failures
+
+
+def _run_map_subscript_self_test() -> int:
+    failures = 0
+    for i, (desc, src, expected) in enumerate(MAP_SUBSCRIPT_SELF_TEST_CASES, start=1):
+        findings = check_sandbox_map_subscripts(src_override=src)
+        actual = sorted((f["file"], f["line"]) for f in findings)
+        if actual != sorted(expected):
+            failures += 1
+            for f in findings:
+                print(format_finding(f))
+            print(
+                f"MAP-SUBSCRIPT-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected findings: {sorted(expected)}\n"
+                f"  actual findings:   {actual}"
+            )
+    return failures
+
+
+def _run_native_wrapper_self_test() -> int:
+    failures = 0
+    for i, (desc, src, expected_codes, *rest) in enumerate(NATIVE_WRAPPER_SELF_TEST_CASES, start=1):
+        findings = check_native_request_wrappers(src_override=src, exempt_override=rest[0] if rest else None)
+        actual_codes = {f["rule"] for f in findings}
+        if actual_codes != expected_codes:
+            failures += 1
+            for f in findings:
+                print(format_finding(f))
+            print(
+                f"NATIVE-WRAPPER-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected codes: {sorted(expected_codes)}\n"
+                f"  actual codes:   {sorted(actual_codes)}"
+            )
+    return failures
+
+
+def format_finding(f: dict) -> str:
+    """Format a single finding for human-readable output."""
+    severity = f["severity"].upper()
+    loc = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
+    msg = f"[{f['rule']}] {f['message']}"
+    parts = [f"{severity}: {loc}: {msg}"]
+    if f["source"]:
+        parts.append(f"  > {f['source']}")
+    return "\n".join(parts)
+
+
+def format_annotation(f: dict) -> str:
+    """Format a finding as a GitHub Actions annotation."""
+    level = "warning" if f["severity"] == "warning" else "error"
+    line_part = f",line={f['line']}" if f["line"] else ""
+    return f"::{level} file={f['file']}{line_part}::[{f['rule']}] {f['message']}"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+SELF_TEST_CASES = [
+    # (description, groovy source, list of (rule_id, should_match))
+    (
+        "a retired derived cache dot write is flagged",
+        "atomicState.requiredParamsByTool = built",
+        [("PERSISTED_DERIVED_KEY", True)],
+    ),
+    (
+        "a retired derived cache bracket write is flagged",
+        "state['toolSearchCorpus'] = built",
+        [("PERSISTED_DERIVED_KEY", True)],
+    ),
+    (
+        "remove-based retired cache cleanup is NOT flagged",
+        "atomicState.remove('toolSearchTokens')",
+        [("PERSISTED_DERIVED_KEY", False)],
+    ),
+    (
+        "a .methods property read is flagged",
+        "def ms = page.methods.findAll { it }",
+        [("SANDBOX-017", True)],
+    ),
+    (
+        "Map.get('methods') is NOT flagged",
+        'def ms = page.get("methods")',
+        [("SANDBOX-017", False)],
+    ),
+    (
+        "querystring embedded in a hubInternalGet path is flagged",
+        'def r = hubInternalGet("/device/updateLabel?deviceId=${id}&label=${name}")',
+        [("SANDBOX-016", True)],
+    ),
+    (
+        "querystring embedded in a _radioGet path is flagged (it funnels into hubInternalGet)",
+        'def resp = _radioGet("/hub/zigbee/updateChannelAndPower?channel=${c}")',
+        [("SANDBOX-016", True)],
+    ),
+    (
+        "querystring embedded in a _radioGetSafe path is flagged",
+        'result.x = _radioGetSafe("/hub/zwaveRepair2?resetStats=false")',
+        [("SANDBOX-016", True)],
+    ),
+    (
+        "the query-map form is NOT flagged",
+        'def r = hubInternalGet("/device/updateLabel", [deviceId: id, label: name])',
+        [("SANDBOX-016", False)],
+    ),
+    (
+        "a Groovy ternary inside an interpolation is NOT flagged (its '?' is not a querystring)",
+        'hubInternalGet("/hub/advanced/network/ethernetMode/${on ? \'true\' : \'false\'}")',
+        [("SANDBOX-016", False)],
+    ),
+    (
+        "a plain path segment is NOT flagged",
+        'def txt = hubInternalGet("/device/fullJson/${deviceId}")',
+        [("SANDBOX-016", False)],
+    ),
+    (
+        "prose in a line comment describing the anti-pattern is NOT flagged",
+        '// never write hubInternalGet("/device/updateLabel?deviceId=1") -- use the query map',
+        [("SANDBOX-016", False)],
+    ),
+    (
+        "a SINGLE-quoted querystring path is flagged too",
+        "def r = hubInternalGet('/device/updateLabel?deviceId=1&label=x')",
+        [("SANDBOX-016", True)],
+    ),
+    (
+        "the anti-pattern inside a /* */ docblock is NOT flagged",
+        '/**\n * Never do this: hubInternalGet("/device/updateLabel?deviceId=1")\n */\ndef f() { }',
+        [("SANDBOX-016", False)],
+    ),
+    (
+        "a real call AFTER a docblock closes is still flagged",
+        '/** docs */\ndef r = hubInternalGet("/device/updateRoom?deviceId=1&room=Den")',
+        [("SANDBOX-016", True)],
+    ),
+    (
+        "getClass() inside a GString interpolation is flagged",
+        'log.warn "type=${obj?.getClass()?.simpleName}"',
+        [("SANDBOX-001", True)],
+    ),
+    (
+        "getClass() as plain string literal content is NOT flagged",
+        'log.warn "text mentioning getClass() as example"',
+        [("SANDBOX-001", False)],
+    ),
+    (
+        "getClass() inside a single-quoted string is NOT flagged (not a GString)",
+        "log.warn 'type=${obj?.getClass()?.simpleName}'",
+        [("SANDBOX-001", False)],
+    ),
+    (
+        "getClass() inside a triple-single-quoted string is NOT flagged",
+        "def s = '''text ${obj.getClass()} here'''",
+        [("SANDBOX-001", False)],
+    ),
+    (
+        "getClass() inside a triple-double-quoted GString interpolation is flagged",
+        'def s = """prefix ${obj.getClass()} suffix"""',
+        [("SANDBOX-001", True)],
+    ),
+    (
+        "Bare getClass() call is flagged",
+        "def t = obj.getClass().simpleName",
+        [("SANDBOX-001", True)],
+    ),
+    (
+        "Nested closure braces inside a GString interpolation don't break the scanner",
+        'def s = "count=${list.findAll { it.getClass() }.size()}"',
+        [("SANDBOX-001", True)],
+    ),
+    (
+        "Nested double-quoted string inside a GString interpolation is scanned correctly",
+        'log.info "${ "literal".getClass() }"',
+        [("SANDBOX-001", True)],
+    ),
+    (
+        "Brace inside a nested string inside a GString does not close the interpolation early",
+        'log.info "${foo.replace(\'}\', \'\').getClass()}"',
+        [("SANDBOX-001", True)],
+    ),
+    (
+        "getClass() inside a nested string inside an interpolation is NOT flagged",
+        'def s = "ok=${foo.toString().replace("getClass()", "X")}"',
+        [("SANDBOX-001", False)],
+    ),
+    (
+        "Back-to-back interpolations are both scanned",
+        'log.warn "${a.getClass()}${Locale.default}"',
+        [("SANDBOX-001", True), ("SANDBOX-002", True)],
+    ),
+    (
+        "Locale inside a GString interpolation is flagged",
+        'log.info "loc=${Locale.default}"',
+        [("SANDBOX-002", True)],
+    ),
+    (
+        "Escaped dollar does not open an interpolation",
+        'def s = "literal \\${getClass()}"',
+        [("SANDBOX-001", False)],
+    ),
+    (
+        "Line comment containing GString-like text is NOT flagged",
+        '// this is a comment mentioning "${foo.getClass()}"',
+        [("SANDBOX-001", False)],
+    ),
+    (
+        "Block comment containing GString-like text is NOT flagged",
+        '/* "${foo.getClass()}" example */',
+        [("SANDBOX-001", False)],
+    ),
+    (
+        # Groovy's bare-form GString supports `$identifier[.prop...]` for
+        # property access. `$foo.getClass` (no parens) is legal and triggers
+        # the no-arg method at runtime, so the sandbox restriction applies.
+        "Bare $obj.getClass GString form is flagged",
+        'log.warn "type=$obj.getClass"',
+        [("SANDBOX-001", True)],
+    ),
+    (
+        "Bare $var reference without a forbidden identifier is NOT flagged",
+        'log.warn "name=$user.email"',
+        [("SANDBOX-001", False), ("SANDBOX-002", False)],
+    ),
+    (
+        "Bare $var inside a single-quoted string is NOT expanded (still a miss)",
+        "log.warn 'type=$obj.getClass'",
+        [("SANDBOX-001", False)],
+    ),
+    (
+        "Bare $Locale.default in an interpolation is flagged",
+        'log.info "loc=$Locale.default"',
+        [("SANDBOX-002", True)],
+    ),
+    (
+        "new ArrayDeque() (no-arg constructor) is flagged",
+        "def stack = new ArrayDeque()",
+        [("SANDBOX-012", True)],
+    ),
+    (
+        "new ArrayDeque(collection) is flagged",
+        "def stack = new ArrayDeque(apps)",
+        [("SANDBOX-012", True)],
+    ),
+    (
+        "new java.util.ArrayDeque() fully-qualified is flagged",
+        "def stack = new java.util.ArrayDeque()",
+        [("SANDBOX-012", True)],
+    ),
+    (
+        "Groovy list literal `[]` is NOT flagged (the safe alternative)",
+        "def stack = []",
+        [("SANDBOX-012", False)],
+    ),
+    (
+        "new LinkedList() is NOT flagged (LinkedList is sandbox-allowed)",
+        "def stack = new LinkedList()",
+        [("SANDBOX-012", False)],
+    ),
+    (
+        "new GroovyShell() is flagged",
+        "def shell = new GroovyShell()",
+        [("SANDBOX-013", True)],
+    ),
+    (
+        "new groovy.lang.GroovyShell() fully-qualified is flagged",
+        "def shell = new groovy.lang.GroovyShell(binding)",
+        [("SANDBOX-013", True)],
+    ),
+    (
+        "GroovyShell.parse(...) static call is flagged",
+        "def script = GroovyShell.parse(src)",
+        [("SANDBOX-013", True)],
+    ),
+    (
+        "GroovyShell mentioned in a string literal is NOT flagged",
+        'log.warn "do not use GroovyShell here"',
+        [("SANDBOX-013", False)],
+    ),
+    (
+        "instanceof InputStream (the ClassExpression the hub rejected) is flagged",
+        "else if (d instanceof InputStream) zipBytes = d.bytes",
+        [("SANDBOX-015", True)],
+    ),
+    (
+        "a (BufferedReader) cast is flagged",
+        "def r = (BufferedReader) resp.data",
+        [("SANDBOX-015", True)],
+    ),
+    (
+        "a typed FileOutputStream declaration is flagged",
+        "FileOutputStream out = openIt()",
+        [("SANDBOX-015", True)],
+    ),
+    (
+        "duck-typed .bytes read (the safe replacement) is NOT flagged",
+        "zipBytes = d.bytes",
+        [("SANDBOX-015", False)],
+    ),
+    (
+        "instanceof CharSequence (sandbox-allowed) is NOT flagged",
+        "if (d instanceof CharSequence) unexpectedBodyDesc = 'text'",
+        [("SANDBOX-015", False)],
+    ),
+    (
+        "InputStream mentioned only in a comment is NOT flagged",
+        "return d.text  // Reader/InputStream -- may throw mid-stream",
+        [("SANDBOX-015", False)],
+    ),
+]
+
+
+# Doc-content fixtures for the count-pattern + historical-skip
+# machinery. Each fixture pairs a doc-shaped string with a synthetic
+# canonical-counts dict and asserts which TOOL_COUNT findings should
+# appear when `_check_doc_against_canonical` is run.
+#
+# Run via `_run_count_self_test` (separate from `SELF_TEST_CASES` which
+# only covers Groovy `scan_source` rules). The runner mutates the
+# canonical dict to verify each pattern fires on real drift, and
+# verifies historical-skip rules with paired pos/neg cases per pattern.
+COUNT_SELF_TEST_CASES = [
+    # === Headline count patterns: each phrasing should fire on a stale value ===
+    (
+        "total in `(N total)`",
+        "Surface area: (101 total) tools currently exposed.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `N tools total`",
+        "The MCP exposes 101 tools total across the surface.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `MCP Tools (N total)`",
+        "## MCP Tools (101 total)",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `exposes N tools`",
+        "The server exposes 101 tools across 12 gateways.",
+        {"total": 102, "gateways": 12}, ["total"],
+    ),
+    (
+        "total in `All N tools are covered`",
+        "All 101 tools are covered by at least one BAT scenario.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `N (total) distinct tools`",
+        "The codebase has 101 total distinct tools.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `N tool definitions`",
+        "getAllToolDefinitions() returns all 101 tool definitions.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in table-row form",
+        "| Total tools in codebase | 101 |",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "core in `N core tools`",
+        "There are 23 core tools plus the gateway proxies.",
+        {"core": 24}, ["core"],
+    ),
+    (
+        "core in `N core + N gateways`",
+        "Architecture: 23 core + 12 gateways on tools/list.",
+        {"core": 24, "gateways": 12}, ["core"],
+    ),
+    (
+        "core in `Core tools on tools/list | N` table-row",
+        "| Core tools on `tools/list` | 23 |",
+        {"core": 24}, ["core"],
+    ),
+    (
+        "gateways in `N gateways`",
+        "Currently 12 gateways are registered.",
+        {"gateways": 13}, ["gateways"],
+    ),
+    (
+        "gateways in `Gateways on tools/list | N` table-row",
+        "| Gateways on `tools/list` | 12 |",
+        {"gateways": 13}, ["gateways"],
+    ),
+    (
+        "tools_list in `N on tools/list`",
+        "There are 35 on tools/list (the visible surface).",
+        {"tools_list": 36}, ["tools_list"],
+    ),
+    (
+        "tools_list in `Total visible on tools/list | N` table-row",
+        "| Total visible on `tools/list` | 35 |",
+        {"tools_list": 36}, ["tools_list"],
+    ),
+    (
+        "proxied in `(N proxied)`",
+        "Architecture: 35 visible (80 proxied) tools.",
+        {"proxied": 79}, ["proxied"],
+    ),
+    (
+        "proxied in `Tools proxied behind gateways | N` table-row",
+        "| Tools proxied behind gateways | 78 |",
+        {"proxied": 79}, ["proxied"],
+    ),
+
+    # === Historical-skip: WIDE markers (line-scope) ===
+    # Each WIDE marker should let the count escape lint even with a
+    # stale value, regardless of how far it sits from the count.
+    (
+        "WIDE skip: `**vN.N.N**:` anywhere on the line",
+        "**v0.7.7**: 74 tools listed at that point in the codebase history.",
+        {"total": 99}, [],   # 74 != 99 but skipped
+    ),
+    (
+        "WIDE skip: `vN.N.N (` parenthetical",
+        "Run prompts on v0.7.7 (all 74 on tools/list) and v0.8.0 to compare.",
+        {"total": 99}, [],
+    ),
+    (
+        "NARROW skip: `(vN.N.N` close to a count scopes that count only",
+        # `(v0.7.7)` is within ±20 of `74` (chars 13→23) but ~16 chars
+        # from `9 gateways` (chars 13→39, end of `(v0.7.7` at char 19).
+        # `9 gateways` is OUTSIDE the window relative to either bound,
+        # so the count fires; `74` would too if any pattern matched it
+        # (no current pattern catches bare `N tools` without context).
+        "Architecture (v0.7.7): 74 tools across 9 gateways.",
+        {"total": 99, "gateways": 12}, ["gateways"],
+    ),
+
+    # === Historical-skip: NARROW markers (window-scope) ===
+    # Each NARROW marker scopes only a count within ±20 chars; a
+    # live count further out should still fire.
+    (
+        "NARROW skip: `was N` near match scopes the nearby count",
+        "We support 80 proxied tools (was 75 before bundling).",
+        # 80 matches canonical (skipped here), 75 is historical (skipped by `was N`)
+        {"proxied": 80}, [],
+    ),
+    (
+        "NARROW skip does NOT swallow a live count further away",
+        "23 core tools are exposed today, but it was 18 in v0.7.",
+        # 23 is live → fire on stale canonical; 18 has `was` near it → skip
+        {"core": 24}, ["core"],
+    ),
+    (
+        "NARROW skip: `→` migration arrow scopes nearby count",
+        "Migration: was 21 core → 23 core after the gateway split.",
+        # 21 historical (within window of `→`); 23 is also within window → both skip
+        {"core": 25}, [],
+    ),
+    (
+        "NARROW skip: `previously N` near match",
+        "There are 12 gateways (previously 9 before split).",
+        {"gateways": 12}, [],
+    ),
+    (
+        "NARROW skip: `before: N` near match",
+        "(Before: 98) now 101 MCP tools registered.",
+        # 101 MCP tools would drift (canonical=102) but `Before: 98` sits fully
+        # in its look-back window → the `before\s*[:=]\s*\d+` pattern matches → skip.
+        {"total": 102}, [],
+    ),
+
+    # === Section-level: ancestor walk ===
+    (
+        "Section skip: `## Version History` ancestor flips contained counts to historical",
+        "## Version History\n\n- v1.0.0: was 99 tools.\n- v0.9.0: 95 tools.\n",
+        {"total": 102}, [],
+    ),
+    (
+        "Section skip: `### vN.N.N` UNDER Version History inherits historical via ancestor walk",
+        "## Version History\n\n### v1.0.0 (2026-01-01)\n\n95 tools listed.\n",
+        {"total": 102}, [],
+    ),
+    (
+        "Section skip: `## Changelog` ancestor flips contained counts",
+        "## Changelog\n\n- 95 tools at last release.\n",
+        {"total": 102}, [],
+    ),
+    (
+        "Section skip: `## Migration` ancestor flips contained counts",
+        "## Migration\n\n9 gateways became 12 gateways after the split.\n",
+        {"gateways": 12}, [],
+    ),
+    (
+        "NEGATIVE: a live test scenario heading with `(vN.N.N)` is NOT historical",
+        "### T120 — All N gateways in one session (v0.8.0)\n\nThe LLM sees 12 gateways live.\n",
+        # If the old over-aggressive HISTORICAL_SECTION_HEADINGS regex still
+        # treated `(v0.8.0)` headings as historical, this would skip silently.
+        # With the ancestor-walk-only design, we expect the count to fire.
+        {"gateways": 13}, ["gateways"],
+    ),
+    (
+        "NEGATIVE: stale count IN the `(v0.8.0)`-suffixed live heading itself fires",
+        # Pin the maintainer's specific regression: a live test scenario
+        # whose title carries a `(v0.8.0)` provenance suffix should NOT
+        # cause a stale count earlier in the same title to be skipped.
+        # Validates that `\(v\d+...` is NARROW (window-scope), not WIDE.
+        "### T120 — All 10 gateways in one session (v0.8.0)\n",
+        {"gateways": 12}, ["gateways"],
+    ),
+
+    # === Per-gateway extraction patterns ===
+    # Canonical per_gateway keys are hub_-prefixed (hub_manage_X / hub_read_X);
+    # captures normalize through _normalize_gateway_name, so bare-name prose
+    # ("manage_logs (8 tools)") and full-name docs ("`hub_manage_logs` (8)")
+    # both resolve to the same canonical key.
+    (
+        "Per-gateway: bare `manage_X (N tools)` parenthesized (legacy prose form)",
+        "The `manage_logs` (8 tools) gateway covers system-log access.",
+        {"per_gateway": {"hub_manage_logs": 9}}, ["per_gateway:hub_manage_logs"],
+    ),
+    (
+        "Per-gateway: hub_-prefixed inventory-line form `\\`hub_manage_X\\` (N),` "
+        "(the TOOL_GUIDE.md gateway-inventory shape — regression guard: the "
+        "pre-hub_-prefix pattern matched ZERO of these, leaving the real docs "
+        "unguarded). Deliberately NO 'Manage gateways (N):' lead-in — that text "
+        "belongs to GATEWAY_FAMILY_PATTERN's fixtures; one pattern class per fixture.",
+        "Inventory: `hub_manage_logs` (8), `hub_manage_selftest_zz` (4)",
+        {"per_gateway": {"hub_manage_logs": 9, "hub_manage_selftest_zz": 4}},
+        ["per_gateway:hub_manage_logs"],
+    ),
+    (
+        "Per-gateway: hub_read_* gateway (read_ family was previously not "
+        "covered by any pattern)",
+        "`hub_read_selftest_zz` (5) is the pure-read gateway.",
+        {"per_gateway": {"hub_read_selftest_zz": 6}}, ["per_gateway:hub_read_selftest_zz"],
+    ),
+    (
+        "Per-gateway: `manage_X (N tools, qualifier)` allows trailing qualifier",
+        "manage_app_driver_code (10 tools, 7 original + 3 library tools)",
+        {"per_gateway": {"hub_manage_app_driver_code": 11}}, ["per_gateway:hub_manage_app_driver_code"],
+    ),
+    (
+        "Per-gateway: markdown-table form",
+        "| `hub_manage_logs` | 8 |",
+        {"per_gateway": {"hub_manage_logs": 9}}, ["per_gateway:hub_manage_logs"],
+    ),
+    (
+        "Per-gateway: markdown-table form, read_ family",
+        "| `hub_read_selftest_zz` | 5 |",
+        {"per_gateway": {"hub_read_selftest_zz": 6}}, ["per_gateway:hub_read_selftest_zz"],
+    ),
+    (
+        "Per-gateway: `sees N tools` after backticked gateway name",
+        "AI calls `manage_native_rules_and_apps` with no args, sees 12 tools.",
+        {"per_gateway": {"hub_manage_native_rules_and_apps": 13}}, ["per_gateway:hub_manage_native_rules_and_apps"],
+    ),
+    (
+        "Per-gateway: `sees N tools` with hub_-prefixed name (the real BAT-v2 shape)",
+        "AI calls `hub_read_apps_code` with no args, sees catalog of 9 tools.",
+        {"per_gateway": {"hub_read_apps_code": 11}}, ["per_gateway:hub_read_apps_code"],
+    ),
+    (
+        "Per-gateway: unknown gateway name (renamed/removed) fires",
+        "The `hub_manage_ghost_zz` (3 tools) gateway covers nothing.",
+        {}, ["per_gateway:hub_manage_ghost_zz"],
+    ),
+    (
+        "Per-gateway: historical section skips a per-gateway count",
+        "## Version History\n\n### v0.9.0 (2026-01-01)\n\n`hub_manage_logs` (8 tools) at that release.\n",
+        {"per_gateway": {"hub_manage_logs": 9}}, [],
+    ),
+    (
+        "Family subtotal: historical section skips it",
+        "## Version History\n\n### v0.9.0 (2026-01-01)\n\nManage gateways (12) back then.\n",
+        {}, [],
+    ),
+    (
+        "Per-gateway: `sees catalog of N tools` phrasing (catalog-of variant)",
+        "AI calls `manage_installed_apps` with no args, sees catalog of 4 tools.",
+        {"per_gateway": {"hub_manage_installed_apps": 5}}, ["per_gateway:hub_manage_installed_apps"],
+    ),
+
+    # === Gateway-family subtotals ("Read gateways (N):" / "Manage gateways (N):") ===
+    # Expected values derive live from per_gateway keys, so drift fixtures use
+    # counts no real catalog will reach; the no-fire case is proven by the real
+    # lint run over the real docs.
+    (
+        "Family subtotal: wrong `Read gateways (N)` fires",
+        "**Read gateways (999):** `hub_read_selftest_zz` (2)",
+        {"per_gateway": {"hub_read_selftest_zz": 2}}, ["gateway_family:read"],
+    ),
+    (
+        "Family subtotal: wrong `Manage gateways (N)` fires",
+        "**Manage gateways (999):** `hub_manage_selftest_zz` (4)",
+        {"per_gateway": {"hub_manage_selftest_zz": 4}}, ["gateway_family:manage"],
+    ),
+
+    # === Required #2 — asymmetric window: trailing `was N` must not suppress live count ===
+    # The maintainer's concrete miss: "22 core tools today, was 18 previously."
+    # With a symmetric ±20 window the `was` at pos 21 fell inside the forward
+    # half and silently swallowed the live count. The look-back-only window
+    # (ending at match_start) keeps `was` outside and lets the drift fire.
+    (
+        "NARROW asymmetric: trailing `was N` does NOT suppress preceding live count",
+        "22 core tools today, was 18 previously.",
+        {"core": 23}, ["core"],
+    ),
+
+    # === Required #3 — positive fixtures for every COUNT_PATTERN ===
+    (
+        "total in `covering N tools`",
+        "This release is covering 101 tools across all gateways.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `exposing N tools`",
+        "The server is exposing 101 tools to the AI consumer.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `has N tools total`",
+        "The implementation has 101 tools total in the registry.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `N MCP tools`",
+        "There are 101 MCP tools registered for dispatch.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "total in `across all N tools`",
+        "The search index spans across all 101 tools in the catalog.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "proxied in `N additional tools`",
+        "Each gateway exposes 78 additional tools beyond the core set.",
+        {"proxied": 79}, ["proxied"],
+    ),
+    (
+        "total in `from N items to M`",
+        "The client goes from 35 items to 101 after gateway expansion.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "proxied in bare `N proxied` (not paren-prefix, named fixture)",
+        "Summary: 23 core + 13 gateways, 80 proxied, 103 total tools.",
+        # Override the other counts the sentence mentions to their literal in-text
+        # values so ONLY `proxied` drifts (80 vs 79); otherwise the live core /
+        # gateways / total counts -- which changed after PR1B's gateway reshape --
+        # also fire and the fixture stops isolating the proxied pattern.
+        {"proxied": 79, "core": 23, "gateways": 13, "total": 103}, ["proxied"],
+    ),
+    (
+        "total in `N total` punctuation-bounded (named fixture)",
+        "The surface area is 101 total, split across core and gateways.",
+        {"total": 102}, ["total"],
+    ),
+    (
+        "tools_list in `N items on tools/list`",
+        "There are 35 items on tools/list for the AI to discover.",
+        {"tools_list": 36}, ["tools_list"],
+    ),
+    (
+        "proxied in `N proxied tools` (named fixture)",
+        "The server routes calls to 80 proxied tools inside gateways.",
+        {"proxied": 79}, ["proxied"],
+    ),
+    (
+        "total in `total tools in codebase` table-row (named fixture)",
+        "| Total tools in codebase | 101 |",
+        {"total": 102}, ["total"],
+    ),
+
+    # === Required #4 — sibling section does NOT propagate historical status ===
+    # A `## Version History` heading and `## Live API` heading are siblings.
+    # A count under `## Live API` must not inherit historical status from the
+    # sibling; only an ANCESTOR heading (strictly lower level) does that.
+    (
+        "Section skip: sibling `## Version History` does NOT silence count in sibling `## Live API`",
+        "## Version History\n\n- v0.7: 90 tools, 8 gateways\n\n## Live API\n\n23 core tools listed.\n",
+        {"core": 24}, ["core"],
+    ),
+
+    # === Required #5 — ancestor inheritance across two heading levels ===
+    # A `####`-level heading under `### vN.N.N` under `## Version History`
+    # should still inherit historical status via the ancestor walk.
+    (
+        "Section skip: `####` UNDER `### vN.N.N` UNDER `## Version History` inherits via two levels",
+        "## Version History\n\n### v1.0.0 (2026-01-15)\n\n#### Old release details\n\n95 tools in release.\n",
+        {"total": 102}, [],
+    ),
+
+    # === Required #6 — NARROW ±20 boundary fixtures for each marker ===
+    # After the asymmetric-window change the meaningful threshold is the
+    # look-BACK direction only: [match_start - 20, match_start).
+    # Each pair below has:
+    #   "inside"  (marker at match_start-20 = win_start): skip
+    #   "outside" (marker at match_start-21 < win_start): fire
+    #
+    # Arrow `→` (1 char + 19 dots = 20 chars to match_start → inside):
+    (
+        "NARROW boundary: `→` 20 chars before match (inside window, skip)",
+        "→" + "." * 19 + "23 core tools here.",
+        {"core": 24}, [],
+    ),
+    (
+        "NARROW boundary: `→` 21 chars before match (outside window, fire)",
+        "→" + "." * 20 + "23 core tools here.",
+        {"core": 24}, ["core"],
+    ),
+    # `previously N` (13 chars + 7 filler = 20 chars to match_start → inside):
+    (
+        "NARROW boundary: `previously N` 20 chars before match (inside window, skip)",
+        "previously 8 " + "." * 7 + "23 core tools here.",
+        {"core": 24}, [],
+    ),
+    (
+        "NARROW boundary: `previously N` 21 chars before match (outside window, fire)",
+        "previously 8 " + "." * 8 + "23 core tools here.",
+        {"core": 24}, ["core"],
+    ),
+    # `before: N` (10 chars + 10 filler = 20 chars to match_start → inside):
+    (
+        "NARROW boundary: `before: N` 20 chars before match (inside window, skip)",
+        "before: 8 " + "." * 10 + "23 core tools here.",
+        {"core": 24}, [],
+    ),
+    (
+        "NARROW boundary: `before: N` 21 chars before match (outside window, fire)",
+        "before: 8 " + "." * 11 + "23 core tools here.",
+        {"core": 24}, ["core"],
+    ),
+    # `(vN.N.N` (8 chars + 12 filler = 20 chars to match_start → inside):
+    (
+        "NARROW boundary: `(vN.N.N` 20 chars before match (inside window, skip)",
+        "(v0.7.7 " + "." * 12 + "23 core tools here.",
+        {"core": 24}, [],
+    ),
+    (
+        "NARROW boundary: `(vN.N.N` 21 chars before match (outside window, fire)",
+        "(v0.7.7 " + "." * 13 + "23 core tools here.",
+        {"core": 24}, ["core"],
+    ),
+
+    # === Nit C — additional HISTORICAL_SECTION_HEADINGS variants ===
+    (
+        "Section skip: `## Release Notes` ancestor flips contained counts",
+        "## Release Notes\n\n- 95 tools at last release.\n",
+        {"total": 102}, [],
+    ),
+    (
+        "Section skip: `## History` ancestor flips contained counts",
+        "## History\n\n9 gateways registered in earlier versions.\n",
+        {"gateways": 12}, [],
+    ),
+]
+
+
+def _check_doc_against_canonical(content: str, canonical_override: dict) -> set[str]:
+    """Run the doc-scanning checks against `content` with a synthetic
+    canonical dict overlaid on the real extractor result. Returns the
+    set of finding-kinds reported (e.g. {'total', 'core',
+    'per_gateway:manage_logs'}). Used by `_run_count_self_test` to
+    verify each pattern fires on drift and each historical-skip rule
+    holds.
+    """
+    real = _extract_canonical_counts() or {
+        "total": 0, "core": 0, "gateways": 0, "tools_list": 0,
+        "proxied": 0, "dev_only_top_level": 0, "per_gateway": {}, "tool_names": set(),
+        "gateway_names": set(), "proxied_names": set(),
+    }
+    canonical = dict(real)
+    canonical.update(canonical_override)
+    if "per_gateway" in canonical_override:
+        # When overriding per-gateway, merge with real per_gateway so other
+        # gateways referenced incidentally in the fixture text don't all
+        # spuriously fire.
+        merged = dict(real["per_gateway"])
+        merged.update(canonical_override["per_gateway"])
+        canonical["per_gateway"] = merged
+
+    kinds: set[str] = set()
+    seen: set[tuple[int, str, int]] = set()
+
+    # COUNT_PATTERNS scan
+    for pat, kind in COUNT_PATTERNS:
+        expected = canonical[kind]
+        for m in pat.finditer(content):
+            if _is_historical_at(content, m.start(), m.end()):
+                continue
+            actual = int(m.group(1))
+            if actual == expected:
+                continue
+            line_no = content[:m.start()].count("\n") + 1
+            dedup = (line_no, kind, actual)
+            if dedup in seen:
+                continue
+            seen.add(dedup)
+            kinds.add(kind)
+
+    # Gateway-family subtotal scan
+    family_seen: set[tuple[int, str, int]] = set()
+    for m in GATEWAY_FAMILY_PATTERN.finditer(content):
+        if _is_historical_at(content, m.start(), m.end()):
+            continue
+        family = m.group(1).lower()
+        actual = int(m.group(2))
+        line_no = content[:m.start()].count("\n") + 1
+        dedup = (line_no, family, actual)
+        if dedup in family_seen:
+            continue
+        family_seen.add(dedup)
+        if actual != _gateway_family_expected(canonical, family):
+            kinds.add(f"gateway_family:{family}")
+
+    # Per-gateway scans
+    per_gw_seen: set[tuple[int, str, int]] = set()
+    for m in (
+        list(PER_GATEWAY_PATTERN.finditer(content))
+        + list(PER_GATEWAY_TABLE_PATTERN.finditer(content))
+        + list(PER_GATEWAY_SEES_PATTERN.finditer(content))
+    ):
+        if _is_historical_at(content, m.start(), m.end()):
+            continue
+        gw_name = _normalize_gateway_name(m.group(1))
+        actual = int(m.group(2))
+        line_no = content[:m.start()].count("\n") + 1
+        dedup = (line_no, gw_name, actual)
+        if dedup in per_gw_seen:
+            continue
+        per_gw_seen.add(dedup)
+        expected = canonical["per_gateway"].get(gw_name)
+        if expected is None or actual != expected:
+            kinds.add(f"per_gateway:{gw_name}")
+
+    return kinds
+
+
+def _run_count_self_test() -> int:
+    failures = 0
+    for i, (desc, content, override, expected_kinds) in enumerate(
+        COUNT_SELF_TEST_CASES, start=1
+    ):
+        actual_kinds = _check_doc_against_canonical(content, override)
+        expected_set = set(expected_kinds)
+        if actual_kinds != expected_set:
+            failures += 1
+            print(
+                f"COUNT-SELF-TEST FAIL [{i}] {desc}\n"
+                f"  expected kinds: {sorted(expected_set)}\n"
+                f"  actual kinds:   {sorted(actual_kinds)}\n"
+                f"  content: {content!r}"
+            )
+    return failures
+
+
+def _build_synthetic_groovy_corpus(section_key: str, body: str) -> str:
+    """Construct a minimal Groovy corpus that satisfies check_tool_guide_pointers'
+    parser: a getToolGuideSections() return literal with exactly ONE section whose
+    key + body match the test fixture. The body is wrapped in a triple-single-quoted
+    Groovy heredoc with the same 8-space indentation the production regex matches.
+    """
+    # Indent the body so any embedded ''' won't terminate the heredoc accidentally
+    # (we keep the fixture bodies simple -- plain text without ''' or backticks).
+    return (
+        "def getToolGuideSections() {\n"
+        "    return [\n"
+        f"        {section_key}: '''{body}''',\n"
+        "    ]\n"
+        "}\n"
+    )
+
+
+def _run_tool_guide_library_pointer_self_test() -> int:
+    """A get_tool_guide pointer written in a LIBRARY is checked, and named by its own file.
+
+    Guide bodies moved into their domain libraries, so a broken pointer beside one is as
+    reachable as a broken pointer in the app and was previously unscanned.
+    """
+    failures = 0
+    src = _build_synthetic_groovy_corpus("selftest_lib_ptr", "body text")
+
+    bad = [("libraries/mcp-selftest-lib.groovy",
+            "// see get_tool_guide(section='no_such_section_here')\n")]
+    broken = [f for f in check_tool_guide_pointers(src_override=src, lib_pointer_override=bad)
+              if f.get("rule") == "tool-guide-broken-pointer"]
+    if not broken:
+        failures += 1
+        print("SELF-TEST FAIL [tool-guide-library-pointer]: a broken pointer in a library was not flagged")
+    elif broken[0].get("file") != "libraries/mcp-selftest-lib.groovy" or broken[0].get("line") != 1:
+        failures += 1
+        print(f"SELF-TEST FAIL [tool-guide-library-pointer]: finding names {broken[0].get('file')}:{broken[0].get('line')}, not the library line that carries it")
+
+    good = [("libraries/mcp-selftest-lib.groovy",
+             "// see get_tool_guide(section='selftest_lib_ptr')\n")]
+    fp = [f for f in check_tool_guide_pointers(src_override=src, lib_pointer_override=good)
+          if f.get("rule") == "tool-guide-broken-pointer"]
+    if fp:
+        failures += 1
+        print(f"SELF-TEST FAIL [tool-guide-library-pointer]: false positive on a valid library pointer ({fp})")
+    if not failures:
+        print(f"tool-guide library-pointer self-test: PASS ({LIBRARY_POINTER_FIXTURES} fixtures)")
+    return failures
+
+
+# Fixture counts for the three self-test suites that print their own PASS line instead of
+# iterating a fixture table. Named once so the PASS line and the run_self_test total read the
+# same value -- two hardcoded copies is exactly how a summary starts understating coverage.
+LIBRARY_POINTER_FIXTURES = 2
+BLOCK_COMMENT_FIXTURES = 4
+SCHEMA_PROVENANCE_FIXTURES = 6
+
+
+def run_self_test() -> int:
+    """Scan inline fixtures through scan_source and confirm each rule
+    triggers where expected. Uses scan_source (not strip_comments_and_strings
+    + inline rule loop) so the self-test exercises the same code path
+    CI uses for real files."""
+    failures = 0
+    for i, (desc, source, expected) in enumerate(SELF_TEST_CASES, start=1):
+        findings = scan_source(source, f"<self-test case {i}>")
+        hits = {f["rule"] for f in findings}
+        for rule_id, should_match in expected:
+            matched = rule_id in hits
+            if matched != should_match:
+                failures += 1
+                stripped = strip_comments_and_strings(source)
+                print(
+                    f"SELF-TEST FAIL [{i}] {desc}\n"
+                    f"  rule={rule_id} expected={'hit' if should_match else 'miss'} "
+                    f"actual={'hit' if matched else 'miss'}\n"
+                    f"  source: {source!r}\n"
+                    f"  stripped: {stripped!r}"
+                )
+
+    # Sanity-check the canonical tool-count extractor: must succeed and
+    # return a self-consistent count breakdown. Extractor failure here
+    # would otherwise only surface as opaque "could not extract" errors
+    # during real lint runs.
+    canonical = _extract_canonical_counts()
+    if canonical is None:
+        failures += 1
+        print(
+            "SELF-TEST FAIL [tool-count extractor]\n"
+            "  _extract_canonical_counts() returned None — getGatewayConfig() "
+            "or getAllToolDefinitions() format may have changed in the "
+            "Groovy source."
+        )
+    else:
+        # Self-consistency of the count breakdown. NOTE: sum(per_gateway.values())
+        # is NOT used as `core + sum == total` anymore -- since PR1B introduced
+        # multi-gateway membership (a read listed in both its hub_read_* and a
+        # hub_manage_* gateway), the per-gateway sum DOUBLE-COUNTS those reads and
+        # exceeds the DISTINCT proxied count. The canonical relationship is on the
+        # distinct count: total == core + distinct_proxied + dev_only_top_level. core is
+        # derived as total - distinct_proxied - dev_only_top_level (dev-mode-only top-level
+        # tools are excluded from the default-catalog `core`; issue #250), so this also guards
+        # a future core-formula change.
+        sum_with_dups = sum(canonical["per_gateway"].values())
+        if canonical["core"] < 0:
+            failures += 1
+            print(
+                f"SELF-TEST FAIL [tool-count extractor]\n"
+                f"  core {canonical['core']} is negative — distinct proxied "
+                f"({canonical['proxied']}) + dev-only top-level ({canonical['dev_only_top_level']}) "
+                f"exceeds total ({canonical['total']}); _extract_canonical_counts() is inconsistent."
+            )
+        if canonical["core"] + canonical["proxied"] + canonical["dev_only_top_level"] != canonical["total"]:
+            failures += 1
+            print(
+                f"SELF-TEST FAIL [tool-count extractor]\n"
+                f"  core ({canonical['core']}) + distinct proxied ({canonical['proxied']}) + "
+                f"dev-only top-level ({canonical['dev_only_top_level']}) != total ({canonical['total']}) — "
+                "internal inconsistency in _extract_canonical_counts()."
+            )
+        # Multi-membership means the per-gateway sum must be >= the distinct
+        # proxied count; sum < distinct would mean a gateway tool went uncounted.
+        if sum_with_dups < canonical["proxied"]:
+            failures += 1
+            print(
+                f"SELF-TEST FAIL [tool-count extractor]\n"
+                f"  per-gateway sum ({sum_with_dups}) < distinct proxied "
+                f"({canonical['proxied']}) — a gateway tool is uncounted; "
+                "_extract_canonical_counts() is inconsistent."
+            )
+        # Compare the raw list length against the de-duplicated set size.
+        # `total` is intentionally len(list); `tool_names` is set(list).
+        # A duplicate `name:` entry in the Groovy source diverges them,
+        # which is the regression class this assertion catches.
+        if canonical["total"] != len(canonical["tool_names"]):
+            failures += 1
+            print(
+                f"SELF-TEST FAIL [tool-name extractor]\n"
+                f"  raw `name:` count {canonical['total']} != "
+                f"unique-names count {len(canonical['tool_names'])} — "
+                "duplicate `name:` entries in getAllToolDefinitions()."
+            )
+        # gateway_names and tool_names should be disjoint by construction:
+        # getAllToolDefinitions() lists every tool the dispatcher routes to
+        # (core tools + every gateway's proxied operations), while
+        # getGatewayConfig() registers the parent facades separately.
+        # Gateways are NEVER entries in getAllToolDefinitions(); a name
+        # appearing in both would mean a naming collision the dispatcher
+        # would resolve in undefined order.
+        if canonical["gateway_names"] & canonical["tool_names"]:
+            overlap = canonical["gateway_names"] & canonical["tool_names"]
+            failures += 1
+            print(
+                f"SELF-TEST FAIL [tool-name extractor]\n"
+                f"  gateway names overlap tool_names: {sorted(overlap)} — "
+                "a gateway should not also have a getAllToolDefinitions() "
+                "entry; check for naming collision."
+            )
+        # Every tool listed in a gateway's `tools:` array must exist in
+        # getAllToolDefinitions() — gateways are facades, not registries.
+        # A gateway pointing at a non-existent tool is dead-on-arrival:
+        # the gateway dispatch path lazy-expands into the tool's schema
+        # and signature, both pulled from getAllToolDefinitions(). This
+        # catches the "removed a tool but forgot the gateway entry" and
+        # "renamed a tool but missed the gateway entry" regressions.
+        ghost_proxies = canonical["proxied_names"] - canonical["tool_names"]
+        if ghost_proxies:
+            failures += 1
+            print(
+                f"SELF-TEST FAIL [tool-name extractor]\n"
+                f"  gateways reference ghost tools (not in "
+                f"getAllToolDefinitions()): {sorted(ghost_proxies)} — "
+                "either remove the gateway entry or add the tool to "
+                "getAllToolDefinitions()."
+            )
+
+    # Doc-content fixtures for COUNT_PATTERNS + historical-skip rules.
+    count_failures = _run_count_self_test()
+    failures += count_failures
+
+    # Gateway-attribution must-catch / must-not-catch fixtures.
+    failures += _run_gateway_attribution_self_test()
+
+    # Discrete-event-caps must-catch / must-not-catch fixtures (PIPELINE.md Rule 13).
+    discrete_event_failures = _run_discrete_event_caps_self_test()
+    failures += discrete_event_failures
+
+    # Trailing-updateRule envelope parity must-catch / must-not-catch fixtures
+    # (PIPELINE.md Rule 13).
+    envelope_parity_failures = _run_envelope_parity_self_test()
+    failures += envelope_parity_failures
+
+    # Read/write-split must-catch / must-not-catch fixtures (PIPELINE.md Rule 13):
+    # the guard that a read-only tool is never stranded behind only a hub_manage_*
+    # gateway ships with positive + negative fixtures so a regression in the
+    # dispatch logic surfaces here rather than silently weakening the lint.
+    read_write_split_failures = _run_read_write_split_self_test()
+    failures += read_write_split_failures
+
+    # Device-tool access gate placement: must-catch / must-not-catch fixtures.
+    failures += _run_device_gate_self_test()
+    # Native-request wrapper inventory: must-catch / must-not-catch fixtures.
+    failures += _run_native_wrapper_self_test()
+    # Map-subscript rule: dynamic read/write, bounded and typed-read exceptions, scope model.
+    failures += _run_map_subscript_self_test()
+
+    # BP20 library file-scope block-comment guard: must-catch / must-not-catch fixtures.
+    failures += _run_tool_guide_library_pointer_self_test()
+    failures += _run_library_block_comment_self_test()
+
+    # Vendored MCP schema provenance guard: must-catch / must-not-catch fixtures.
+    failures += _run_vendored_schema_hash_self_test()
+
+    if failures:
+        print(f"--- {failures} self-test failure(s) ---")
+        return 1
+    total_cases = (
+        len(SELF_TEST_CASES)
+        + len(COUNT_SELF_TEST_CASES)
+        + len(GATEWAY_ATTRIBUTION_SELF_TEST_CASES)
+        + len(DISCRETE_EVENT_CAPS_SELF_TEST_CASES)
+        + len(ENVELOPE_PARITY_SELF_TEST_CASES)
+        + len(READ_WRITE_SPLIT_SELF_TEST_CASES)
+        + len(DEVICE_GATE_SELF_TEST_CASES)
+        + len(NATIVE_WRAPPER_SELF_TEST_CASES)
+        + len(MAP_SUBSCRIPT_SELF_TEST_CASES)
+        + LIBRARY_POINTER_FIXTURES
+        + BLOCK_COMMENT_FIXTURES
+        + SCHEMA_PROVENANCE_FIXTURES
+    )
+    print(
+        f"Self-test: {total_cases} case(s) passed "
+        f"({len(SELF_TEST_CASES)} sandbox, {len(COUNT_SELF_TEST_CASES)} count, "
+        f"{len(GATEWAY_ATTRIBUTION_SELF_TEST_CASES)} gateway-attribution, "
+        f"{len(DISCRETE_EVENT_CAPS_SELF_TEST_CASES)} discrete-event-caps, "
+        f"{len(ENVELOPE_PARITY_SELF_TEST_CASES)} envelope-parity, "
+        f"{len(READ_WRITE_SPLIT_SELF_TEST_CASES)} read-write-split, "
+        f"{len(DEVICE_GATE_SELF_TEST_CASES)} device-tool-access-gate, "
+        f"{len(NATIVE_WRAPPER_SELF_TEST_CASES)} native-request-wrapper, "
+        f"{len(MAP_SUBSCRIPT_SELF_TEST_CASES)} map-subscript, "
+        f"{LIBRARY_POINTER_FIXTURES} tool-guide-library-pointer, "
+        f"{BLOCK_COMMENT_FIXTURES} library-block-comment, "
+        f"{SCHEMA_PROVENANCE_FIXTURES} mcp-schema-provenance)."
+    )
+    return 0
+
+
+def check_include_library_lockstep() -> list[dict]:
+    """`#include` lines and libraries/*.groovy files must match one-to-one (issues #209/#522) --
+    the rules tools/build-release-app.py enforces when it inlines the libraries into the parent HPM
+    installs, so a gap fails here, in-PR, instead of at publish time:
+    (1) every `#include ns.Name` has a libraries/*.groovy whose FIRST line declares
+        library(namespace: ns, name: Name) (the builder reads only line 1);
+    (2) every library file is #included, exactly once;
+    (3) no two library files declare the same (namespace, name).
+    """
+    findings: list[dict] = []
+    server = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if not server.exists():
+        return findings
+    src = server.read_text(encoding="utf-8", errors="replace")
+    rel = "hubitat-mcp-server.groovy"
+
+    # (1) libraries declared by (namespace, name) from each libraries/*.groovy first line.
+    declared: dict[tuple[str, str], str] = {}
+    lib_dir = REPO_ROOT / "libraries"
+    if lib_dir.is_dir():
+        for lib in sorted(lib_dir.glob("*.groovy")):
+            first = lib.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+            m = re.match(r"library\s*\((.*)\)\s*$", first)
+            if not m:
+                findings.append({
+                    "file": f"libraries/{lib.name}", "line": 1, "severity": "error",
+                    "rule": "INCLUDE_LOCKSTEP", "source": first[:80],
+                    "message": (
+                        "Line 1 is not the library(name: ..., namespace: ...) declaration. The release "
+                        "build matches #include against line 1 only (and BP20 wants it first) -- move "
+                        "the declaration to line 1."
+                    ),
+                })
+                continue
+            decl = m.group(1)
+            nm = re.search(r"name:\s*['\"]([^'\"]+)['\"]", decl)
+            ns = re.search(r"namespace:\s*['\"]([^'\"]+)['\"]", decl)
+            if nm and ns:
+                key = (ns.group(1), nm.group(1))
+                if key in declared:
+                    findings.append({
+                        "file": f"libraries/{lib.name}", "line": 1, "severity": "error",
+                        "rule": "INCLUDE_LOCKSTEP", "source": "",
+                        "message": (
+                            f"Duplicate library declaration namespace='{key[0]}', name='{key[1]}' in "
+                            f"both {declared[key]} and {lib.name} -- a duplicate (namespace, name) makes "
+                            f"the hub's #include bind ambiguously (only one copy wins). Rename or remove one."
+                        ),
+                    })
+                else:
+                    declared[key] = lib.name
+
+    included: set[tuple[str, str]] = set()
+    for ln, line in enumerate(src.splitlines(), 1):
+        m = re.match(r"^[ \t]*#include[ \t]+([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)[ \t]*$", line)
+        if not m:
+            continue
+        ns, name = m.groups()
+        token = f"{ns}.{name}"
+        if (ns, name) in included:
+            findings.append({
+                "file": rel, "line": ln, "severity": "error", "rule": "INCLUDE_LOCKSTEP", "source": "",
+                "message": (
+                    f"#include {token} appears more than once -- the release build inlines each "
+                    f"library exactly once. Remove the repeat."
+                ),
+            })
+            continue
+        included.add((ns, name))
+        if (ns, name) not in declared:
+            findings.append({
+                "file": rel, "line": ln, "severity": "error", "rule": "INCLUDE_LOCKSTEP", "source": "",
+                "message": (
+                    f"#include {token} has no matching libraries/*.groovy "
+                    f"(a library() with namespace='{ns}', name='{name}'). The app won't compile -- "
+                    f"add the library file."
+                ),
+            })
+
+    # (2) the other direction: a library file nothing #includes would be refused by the build.
+    for (ns, name), filename in declared.items():
+        if (ns, name) not in included:
+            findings.append({
+                "file": f"libraries/{filename}", "line": 1, "severity": "error",
+                "rule": "INCLUDE_LOCKSTEP", "source": "",
+                "message": (
+                    f"libraries/{filename} ({ns}.{name}) is not #included by {rel}, so the release "
+                    f"build refuses it. Add the #include or delete the file."
+                ),
+            })
+    return findings
+
+
+def _advance_triple_quote_state(line: str, state: "str | None") -> "str | None":
+    r"""Return the triple-quoted-string state at the END of `line`, given the state at its
+    start (the delimiter we are inside -- triple-double or triple-single -- or None).
+
+    Only triple-quoted strings span lines, so only that state carries across lines. Within a
+    line, quote tokens that are NOT real triple-quoted-string delimiters must be skipped, or
+    they false-flip the state and blind the file-scope-block-comment scan for the rest of the
+    file: anything after an unquoted // line comment, anything inside a regular single/double-
+    quoted string, and a triple-quote whose first quote is backslash-escaped (Groovy's escape
+    for a literal triple-quote inside a triple-quoted string)."""
+    def _escaped(idx):
+        b = 0
+        k = idx - 1
+        while k >= 0 and line[k] == "\\":
+            b += 1
+            k -= 1
+        return b % 2 == 1
+    i = 0
+    n = len(line)
+    reg = None  # delimiter of the regular (non-triple) string we are inside, or None
+    while i < n:
+        if state is not None:
+            # Inside a triple-quoted string: only the matching, unescaped triple closes it.
+            if line.startswith(state, i) and not _escaped(i):
+                state = None
+                i += 3
+                continue
+            i += 1
+            continue
+        if reg is not None:
+            # Inside a regular (non-triple) string: only the matching, unescaped quote closes it.
+            if line[i] == reg and not _escaped(i):
+                reg = None
+            i += 1
+            continue
+        # In code: an unquoted // starts a line comment -- the rest of the line is not scannable.
+        if line[i] == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        if line.startswith('"""', i) and not _escaped(i):
+            state = '"""'
+            i += 3
+            continue
+        if line.startswith("'''", i) and not _escaped(i):
+            state = "'''"
+            i += 3
+            continue
+        if line[i] in ('"', "'"):
+            reg = line[i]
+            i += 1
+            continue
+        i += 1
+    return state
+
+
+def _scan_library_block_comments(name: str, text: str) -> list[dict]:
+    """Flag file-scope (column-0) /* or /** block comments that are outside any
+    triple-quoted string. Block comments INSIDE a method body are indented, so they
+    never start at column 0 and are not flagged."""
+    findings: list[dict] = []
+    state = None
+    for i, line in enumerate(text.split("\n"), 1):
+        if state is None and line.startswith("/*"):
+            findings.append({
+                "file": name, "line": i, "severity": "error",
+                "rule": "library-file-scope-block-comment", "source": line[:80],
+                "message": (
+                    "File-scope /* */ or /** */ block comment in a #include library (BP20). "
+                    "The hub parser can fail with 'Internal error' on save of a library that carries "
+                    "a file-scope block comment under #include -- and the inlined Spock compile + "
+                    "release build do NOT catch it, only the live hub does. Convert it to // line "
+                    "comments (the pattern every other library uses)."
+                ),
+            })
+        state = _advance_triple_quote_state(line, state)
+    return findings
+
+
+def check_bm25_key_subscripts() -> list[dict]:
+    """hub_search_tools sandbox fix guard. The platform's SandboxSubscriptGuard rejects a COMPUTED
+    map key that collides with a reflection-ish property name, and one real corpus token
+    ("fields", from hub_list_devices' parameter) does -- so every key used to subscript the
+    df/tf maps in bm25Score must be derived through _bm25Key. The Spock harness is plain Groovy
+    with no such guard, so a test cannot fail on a bare token key; only a source-level rule can
+    hold this invariant. Checked at the DERIVATION: a subscript variable assigned from anything
+    but _bm25Key(...) fails, as does a literal subscript, as does a body with no _bm25Key call."""
+    findings: list[dict] = []
+    lib = REPO_ROOT / "libraries" / "mcp-discovery-lib.groovy"
+    if not lib.is_file():
+        return findings
+    src = lib.read_text(encoding="utf-8")
+    m = re.search(r"\n[^\n]*\bbm25Score\([^)]*\)\s*\{", src)
+    if not m:
+        findings.append({"file": str(lib.relative_to(REPO_ROOT)), "line": 1, "severity": "error",
+                         "rule": "bm25-key-subscripts",
+                         "message": "Could not locate bm25Score() -- has the function shape changed?"})
+        return findings
+    start = m.end()
+    end = src.find("\n}", start)
+    body = src[start:end if end > 0 else len(src)]
+    base_line = src.count("\n", 0, start) + 1
+    rel = str(lib.relative_to(REPO_ROOT))
+
+    body_lines = body.split("\n")
+
+    def flag(i: int, msg: str) -> None:
+        findings.append({"file": rel, "line": base_line + i, "severity": "error",
+                         "rule": "bm25-key-subscripts", "message": msg,
+                         "source": body_lines[i].strip() if 0 <= i < len(body_lines) else ""})
+
+    # Which local names are used as df/tf subscripts, and where each is assigned.
+    subscript_vars: set[str] = set()
+    for i, line in enumerate(body.split("\n")):
+        for sm in re.finditer(r"\b(?:df|tf)\s*\[\s*([^\]]+?)\s*\]", line):
+            key = sm.group(1).strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                subscript_vars.add(key)
+            elif key.startswith("_bm25Key("):
+                continue
+            else:
+                flag(i, f"df/tf subscripted with a non-variable key `{key}` in bm25Score -- route it through _bm25Key(token).")
+    derived: set[str] = set()
+    for i, line in enumerate(body.split("\n")):
+        for am in re.finditer(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]+?)(?:;|$)", line):
+            name, rhs = am.group(1), am.group(2).strip()
+            if name in subscript_vars:
+                if rhs.startswith("_bm25Key("):
+                    derived.add(name)
+                else:
+                    flag(i, f"`{name}` is used as a df/tf subscript but is assigned from `{rhs}` -- it must be _bm25Key(...); a raw corpus token as a map key trips the platform's SandboxSubscriptGuard (hub_search_tools threw on every call).")
+    # Positive evidence required: a subscript variable with NO _bm25Key assignment in the body is a
+    # closure parameter or an outer binding carrying the raw token straight into the map.
+    for name in sorted(subscript_vars - derived):
+        flag(0, f"`{name}` subscripts df/tf but is never assigned from _bm25Key(...) in bm25Score -- a raw corpus token as a map key trips the platform's SandboxSubscriptGuard.")
+    if "_bm25Key(" not in body:
+        flag(0, "bm25Score never calls _bm25Key -- the sandbox-safe key namespacing has been removed.")
+    return findings
+
+
+def check_sandbox_map_subscripts(
+    src_override: dict[str, str] | None = None,
+) -> list[dict]:
+    """Scan Map reads/writes using the measured Hubitat access contract.
+
+    Lowercase fields/class/metaClass fail on untyped bracket receivers.
+    Explicit Map receivers accept the measured fields/class operations, but
+    metaClass writes attempt a cast. getClass and Fields are valid data keys.
+    Dynamic accesses require explicit get/put unless their keys are locally
+    bounded or the measured typed-read exception applies. This is a blocking
+    source invariant, not a claim that each match
+    is a reproduced bug or that the measured collision set is exhaustive.
+    See tests/fixtures/sandbox-map-probes.md for measurements and inference limits.
+    """
+    if src_override is None:
+        paths = [
+            REPO_ROOT / "hubitat-mcp-server.groovy",
+            REPO_ROOT / "hubitat-mcp-rule.groovy",
+            *sorted((REPO_ROOT / "libraries").glob("*.groovy")),
+        ]
+        sources = {
+            path.relative_to(REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+            for path in paths if path.is_file()
+        }
+    else:
+        sources = src_override
+
+    ident = r"[A-Za-z_][A-Za-z0-9_]*"
+    map_type = r"(?:Map|LinkedHashMap|HashMap|TreeMap|ConcurrentHashMap)(?:\s*<[^{};=]+?>)?"
+    method_re = re.compile(
+        rf"^[ \t]*(?:(?:private|protected|public)\s+)?(?:static\s+)?"
+        rf"(?:(?P<type>{ident}(?:<[^{{}}\n]+>)?)\s+)?"
+        rf"(?P<name>(?!(?:if|for|while|switch|catch|synchronized|else)\b){ident})\s*\(",
+        re.MULTILINE,
+    )
+    map_decl = re.compile(rf"\b{map_type}\s+({ident})\b")
+    assignment_re = re.compile(rf"(?<![.\w?])({ident}(?:\??\.{ident})*)\s*=(?!=|~)\s*")
+    checked_map = re.compile(rf"\b({ident})\s+(?:instanceof|as)\s+Map\b")
+    conditional_map = re.compile(
+        rf"\b({ident})\s*=\s*[^\n;]*\binstanceof\s+Map\b[^\n;]*:\s*\[:\]"
+    )
+    fallback_map = re.compile(rf"\b({ident})\s*=\s*[^\n;]*\?:\s*\[:\]")
+    cast_map = re.compile(rf"\b({ident})\s*=\s*[^\n;]*\bas\s+Map\b")
+    field_map = re.compile(
+        rf"@(?:groovy\.transform\.)?Field\s+(?:(?:static|final|private|protected|public)\s+)*"
+        rf"(?:java\.util\.(?:concurrent\.)?)?{map_type}\s+({ident})\b"
+    )
+    field_inferred = re.compile(
+        rf"@(?:groovy\.transform\.)?Field\s+(?:(?:static|final|private|protected|public)\s+)*"
+        rf"(?:def\s+)?({ident})\s*=\s*([^\n;]+)"
+    )
+    # A safe-navigation receiver (ctx?.data[key]) is the same Map access; the
+    # receiver is normalised without its '?' before it is looked up.
+    subscript_re = re.compile(
+        rf"\b(?P<receiver>{ident}(?:\??\.{ident})*)\s*\[\s*"
+        rf"(?P<key>{ident}(?:\??\.{ident})*(?:\(\))?)\s*\]"
+    )
+    literal_re = re.compile(
+        rf"\b(?P<receiver>{ident}(?:\??\.{ident})*)\s*\[\s*"
+        r"(?P<quote>['\"])(?P<key>fields|class|metaClass)(?P=quote)\s*\]"
+    )
+    # Balance the outer subscript so nested call arguments and List indices
+    # remain part of a composed key, rather than ending a regex match early.
+    subscript_open_re = re.compile(rf"\b(?P<receiver>{ident}(?:\??\.{ident})*)\s*\[")
+    interpolated_key_re = re.compile(r'"[^"\n]*\$(?:\{|[A-Za-z_])[^"\n]*"')
+    # The raw literal is correlated against executable code below; a quoted
+    # example in a comment cannot establish a safe branch.
+    bounded_if_re = re.compile(
+        rf"\bif\s*\(\s*(?P<key>{ident})\s*==\s*"
+        r"""(?P<quote>['"])(?P<literal>[^'"\n$\\]+)(?P=quote)"""
+        r"\s*(?:&&[^{}]*?)?\)\s*\{"
+    )
+    collisions = {"fields", "class", "metaClass"}
+
+    def close_delimiter(code: str, opening: int, left: str, right: str) -> int:
+        depth = 1
+        for pos in range(opening + 1, len(code)):
+            depth += (code[pos] == left) - (code[pos] == right)
+            if depth == 0:
+                return pos
+        return len(code)
+
+    def close_brace(code: str, opening: int) -> int:
+        return close_delimiter(code, opening, "{", "}")
+
+    def method_records(code: str):
+        for match in method_re.finditer(code):
+            params_end = close_delimiter(code, match.end() - 1, "(", ")")
+            opening = params_end + 1
+            while opening < len(code) and code[opening].isspace():
+                opening += 1
+            if opening < len(code) and code[opening] == "{":
+                yield match, code[match.end():params_end], opening, close_brace(code, opening)
+
+    def is_map_literal(expression: str) -> bool:
+        if not expression.startswith("[") or close_delimiter(expression, 0, "[", "]") != len(expression) - 1:
+            return False
+        # Only an outer entry separator establishes a Map. Nested Maps and
+        # ternary/Elvis expressions are also legal elements of a List.
+        depth = 0
+        ternaries = 0
+        for pos, token in enumerate(expression[1:-1], start=1):
+            depth += (token in "([{") - (token in ")]}")
+            if depth != 0:
+                continue
+            if token == "?" and expression[pos + 1:pos + 2] not in (".", "["):
+                ternaries += 1
+            elif token == ":":
+                if ternaries:
+                    ternaries -= 1
+                else:
+                    return True
+        return False
+
+    def outer_expression_tokens(expression: str):
+        depth = 0
+        for pos, token in enumerate(expression):
+            if depth == 0:
+                yield pos, token
+            depth += (token in "([{") - (token in ")]}")
+
+    def assignment_records(body: str):
+        # Keep multiline literals together and include their property/index/
+        # method suffixes: the initializer result may differ from its prefix.
+        for assignment in assignment_re.finditer(body):
+            tail = body[assignment.end():]
+            end = next((pos for pos, token in outer_expression_tokens(tail)
+                        if token in "\n;,)]}"), len(tail))
+            yield assignment[1], tail[:end].strip(), assignment.start()
+
+    def assignment_expressions(body: str):
+        for dest, expression, _ in assignment_records(body):
+            yield dest, expression
+
+    def is_map_expression(expression: str, maps: set[str], returns: set[str]) -> bool:
+        expression = expression.strip()
+        while expression.startswith("(") and close_delimiter(expression, 0, "(", ")") == len(expression) - 1:
+            expression = expression[1:-1].strip()
+        if re.fullmatch(rf"{ident}(?:\.{ident})*", expression):
+            return expression in maps
+        for pos, token in outer_expression_tokens(expression):
+            if token == "+":
+                return (is_map_expression(expression[:pos], maps, returns)
+                        and is_map_expression(expression[pos + 1:], maps, returns))
+        constructor = re.match(rf"new\s+(?:java\.util\.(?:concurrent\.)?)?{map_type}\s*\(", expression)
+        call = re.match(rf"({ident})\s*\(", expression)
+        if constructor or (call and call[1] in returns):
+            opening = (constructor or call).end() - 1
+            return close_delimiter(expression, opening, "(", ")") == len(expression) - 1
+        return is_map_literal(expression)
+
+    def is_list_expression(expression: str) -> bool:
+        while expression.startswith("(") and close_delimiter(expression, 0, "(", ")") == len(expression) - 1:
+            expression = expression[1:-1].strip()
+        if expression.startswith("[") and close_delimiter(expression, 0, "[", "]") == len(expression) - 1:
+            return not is_map_literal(expression)
+        constructor = re.match(
+            r"new\s+(?:java\.util\.(?:concurrent\.)?)?"
+            r"(?:ArrayList|LinkedList|CopyOnWriteArrayList)(?:\s*<[^{};=]+?>)?\s*\(", expression
+        )
+        if constructor:
+            return close_delimiter(expression, constructor.end() - 1, "(", ")") == len(expression) - 1
+        cast = re.search(r"\s+as\s+(?:java\.util\.)?List(?:\s*<[^{};=]+?>)?$", expression)
+        if cast:
+            operand = expression[:cast.start()].strip()
+            # A trailing cast in a conditional applies only to that arm. Limit
+            # proof to a simple receiver or a fully parenthesized operand.
+            return bool(re.fullmatch(rf"{ident}(?:\??\.{ident})*", operand)) or (
+                operand.startswith("(") and close_delimiter(operand, 0, "(", ")") == len(operand) - 1
+            )
+        return False
+
+    def method_return_expressions(body: str) -> list[str]:
+        # A return inside a closure returns from that closure, not its method.
+        # Keep control blocks, but mask other brace bodies before collecting.
+        visible = list(body)
+        pos = 0
+        while pos < len(body):
+            if body[pos] != "{":
+                pos += 1
+                continue
+            prefix = body[:pos].rstrip()
+            control = bool(re.search(r"\b(?:else|try|finally)\s*$", prefix))
+            if prefix.endswith(")"):
+                depth = 1
+                cursor = len(prefix) - 2
+                while cursor >= 0 and depth:
+                    depth += (prefix[cursor] == ")") - (prefix[cursor] == "(")
+                    cursor -= 1
+                control = bool(re.search(
+                    r"\b(?:if|for|while|switch|catch|synchronized)\s*$", prefix[:cursor + 1]
+                ))
+            if control:
+                pos += 1
+            else:
+                end = close_brace(body, pos)
+                visible[pos:end + 1] = ["\n" if char == "\n" else " " for char in body[pos:end + 1]]
+                pos = end + 1
+        code = "".join(visible)
+        expressions = re.findall(r"\breturn\s+([^\n;{}]+)", code)
+        expressions.extend(re.split(r"[\n;]", code.rstrip())[-1:])
+        return [re.sub(r"^\s*return\s+", "", value).strip() for value in expressions]
+
+    mutation_operator = r"(?:=(?!=|~)|(?:<<|>>>?|\*\*|[+*/%&|^\-])=|\+\+|--)"
+
+    def key_binding_unchanged(key: str, code: str) -> bool:
+        mutation = rf"\b{key}\s*{mutation_operator}|(?:\+\+|--)\s*\b{key}\b"
+        if re.search(mutation, code):
+            return False
+        if any(re.search(rf"\b{key}\b", match[1])
+               for match in re.finditer(r"\{\s*([^{}\n]*?)->", code)):
+            return False
+        # A nested closure without an arrow has its own implicit `it` binding.
+        # Conservatively reject nested braces for that particular parameter.
+        nested = code[code.index("{") + 1:] if code.lstrip().startswith("if") and "{" in code else code
+        if key == "it" and "{" in nested:
+            return False
+        return not re.search(rf"\bfor\s*\([^)]*\b{key}\b", code)
+
+    def condition_requires_key_comparison(condition: str) -> bool:
+        opening = condition.index("(")
+        closing = close_delimiter(condition, opening, "(", ")")
+        expression = condition[opening + 1:closing]
+        # The matcher anchors the first term to the key equality. An outer OR
+        # or conditional can admit keys that fail it; an AND's nested OR cannot.
+        for pos, token in outer_expression_tokens(expression):
+            if expression[pos:pos + 2] == "||":
+                return False
+            # Non-short-circuit OR/XOR bind as (key == 'a') | flag: reachable
+            # with any key, so they admit keys exactly like || does.
+            if token in "|^" and expression[pos - 1:pos] != "|" and expression[pos + 1:pos + 2] != "|":
+                return False
+            if token == "?" and expression[pos + 1:pos + 2] not in (".", "["):
+                return False
+        return True
+
+    def writes_subscript(code: str, start: int, end: int) -> bool:
+        return bool(
+            re.match(rf"\s*{mutation_operator}", code[end:])
+            or re.search(r"(?:^|[\n=;{}(,:?+*/%&|^!<>~\-]|\breturn)\s*(?:\+\+|--)\s*$", code[:start])
+        )
+
+    masked = {
+        path: "\n".join(
+            clean.ljust(len(raw))
+            for raw, clean in zip(source.split("\n"), strip_comments_and_strings(source), strict=True)
+        )
+        for path, source in sources.items()
+    }
+    # Libraries are pasted into the parent app. The child app is a different
+    # class: a same-named helper there must not inherit the parent's return type.
+    def scope(path: str) -> str:
+        return "parent" if path.startswith("libraries/") else path
+
+    def return_scope(path: str) -> str:
+        return "parent" if path == "hubitat-mcp-server.groovy" else scope(path)
+
+    methods_by_path = {
+        path: [(match, params, opening, end, code[opening + 1:end])
+               for match, params, opening, end in method_records(code)]
+        for path, code in masked.items()
+    }
+    methods = [(path, *record) for path, records in methods_by_path.items() for record in records]
+    map_returns: dict[str, set[str]] = {}
+    for path, match, _, _, _, _ in methods:
+        known = map_returns.setdefault(return_scope(path), set())
+        if re.fullmatch(map_type, match.group("type") or ""):
+            known.add(match.group("name"))
+
+    def inferred_maps(params: str, body: str, returns: set[str]) -> set[str]:
+        maps = (set(map_decl.findall(params)) | set(map_decl.findall(body)) |
+                set(checked_map.findall(body)) |
+                set(conditional_map.findall(body)) | set(fallback_map.findall(body)) |
+                set(cast_map.findall(body)))
+        aliases = list(assignment_expressions(body))
+        for _ in range(len(aliases) + 1):
+            before = set(maps)
+            for dest, expression in aliases:
+                if is_map_expression(expression, maps, returns):
+                    maps.add(dest)
+            if before == maps:
+                break
+        return maps
+
+    # Infer observable Map returns without relying on helper names. Include
+    # aliases and transitive calls; unknown external helpers stay unknown.
+    for _ in range(len(methods) + 1):
+        changed = False
+        for path, method, params, _, _, body in methods:
+            known = map_returns[return_scope(path)]
+            if method.group("name") in known or method.group("type") not in (None, "def"):
+                continue
+            maps = inferred_maps(params, body, known)
+            for expression in method_return_expressions(body):
+                if is_map_expression(expression, maps, known):
+                    known.add(method.group("name"))
+                    changed = True
+                    break
+        if not changed:
+            break
+    # A @Field Map declared in the app is in scope for every #include'd
+    # library at runtime (they are one class), so field inference follows the
+    # same parent/child scope as return inference, not the file boundary.
+    field_maps_by_scope: dict[str, set[str]] = {}
+    inferred_fields_by_scope: dict[str, set[str]] = {}
+    for path, code in masked.items():
+        field_maps_by_scope.setdefault(return_scope(path), set()).update(field_map.findall(code))
+        inferred_fields_by_scope.setdefault(return_scope(path), set()).update(
+            name for name, expression in field_inferred.findall(code)
+            if is_map_expression(expression, set(), set())
+        )
+
+    def brace_blocks(body: str) -> list[tuple[int, int]]:
+        blocks = []
+        stack = []
+        for pos, token in enumerate(body):
+            if token == "{":
+                stack.append(pos)
+            elif token == "}" and stack:
+                blocks.append((stack.pop(), pos))
+        return blocks
+
+    def statement_end(code: str, start: int) -> int:
+        start += len(code[start:]) - len(code[start:].lstrip())
+        if start >= len(code):
+            return len(code)
+        if code[start] == "{":
+            return min(len(code), close_brace(code, start) + 1)
+        control = re.match(r"(if|for|while|switch|synchronized|catch)\s*\(", code[start:])
+        if control:
+            header_end = close_delimiter(code, start + control.end() - 1, "(", ")")
+            stop = statement_end(code, header_end + 1)
+            alternate = re.match(r"\s*else\b", code[stop:]) if control[1] == "if" else None
+            return statement_end(code, stop + alternate.end()) if alternate else stop
+        if re.match(r"try\b", code[start:]):
+            stop = statement_end(code, start + 3)
+            while continuation := re.match(r"\s*(catch|finally)\b", code[stop:]):
+                if continuation[1] == "catch":
+                    stop = statement_end(code, stop + continuation.start(1))
+                else:
+                    stop = statement_end(code, stop + continuation.end())
+            return stop
+        if re.match(r"do\b", code[start:]):
+            stop = statement_end(code, start + 2)
+            condition = re.match(r"\s*while\s*\(", code[stop:])
+            return (min(len(code), close_delimiter(code, stop + condition.end() - 1, "(", ")") + 1)
+                    if condition else stop)
+        return next((start + pos + (token != "}")
+                     for pos, token in outer_expression_tokens(code[start:]) if token in ";\n}"), len(code))
+
+    findings = []
+    for path, source in sources.items():
+        code = masked[path]
+        raw_lines = source.split("\n")
+        field_maps = field_maps_by_scope.get(return_scope(path), set())
+        inferred_fields = inferred_fields_by_scope.get(return_scope(path), set())
+        for method, params, opening, end, body in methods_by_path[path]:
+            raw_body = source[opening + 1:end]
+            explicit_maps = set(map_decl.findall(params))
+            explicit_maps.update(map_decl.findall(body))
+            explicit_maps.update(field_maps)
+            returns = map_returns[return_scope(path)]
+            maps = explicit_maps | inferred_fields | inferred_maps(params, body, returns)
+            # Groovy scope, not method-wide membership: a declaration (typed
+            # local, closure parameter, `def x = [:]`) binds a name only inside
+            # its innermost brace block and only after its position, so a
+            # closure-local `Map x` cannot classify the enclosing method's `x`.
+            # A plain assignment binds nothing new -- it writes the name already
+            # in scope (a closure assigning an outer local), so it counts from
+            # its position onward regardless of block.
+            blocks = brace_blocks(body)
+            for loop in re.finditer(r"\bfor\s*\(", body):
+                header_end = close_delimiter(body, loop.end() - 1, "(", ")")
+                blocks.append((loop.start(), statement_end(body, header_end + 1)))
+            # Assignment proof must stay within the executed arm, including
+            # controls without braces. This is separate from declaration scope.
+            proof_blocks = list(blocks)
+            control_bodies = []
+            control_headers = []
+            repeat_blocks = []
+            for control in re.finditer(r"\b(?:if|for|while|switch|synchronized|catch)\s*\(", body):
+                header_end = close_delimiter(body, control.end() - 1, "(", ")")
+                control_headers.append((control.start(), header_end))
+                control_bodies.append(header_end + 1)
+                block = (control.start(), statement_end(body, header_end + 1))
+                proof_blocks.append(block)
+                if re.match(r"(?:for|while)\b", control[0]):
+                    repeat_blocks.append(block)
+            for control in re.finditer(r"\b(?:else|do|try|finally)\b", body):
+                control_bodies.append(control.end())
+                block = (control.start(), statement_end(body, control.end()))
+                proof_blocks.append(block)
+                if control[0] == "do":
+                    repeat_blocks.append(block)
+            control_braces = {site + len(body[site:]) - len(body[site:].lstrip()) for site in control_bodies}
+            closure_blocks = [block for block in brace_blocks(body) if block[0] not in control_braces]
+            repeat_blocks.extend(closure_blocks)
+            declared_re = re.compile(rf"\b(?:def|{ident}(?:<[^{{}};=]+>)?)\s+$")
+
+            def declared(site: int, *, body=body, declared_re=declared_re) -> bool:
+                return bool(declared_re.search(body[max(0, site - 64):site]))
+
+            def visible_range(site: int, declaration: bool, *, body=body, blocks=blocks) -> tuple[int, int]:
+                # (from, to): a declaration is visible after itself inside its
+                # innermost block; an assignment is visible after itself anywhere.
+                if declaration:
+                    enclosing = [b for b in blocks if b[0] < site < b[1]]
+                    if enclosing:
+                        return site, max(enclosing)[1]
+                return site, len(body)
+
+            # Resolve the nearest visible declaration at each access. A later
+            # local cannot hide an earlier field use, and a closure parameter
+            # shadows the field only until that closure ends.
+            bindings = []
+            parameter_re = re.compile(rf"\b({ident})\s*(?:=[^,]*)?(?=,|$)")
+            typed_params = set(map_decl.findall(params))
+            bindings.extend((m[1], -1, len(body), m[1] in typed_params)
+                            for m in parameter_re.finditer(params))
+            # Bare command expressions such as `println CACHE` do not declare
+            # a local. Require a type-shaped token before masking a field.
+            local_type = rf"(?:def|boolean|byte|char|double|float|int|long|short|(?:{ident}\.)*[A-Z][A-Za-z0-9_]*)"
+            local_re = re.compile(
+                rf"\b(?P<type>{local_type}(?:\s*<[^{{}};=]+?>)?(?:\[\])?)"
+                rf"\s+(?P<name>{ident})\s*(?==|;|\n|\}}|:|\bin\b)"
+            )
+            typed_local_sites = {m.start(1) for m in map_decl.finditer(body)}
+            for declaration in local_re.finditer(body):
+                site = declaration.start("name")
+                bindings.append((declaration["name"], *visible_range(site, True),
+                                 site in typed_local_sites))
+            for closure in re.finditer(r"\{\s*([^{}]*?)->", body):
+                closure_params = closure[1]
+                typed = set(map_decl.findall(closure_params))
+                bindings.extend((m[1], closure.start(), close_brace(body, closure.start()), m[1] in typed)
+                                for m in parameter_re.finditer(closure_params))
+
+            def binding_at(receiver: str, pos: int, *, bindings=bindings):
+                return max((binding for binding in bindings
+                            if binding[0] == receiver and binding[1] <= pos < binding[2]),
+                           key=lambda binding: binding[1], default=None)
+
+            inferred_sites = [(m.group(1), *visible_range(m.start(), False)) for m in checked_map.finditer(body)]
+            for regex in (conditional_map, fallback_map, cast_map):
+                inferred_sites.extend(
+                    (m.group(1), *visible_range(m.start(), declared(m.start())))
+                    for m in regex.finditer(body)
+                )
+            def explicit_at(receiver: str, pos: int, *, field_maps=field_maps) -> bool:
+                binding = binding_at(receiver, pos)
+                return binding[3] if binding is not None else receiver in field_maps
+
+            assignments = list(assignment_records(body))
+            list_proofs = []
+            for dest, expression, start in assignments:
+                enclosing = [block for block in proof_blocks if block[0] < start < block[1]]
+                stop = max(enclosing)[1] if enclosing else len(body)
+                boundary = max([body.rfind(token, 0, start) + 1 for token in "\n;{"]
+                               + [site for site in control_bodies if site <= start])
+                prefix = body[boundary:start].strip()
+                standalone = (not prefix or bool(re.fullmatch(local_type + r"\s*(?:<[^{};=]+?>)?", prefix)))
+                # Newlines inside an expression do not turn a skipped operand
+                # into an unconditional statement. Headers are never proof.
+                prior = body[:boundary].rstrip()
+                standalone = standalone and not (prior and prior[-1] in "&|?:=,+-*/%(")
+                standalone = standalone and not any(left < start < right for left, right in control_headers)
+                list_proofs.append((dest.replace("?", ""), start, stop,
+                                    standalone and is_list_expression(expression)))
+
+            def list_at(receiver: str, pos: int, *, list_proofs=list_proofs,
+                        closure_blocks=closure_blocks, repeat_blocks=repeat_blocks) -> bool:
+                binding = binding_at(receiver, pos)
+                # Select the latest assignment before checking its scope: a
+                # branch-local Map assignment invalidates an earlier outer List
+                # proof, while a shadowing local writes a different binding.
+                latest = next((record for record in reversed(list_proofs)
+                               if record[0] == receiver and record[1] < pos
+                               and binding_at(receiver, record[1]) == binding), None)
+                if latest is None or pos >= latest[2] or not latest[3]:
+                    return False
+                for name, site, _, _ in list_proofs:
+                    if name != receiver or binding_at(receiver, site) != binding:
+                        continue
+                    # A captured write can run later than its source position;
+                    # an outer List proof also cannot cover a loop's next pass.
+                    if any(left < site < right and not left < pos < right for left, right in closure_blocks):
+                        return False
+                    if any(latest[1] < left < pos < right and left < site < right for left, right in repeat_blocks):
+                        return False
+                return True
+
+            def map_at(receiver: str, pos: int, *, inferred_sites=inferred_sites,
+                       inferred_fields=inferred_fields) -> bool:
+                field_inferred_here = receiver in inferred_fields and binding_at(receiver, pos) is None
+                return explicit_at(receiver, pos) or (not list_at(receiver, pos) and (field_inferred_here or any(
+                    name == receiver and start < pos < stop
+                    and binding_at(receiver, start) == binding_at(receiver, pos)
+                    for name, start, stop in inferred_sites
+                )))
+
+            for dest, expression, start in assignments:
+                visible_maps = {name for name in maps if map_at(name, start)}
+                if is_map_expression(expression, visible_maps, returns):
+                    inferred_sites.append((dest.replace("?", ""), *visible_range(start, declared(start))))
+
+            bounded = []
+            # A literal list is a finite key set, but only if its actual values
+            # exclude measured collisions. Never exempt a whole helper by name.
+            literal_each = re.compile(
+                rf"\[(?P<values>[^\[\]\n]*)\]\.each\s*\{{\s*(?P<key>{ident})\s*->"
+            )
+            for loop in literal_each.finditer(raw_body):
+                values = loop.group("values")
+                literals = re.findall(r"(['\"])([^'\"$\\]*)\1", values)
+                remainder = re.sub(r"(['\"])([^'\"$\\]*)\1", "", values)
+                if (literals and re.fullmatch(r"[\s,]*", remainder)
+                        and not any(value in collisions for _, value in literals)
+                        and body[loop.start():].startswith("[")):
+                    brace = loop.end() - 1
+                    stop = close_brace(body, brace)
+                    if key_binding_unchanged(loop.group("key"), body[loop.end():stop]):
+                        bounded.append((loop.group("key"), brace, stop))
+            for branch in bounded_if_re.finditer(raw_body):
+                if branch.group("literal") in collisions:
+                    continue
+                if not body[branch.start():].startswith("if"):
+                    continue
+                brace = branch.end() - 1
+                if not condition_requires_key_comparison(body[branch.start():brace]):
+                    continue
+                stop = close_brace(body, brace)
+                if key_binding_unchanged(branch.group("key"), body[branch.start():stop]):
+                    bounded.append((branch.group("key"), brace, stop))
+
+            def add(pos: int, message: str, severity: str = "error", *,
+                    code=code, opening=opening, path=path, raw_lines=raw_lines) -> None:
+                line = code.count("\n", 0, opening + 1 + pos)
+                findings.append({
+                    "file": path, "line": line + 1, "severity": severity,
+                    "rule": "sandbox-map-key-subscript", "message": message,
+                    "source": raw_lines[line].strip(),
+                })
+
+            for literal in literal_re.finditer(raw_body):
+                receiver, key = literal.group("receiver", "key")
+                if not body[literal.start():].startswith(receiver):
+                    continue
+                receiver = receiver.replace("?", "")
+                if not map_at(receiver, literal.start()):
+                    continue
+                writing = writes_subscript(body, literal.start(), literal.end())
+                if explicit_at(receiver, literal.start()) and (key != "metaClass" or not writing):
+                    continue
+                add(literal.start(),
+                    f"Measured {'write' if writing else 'read'} collision for '{key}' "
+                    f"on {receiver}; preserve the key with Map.{'put' if writing else 'get'}.")
+
+            def composed_key_can_collide(raw_key: str, masked_key: str) -> bool:
+                # A composed key is bounded by its fixed parts: "switch${id}.@N"
+                # can never spell fields/class/metaClass, "${k}" or k + "s" can.
+                # Literal fragments stay literal, everything else is a wildcard.
+                parts = []
+                for pos, token in outer_expression_tokens(masked_key):
+                    if token == "+":
+                        parts.append(pos)
+                pieces = [raw_key[i + 1:j].strip() for i, j in
+                          zip([-1, *parts], [*parts, len(raw_key)], strict=True)]
+                skeleton = ""
+                for piece in pieces:
+                    if len(piece) >= 2 and piece[0] == piece[-1] and piece[0] in "'\"":
+                        inner = piece[1:-1]
+                        if piece[0] == '"':
+                            inner = re.sub(rf"\$\{{[^}}]*\}}|\${ident}(?:\.{ident})*", "\0", inner)
+                        skeleton += "".join(".*" if ch == "\0" else re.escape(ch) for ch in inner)
+                    elif re.fullmatch(r"[+-]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?[lLfFdDgG]?", piece):
+                        # Numeric addition stays numeric; string concatenation
+                        # retains a digit, excluding every measured collision.
+                        skeleton += re.escape(piece)
+                    else:
+                        skeleton += ".*"
+                return any(re.fullmatch(skeleton, name) for name in collisions)
+
+            accesses = []
+            for access in subscript_re.finditer(body):
+                # Masking a GString retains its interpolation expression. That
+                # must not turn map["prefix${id}"] into an apparent map[id];
+                # the composed scan below reports it with its real key.
+                if subscript_re.fullmatch(raw_body[access.start():access.end()]):
+                    accesses.append((access.start(), access.end(), *access.group("receiver", "key")))
+            for access in subscript_open_re.finditer(body):
+                stop = close_delimiter(body, access.end() - 1, "[", "]")
+                if stop == len(body):
+                    continue
+                raw_key = raw_body[access.end():stop]
+                masked_key = body[access.end():stop]
+                # Strip parentheses together to retain raw/masked offset parity.
+                while True:
+                    leading = len(raw_key) - len(raw_key.lstrip())
+                    raw_key = raw_key.strip()
+                    masked_key = masked_key[leading:leading + len(raw_key)]
+                    if not (masked_key.startswith("(") and
+                            close_delimiter(masked_key, 0, "(", ")") == len(masked_key) - 1):
+                        break
+                    raw_key, masked_key = raw_key[1:-1], masked_key[1:-1]
+                composed = (interpolated_key_re.fullmatch(raw_key) or
+                            any(token == "+" for _, token in outer_expression_tokens(masked_key)))
+                if composed and composed_key_can_collide(raw_key, masked_key):
+                    accesses.append((access.start(), stop + 1, access.group("receiver"), raw_key))
+            for start, end, receiver, key in sorted(accesses):
+                receiver = receiver.replace("?", "")
+                if not map_at(receiver, start):
+                    continue
+                writing = writes_subscript(body, start, end)
+                if explicit_at(receiver, start) and not writing:
+                    continue
+                if any(key == name and block_start < start < stop
+                       for name, block_start, stop in bounded):
+                    continue
+                severity = "error"
+                add(start,
+                    f"Dynamic Map {'write' if writing else 'read'} candidate "
+                    f"{receiver}[{key.strip()}] in {method.group('name')}; "
+                    f"use Map.{'put' if writing else 'get'} for unbounded data keys "
+                    "(caller key bounds require separate verification).", severity)
+    return sorted(findings, key=lambda item: (item["file"], item["line"]))
+
+
+def check_logs_json_snapshot_guard() -> list[dict]:
+    """Slow-read guard for the hub's /logs/json page. That one document carries every device and
+    app stat plus the job tables, so its fetch time grows with hub size and a synchronous read
+    built on it outruns the cloud relay on a large hub (hub_get_jobs and
+    hub_get_performance_stats both 502'd that way). Two source-level invariants keep the fix in
+    place: (1) the only hubInternalGet of "/logs/json" lives in _logsJsonFetchAndPublish, the
+    single fetch implementation behind the JVM snapshot (invoked inline on an unbudgeted request
+    and by the scheduled worker otherwise); (2) every tool whose implementation reads the
+    snapshot is listed in BOTH _mrtrReadTools() (so a modern client continues it through
+    requestState) and _budgetAwareTools() (so the leaf sees the request's __reqT0 clock and
+    hands back in_progress inside the relay budget). The raw-fetch scan matches either quote
+    style of the "/logs/json" literal; an indirect fetch (a path built at runtime, or a call
+    through _hubRequest) is outside what a source scan can see, and the runtime [hubrt] slow
+    warning is the backstop for that."""
+    findings: list[dict] = []
+    server = REPO_ROOT / "hubitat-mcp-server.groovy"
+    if not server.is_file():
+        return findings
+    sources = {f: f.read_text(encoding="utf-8") for f in
+               [server, *sorted((REPO_ROOT / "libraries").glob("*.groovy"))]}
+    fn_re = re.compile(r"^(?:private\s+|static\s+)*(?:def|void|boolean|Map|List|String|Set|Long|long|int|Integer)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
+
+    def enclosing_fn(src: str, pos: int) -> str | None:
+        last = None
+        for m in fn_re.finditer(src, 0, pos):
+            last = m.group(1)
+        return last
+
+    def fn_bodies(src: str) -> list[tuple[str, int, str]]:
+        heads = list(fn_re.finditer(src))
+        out = []
+        for i, m in enumerate(heads):
+            end = heads[i + 1].start() if i + 1 < len(heads) else len(src)
+            out.append((m.group(1), src.count("\n", 0, m.start()) + 1, src[m.start():end]))
+        return out
+
+    # (1) the raw fetch has exactly one home.
+    for f, src in sources.items():
+        rel = str(f.relative_to(REPO_ROOT))
+        for m in re.finditer(r"""hubInternalGet(?:Raw)?\(\s*(["'])/logs/json\1""", src):
+            fn = enclosing_fn(src, m.start())
+            if fn != "_logsJsonFetchAndPublish":
+                findings.append({"file": rel, "line": src.count("\n", 0, m.start()) + 1, "severity": "error",
+                                 "rule": "logs-json-snapshot-guard", "source": "",
+                                 "message": f"`{fn}` fetches /logs/json directly. That page grows with hub size and outruns the cloud relay; read it through _logsJsonSnapshot(args) so the fetch runs in the background worker and is cached."})
+
+    # (2) every snapshot reader is a continuation-eligible, budget-aware tool.
+    server_src = sources[server]
+
+    def set_literal(name: str) -> set[str] | None:
+        m = re.search(rf"def {re.escape(name)}\(\)\s*\{{\s*return\s*\[(.*?)\]\s*as\s+Set", server_src, re.S)
+        if not m:
+            return None
+        return set(re.findall(r'"([^"]+)"', m.group(1)))
+
+    read_set = set_literal("_mrtrReadTools")
+    budget_set = set_literal("_budgetAwareTools")
+    if read_set is None or budget_set is None:
+        findings.append({"file": "hubitat-mcp-server.groovy", "line": 1, "severity": "error",
+                         "rule": "logs-json-snapshot-guard", "source": "",
+                         "message": "Could not parse _mrtrReadTools() / _budgetAwareTools() set literals -- has their shape changed?"})
+        return findings
+    dispatch: dict[str, set[str]] = {}
+    for src in sources.values():
+        for tool, fn in re.findall(r'case "(hub_[a-z0-9_]+)":\s*return\s+([A-Za-z_][A-Za-z0-9_]*)\(',
+                                   src):
+            dispatch.setdefault(fn, set()).add(tool)
+    for f, src in sources.items():
+        rel = str(f.relative_to(REPO_ROOT))
+        for fn, line, body in fn_bodies(src):
+            if fn.startswith("_logsJson") or "_logsJsonSnapshot(" not in body:
+                continue
+            tools = dispatch.get(fn)
+            if not tools:
+                findings.append({"file": rel, "line": line, "severity": "error",
+                                 "rule": "logs-json-snapshot-guard", "source": "",
+                                 "message": f"`{fn}` reads the /logs/json snapshot but no executeTool case dispatches to it, so its tool name cannot be checked against _mrtrReadTools()/_budgetAwareTools()."})
+                continue
+            for tool in sorted(tools):
+                missing = [n for n, members in (("_mrtrReadTools", read_set), ("_budgetAwareTools", budget_set)) if tool not in members]
+                if missing:
+                    findings.append({"file": rel, "line": line, "severity": "error",
+                                     "rule": "logs-json-snapshot-guard", "source": "",
+                                     "message": f"`{tool}` ({fn}) reads the /logs/json snapshot but is missing from {' and '.join(missing)}() in hubitat-mcp-server.groovy -- without both, a relay-bound call of it cannot continue and 502s on a large hub."})
+    return findings
+
+def check_library_no_file_scope_block_comments() -> list[dict]:
+    """BP20 library hygiene: no file-scope /* */ or /** */ block comments in any
+    libraries/*.groovy (see _scan_library_block_comments for the rationale)."""
+    findings: list[dict] = []
+    lib_dir = REPO_ROOT / "libraries"
+    if not lib_dir.is_dir():
+        return findings
+    for lib in sorted(lib_dir.glob("*.groovy")):
+        findings.extend(_scan_library_block_comments(
+            f"libraries/{lib.name}", lib.read_text(encoding="utf-8", errors="replace")))
+    return findings
+
+
+def _run_library_block_comment_self_test() -> int:
+    """Must-catch / must-not-catch fixtures for check_library_no_file_scope_block_comments."""
+    failures = 0
+    bad = '/**\n * docblock\n */\ndef foo() { return 1 }\n'
+    if not _scan_library_block_comments("<self-test>", bad):
+        failures += 1
+        print("SELF-TEST FAIL [library-block-comment]: a file-scope /** */ block was not flagged")
+    ok = (
+        '// file-scope line comment is fine\n'
+        'def foo() {\n'
+        '    /* indented in-method block comment is allowed */\n'
+        '    def d = """\n'
+        '/* string content, not a comment */\n'
+        '"""\n'
+        '    return d\n'
+        '}\n'
+    )
+    fp = _scan_library_block_comments("<self-test>", ok)
+    if fp:
+        failures += 1
+        print(f"SELF-TEST FAIL [library-block-comment]: false positive(s) at line(s) {[f['line'] for f in fp]}")
+    # Gemini #279: an escaped triple-quote (\""" -- a literal triple-quote inside a
+    # triple-quoted string) must NOT terminate the string, so a column-0 /* still inside
+    # it is not falsely flagged.
+    esc = (
+        'def foo() {\n'
+        '    def d = """opens; \\""" is a literal triple-quote, still in the string\n'
+        '/* string content after an escaped triple-quote, not a comment */\n'
+        '"""\n'
+        '    return d\n'
+        '}\n'
+    )
+    fp2 = _scan_library_block_comments("<self-test>", esc)
+    if fp2:
+        failures += 1
+        print(f"SELF-TEST FAIL [library-block-comment]: escaped-triple-quote false positive at line(s) {[f['line'] for f in fp2]}")
+    # silent-failure-hunter #279: a triple-quote inside a // comment (or a regular string) must
+    # NOT flip the string state, so a genuine file-scope /* */ AFTER it is still flagged.
+    after_comment = (
+        'def foo() { return 1 }\n'
+        '// a // comment that mentions """ once must not blind the scanner\n'
+        'def s = "a string with \'\'\' in it"\n'
+        '/* a real file-scope block comment that MUST still be flagged */\n'
+        'def bar() { return 2 }\n'
+    )
+    must = _scan_library_block_comments("<self-test>", after_comment)
+    if not must:
+        failures += 1
+        print("SELF-TEST FAIL [library-block-comment]: file-scope /* after a // comment / string containing triple-quotes was NOT flagged")
+    if failures == 0:
+        print(f"library block-comment self-test: PASS ({BLOCK_COMMENT_FIXTURES} fixtures)")
+    return failures
+
+
+MCP_SCHEMA_DIR = REPO_ROOT / "src" / "test" / "resources" / "mcp-schema"
+
+
+def _scan_vendored_schema_hashes(readme: str, actual: dict) -> list[dict]:
+    """Compare each vendored MCP schema's bytes against the provenance the mcp-schema README
+    records for it. `actual` maps '<dir>/schema.json' -> (byte_count, sha256).
+
+    The schemas are the conformance leg's whole referee and the README says they are never
+    hand-edited, but until this check nothing verified it: the recorded hashes matched, and
+    would have kept reading as if they matched after a loosened schema or a half-refresh that
+    updated the file without the provenance (or the reverse). This is what makes a recorded
+    hash a checked fact rather than a claim.
+    """
+    rel = "src/test/resources/mcp-schema/README.md"
+    findings: list[dict] = []
+    recorded: dict[str, tuple[int, str, int]] = {}
+    for m in re.finditer(r"(?m)^###\s+`([^`]+)`\s*$", readme):
+        name = m.group(1)
+        if not name.endswith("schema.json"):
+            continue
+        line = readme[:m.start()].count("\n") + 1
+        section = readme[m.end():]
+        nxt = re.search(r"(?m)^#{1,3}\s", section)
+        if nxt:
+            section = section[:nxt.start()]
+        bullet = re.search(r"(?m)^-\s*([0-9]+)\s+bytes,\s*`sha256\s+([0-9a-f]{64})`", section)
+        if not bullet:
+            findings.append({
+                "file": rel, "line": line, "severity": "error", "rule": "MCP_SCHEMA_PROVENANCE",
+                "source": "",
+                "message": (
+                    f"The `{name}` provenance section records no '- <N> bytes, `sha256 <hex>`' "
+                    "bullet, so nothing pins the vendored bytes. Re-record it (the README's "
+                    "Refreshing section has the command)."
+                ),
+            })
+            continue
+        recorded[name] = (int(bullet.group(1)), bullet.group(2), line)
+
+    for name, (size, digest, line) in sorted(recorded.items()):
+        if name not in actual:
+            findings.append({
+                "file": rel, "line": line, "severity": "error", "rule": "MCP_SCHEMA_PROVENANCE",
+                "source": "",
+                "message": (
+                    f"The README records provenance for `{name}`, but no such file is vendored "
+                    "under src/test/resources/mcp-schema/ -- the conformance spec cannot load it."
+                ),
+            })
+            continue
+        got_size, got_digest = actual[name]
+        if (got_size, got_digest) != (size, digest):
+            findings.append({
+                "file": f"src/test/resources/mcp-schema/{name}", "line": 1, "severity": "error",
+                "rule": "MCP_SCHEMA_PROVENANCE", "source": "",
+                "message": (
+                    f"Vendored schema drifted from the provenance in {rel}:{line} -- recorded "
+                    f"{size} bytes / sha256 {digest}, found {got_size} bytes / sha256 {got_digest}. "
+                    "These files are verbatim upstream copies and are never hand-edited: if this is "
+                    "a deliberate refresh, re-record the byte count, hash, and upstream commit in "
+                    "the README; if it is not, restore the file."
+                ),
+            })
+
+    for name in sorted(set(actual) - set(recorded)):
+        findings.append({
+            "file": f"src/test/resources/mcp-schema/{name}", "line": 1, "severity": "error",
+            "rule": "MCP_SCHEMA_PROVENANCE", "source": "",
+            "message": (
+                f"`{name}` is vendored but has no provenance section in {rel}, so its bytes are "
+                "unpinned. Add a '### `<name>`' section recording the source URL, upstream commit, "
+                "byte count, and sha256."
+            ),
+        })
+    return findings
+
+
+def check_vendored_mcp_schema_hashes() -> list[dict]:
+    """The vendored MCP JSON Schemas must match the hashes recorded in their README."""
+    readme = MCP_SCHEMA_DIR / "README.md"
+    if not readme.is_file():
+        return []
+    actual = {}
+    for f in sorted(MCP_SCHEMA_DIR.glob("*/schema.json")):
+        raw = f.read_bytes()
+        actual[f"{f.parent.name}/{f.name}"] = (len(raw), hashlib.sha256(raw).hexdigest())
+    return _scan_vendored_schema_hashes(readme.read_text(encoding="utf-8", errors="replace"), actual)
+
+
+def _run_vendored_schema_hash_self_test() -> int:
+    """Must-catch / must-not-catch fixtures for check_vendored_mcp_schema_hashes."""
+    failures = 0
+    good_digest = "a" * 64
+    readme = (
+        "# Vendored\n\n"
+        "### `draft/schema.json`\n\n"
+        "- URL: <https://example.invalid/schema.json>\n"
+        f"- 42 bytes, `sha256 {good_digest}`\n\n"
+        "## Refreshing\n"
+    )
+    clean = _scan_vendored_schema_hashes(readme, {"draft/schema.json": (42, good_digest)})
+    if clean:
+        failures += 1
+        print(f"SELF-TEST FAIL [mcp-schema-provenance]: false positive(s) {[f['message'] for f in clean]}")
+    for label, actual in (
+        ("a changed hash", {"draft/schema.json": (42, "b" * 64)}),
+        ("a changed byte count", {"draft/schema.json": (43, good_digest)}),
+        ("a missing file", {}),
+        ("an unrecorded extra schema", {"draft/schema.json": (42, good_digest),
+                                       "2025-06-18/schema.json": (7, "c" * 64)}),
+    ):
+        if not _scan_vendored_schema_hashes(readme, actual):
+            failures += 1
+            print(f"SELF-TEST FAIL [mcp-schema-provenance]: {label} was not flagged")
+    if not _scan_vendored_schema_hashes(
+            "### `draft/schema.json`\n\n- URL: <https://example.invalid/>\n",
+            {"draft/schema.json": (42, good_digest)}):
+        failures += 1
+        print("SELF-TEST FAIL [mcp-schema-provenance]: a provenance section with no hash bullet was not flagged")
+    if failures == 0:
+        print(f"mcp-schema provenance self-test: PASS ({SCHEMA_PROVENANCE_FIXTURES} fixtures)")
+    return failures
+
+
+def main() -> int:
+    if "--self-test" in sys.argv[1:]:
+        return run_self_test()
+
+    all_findings: list[dict] = []
+
+    # Scan groovy files
+    for gf in GROOVY_FILES:
+        if gf.exists():
+            all_findings.extend(scan_file(gf))
+        else:
+            print(f"WARNING: Expected file not found: {gf}")
+
+    # Check version consistency
+    all_findings.extend(check_versions())
+
+    # Check tool-count consistency between Groovy source and docs
+    all_findings.extend(check_tool_counts())
+    all_findings.extend(check_gateway_attributions())
+
+    # Check tool-name references in doc tables match canonical tool names
+    all_findings.extend(check_tool_name_consistency())
+
+    # Check that every get_tool_guide(section='X') pointer in the schemas
+    # references a section that actually exists in getToolGuideSections().
+    # Catches the silent-truncation regression class of "trim points caller
+    # at get_tool_guide(section=Y), but Y was never added to the dispatcher".
+    all_findings.extend(check_tool_guide_pointers())
+    # TOOL_GUIDE.md must be the generated rendering of getToolGuideSections().
+    all_findings.extend(check_tool_guide_generated())
+
+    # Check that every doc surface that lists discrete-event sensor capabilities
+    # only names capabilities that are in production's DISCRETE_EVENT_CAPS map.
+    # Catches the "doc surface drifts ahead of production" class -- agents
+    # copying a stale-doc example would build a condition the live walker rejects.
+    all_findings.extend(check_discrete_event_caps_doc_parity())
+
+    # Check that every `catch (Exception updateExc)` block in the RM dispatcher
+    # is followed by the full 5-slot trailing-updateRule envelope shape.
+    # Catches the "dispatcher catches the click rejection but forgets to thread
+    # the dedicated slots into the return shape" class -- callers cannot detect
+    # the not-live state without log-grep otherwise.
+    all_findings.extend(check_trailing_updaterule_envelope_parity())
+
+    # Enforce the gateway read/write-split invariant: a read-only tool must be
+    # reachable from a hub_read_* gateway or be flat -- NEVER stranded behind only
+    # a hub_manage_* gateway (AGENTS.md "Gateway read/write split"). Catches the
+    # "a read got added to a manage gateway but never surfaced on the read side"
+    # class, which mislabels the read as a write and hides it from the read path.
+    all_findings.extend(check_read_write_split())
+
+    # Authorization chokepoint: a device tool that reaches a native per-device endpoint
+    # must gate at entry (or carry a documented exemption), so a new tool cannot forget it.
+    all_findings.extend(check_device_tool_access_gate())
+
+    # The gate and SANDBOX-016 only see a path handed to a call they recognise: hold the anchor
+    # against the wrapper inventory derived from the source, so a new wrapper cannot hide one.
+    all_findings.extend(check_native_request_wrappers())
+
+    # Issue #209/#522 lockstep: #include lines and libraries/ files match one-to-one, so a
+    # library the release build can't inline fails CI here instead of at publish time.
+    all_findings.extend(check_include_library_lockstep())
+
+    # BP20: no file-scope block comments in #include libraries (hub-parser hazard).
+    all_findings.extend(check_library_no_file_scope_block_comments())
+
+    # Groovy strings and GString expressions require the AST, not a raw-source regex.
+    print("Closure-parameter guard: run the authoritative ci/groovy24-parse parse24 lane (not checked by this lint).")
+
+    # hub_search_tools sandbox fix: every bm25Score map subscript goes through _bm25Key.
+    all_findings.extend(check_bm25_key_subscripts())
+
+    # Device-catalog renderer regression: arbitrary external Map keys and the
+    # verified `fields` collision must use sandbox-safe Map.get/put operations.
+    all_findings.extend(check_sandbox_map_subscripts())
+
+
+    # /logs/json grows with hub size: its only fetch is the worker-run one behind the JVM
+    # snapshot, and every tool reading the snapshot continues via requestState.
+    all_findings.extend(check_logs_json_snapshot_guard())
+
+    # The conformance leg's referee is the vendored MCP JSON Schemas; make the byte hashes
+    # their README records ENFORCED, so a loosened or half-refreshed schema fails here
+    # instead of quietly weakening every McpWireSchemaConformanceSpec verdict.
+    all_findings.extend(check_vendored_mcp_schema_hashes())
+
+    # Sort by file, then line
+    all_findings.sort(key=lambda f: (f["file"], f["line"]))
+
+    # Output
+    errors = [f for f in all_findings if f["severity"] == "error"]
+    warnings = [f for f in all_findings if f["severity"] == "warning"]
+
+    if all_findings:
+        for f in all_findings:
+            print(format_finding(f))
+            if IS_CI:
+                print(format_annotation(f))
+            print()
+    else:
+        print("Sandbox lint: all checks passed.")
+
+    # Summary
+    print(f"--- {len(errors)} error(s), {len(warnings)} warning(s) ---")
+
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,376 @@
+package rules
+
+import me.biocomp.hubitat_ci.api.app_api.AppExecutor
+import me.biocomp.hubitat_ci.app.HubitatAppSandbox
+import me.biocomp.hubitat_ci.app.HubitatAppScript
+import me.biocomp.hubitat_ci.validation.Flags
+import spock.lang.Shared
+import spock.lang.Specification
+import support.PassThroughAppValidator
+import support.PermissiveLog
+import support.SubscriptionRecorder
+import support.TestChildApp
+import support.TestLocation
+
+/**
+ * Loads hubitat-mcp-rule.groovy (the rule-engine child app — separate
+ * from the MCP server app) into a HubitatCI sandbox once per spec class
+ * and reuses the compiled script across feature methods. See the Javadoc
+ * on {@link support.HarnessSpec} for the broader rationale; the rule
+ * file is ~4000 lines, and paying its parse+compile once per Spock spec
+ * class (instead of once per feature method) is where the bulk of the
+ * test-job speedup comes from for rule specs.
+ *
+ * Same load/wiring approach as {@link support.HarnessSpec}:
+ * {@code sandbox.run()} with an explicit {@link PassThroughAppValidator}
+ * (see HarnessSpec Javadoc for the compile-vs-run precedence trap),
+ * state/atomicState/settings/now/log flow through the AppExecutor mock
+ * + userSettingValues + metaclass.
+ *
+ * {@code parent} is exposed as a writable property — specs assign it in
+ * their {@code given:} block (e.g. {@code parent = new SmokeParent(...)}),
+ * and the setter propagates the value to the shared script via
+ * {@code HubitatAppScript.setParent()} so that {@code parent.findDevice(id)}
+ * inside the rule engine resolves to the spec's stub. eighty20results'
+ * HubitatAppScript defines {@code parent} as a private field accessed via
+ * its {@code @CompileStatic getProperty("parent")} override, so mocking
+ * {@code AppExecutor.getParent()} no longer intercepts property access —
+ * {@code setParent} is the only reliable hook. {@code setup()} resets
+ * {@code _parent} and re-applies it to the shared script so specs that
+ * expected {@code parent == null} on entry don't see the previous test's
+ * value.
+ */
+abstract class RuleHarnessSpec extends Specification {
+    // Per-JVM cache for the compiled rule-engine script. The Mock is
+    // rebuilt per spec class and reflectively rebound onto SHARED_SCRIPT.api.
+    // See support.HarnessSpec for the broader rationale.
+    //
+    // Note: the @Shared `settingsMap` / `stateMap` / `atomicStateMap`
+    // fields below are PER-SPEC-INSTANCE, while the equivalents in
+    // HarnessSpec are JVM-static. sandbox.run() captures the FIRST
+    // subclass instance's settingsMap into eighty20results'
+    // AppPreferencesReader for the JVM's lifetime; subsequent specs'
+    // settings reads flow through api.getSettings() (stubbed per-spec
+    // to the current instance's settingsMap), so the orphaned reference
+    // is unreachable today. If a future eighty20results change ever
+    // routes `script.settings` through preferencesReader directly,
+    // those fields should be hoisted to JVM-static like HarnessSpec's
+    // SHARED_* constants to keep cross-spec isolation honest.
+    private static HubitatAppScript SHARED_SCRIPT
+    private static final Object COMPILE_LOCK = new Object()
+    private static final java.lang.reflect.Field API_FIELD = {
+        def f = HubitatAppScript.getDeclaredField('api')
+        f.accessible = true
+        f
+    }()
+
+    @Shared protected AppExecutor appExecutor
+    @Shared protected script
+    // Matches HarnessSpec's PermissiveLog usage — a concrete shim that
+    // accepts both the single-arg methods on HubitatCI's Log interface and
+    // the 2-arg (String, Throwable) overloads the real Hubitat runtime
+    // supports. A Spock Mock(Log) would throw MissingMethodException on
+    // script code like `log.error(msg, e)` under dynamic Groovy dispatch.
+    @Shared private PermissiveLog sharedLog = new PermissiveLog()
+
+    // Stable references captured by setupSpec's stubs; reset in setup().
+    @Shared protected final Map stateMap = [:]
+    @Shared protected final Map atomicStateMap = [:]
+    // Must be non-empty at sandbox.run() time — see HarnessSpec.
+    @Shared protected final Map settingsMap = [_harness: true]
+    /**
+     * Shared Location stub returned by the AppExecutor mock. Mutable fields
+     * (`mode`, `sunrise`, `sunset`, `hsmStatus`) are reset in {@code setup()}
+     * so per-test state does not leak across feature methods. Specs that
+     * need to drive these in {@code given:} set them directly on this
+     * instance (e.g. {@code testLocation.mode = 'Night'}).
+     */
+    @Shared protected final TestLocation testLocation = new TestLocation()
+
+    // Call recorders for AppExecutor methods the rule engine dispatches
+    // through @Delegate. Spock's interaction verification (`1 * appExecutor.foo(...)`)
+    // on a @Shared mock declared in given:/then: doesn't work reliably —
+    // stubs only apply when installed in setupSpec. Tests assert on these
+    // lists instead of using Spock interactions. All are cleared in setup().
+    @Shared protected final List<List<Object>> runInCalls = []
+    @Shared protected final List<List<Object>> runOnceCalls = []
+    // Time + periodic trigger branches in subscribeToTriggers() register via
+    // schedule(cronExpr, handler) rather than subscribe(...), so the
+    // SubscriptionRecorder never sees them. Recording schedule calls here
+    // gives SubscribeTriggerIntegrationSpec a uniform way to assert on the
+    // wire-up step for those branches.
+    @Shared protected final List<List<Object>> scheduleCalls = []
+    // Split to disambiguate no-arg `unschedule()` (blanket cancel, everything)
+    // from targeted `unschedule('handlerName')` — the engine uses both and
+    // lumping them together would let a regression swap one for the other
+    // without any assertion failing.
+    @Shared protected int unscheduleAllCount = 0
+    @Shared protected final List<String> unscheduleCalls = []
+    @Shared protected int unsubscribeCount = 0
+    @Shared protected final List<Map> sendLocationEventCalls = []
+    @Shared protected final List<List<Object>> httpGetCalls = []
+    @Shared protected final List<List<Object>> httpPostCalls = []
+    /**
+     * Records subscribe(source, attribute, handlerName) calls from
+     * {@code subscribeToTriggers()} and replays them via
+     * {@code fireEvent(script, source, attribute, value)}. Previously
+     * subscribe() fell through the AppExecutor Mock's @Delegate chain as
+     * a silent no-op — specs could only unit-test handler bodies directly
+     * and never verified the wire-up step. See SubscriptionRecorder for
+     * the rationale.
+     */
+    @Shared protected final SubscriptionRecorder subscriptions = new SubscriptionRecorder()
+
+    // Mutable @Shared fields reading from tests' given: blocks. The stub
+    // closures in setupSpec read these at invocation time.
+    @Shared protected Boolean stubTimeOfDayResult = false
+    @Shared protected Map<String, Date> stubSunriseSunset = null
+    @Shared protected Throwable stubHttpGetException = null
+
+    // Per-feature backing field — each test gets its own instance, so
+    // resetting _parent to null in setup() guarantees isolation without
+    // having to @Shared the state.
+    private Object _parent
+
+    /** Assigning `parent = foo` in a given: block routes through here. */
+    void setParent(Object p) {
+        _parent = p
+        if (script) {
+            script.setParent(p)
+        }
+    }
+
+    Object getParent() { _parent }
+
+    /**
+     * Lines recorded by the shared PermissiveLog during the current feature
+     * method, each as "level:message" (e.g. "debug:HTTP GET ..."). Cleared in
+     * setup(). Typed accessor so specs don't reach through the Log interface.
+     * (Mirrored into the Groovy 2.5 scaffold RuleHarnessSpec so the success-path
+     * redaction specs run on both lanes.)
+     */
+    protected List<String> capturedLogs() { sharedLog.messages }
+
+    def setupSpec() {
+        appExecutor = buildAppExecutorMock()
+        synchronized (COMPILE_LOCK) {
+            if (SHARED_SCRIPT == null) {
+                compileSharedScript()
+            } else {
+                rebindApi(appExecutor)
+            }
+        }
+        // Defensive: setup() already nulls parent for every feature, but
+        // resetting here too keeps the JVM-shared script from carrying
+        // the previous spec class's last-test parent across the rebind
+        // boundary. Cheap insurance against future setupSpec() additions
+        // that consult parent before setup() fires.
+        SHARED_SCRIPT?.setParent(null)
+        script = SHARED_SCRIPT
+    }
+
+    private void rebindApi(AppExecutor mock) {
+        try {
+            API_FIELD.set(SHARED_SCRIPT, mock)
+        } catch (Throwable t) {
+            throw new IllegalStateException(
+                "Failed to rebind AppExecutor on cached SHARED_SCRIPT for " +
+                "${this.class.simpleName}. An eighty20results upgrade may have " +
+                "changed HubitatAppScript.api field shape; see support.HarnessSpec " +
+                "for the rebind contract.", t)
+        }
+    }
+
+    private AppExecutor buildAppExecutorMock() {
+        def mock = Mock(AppExecutor) {
+            _ * getState() >> stateMap
+            _ * getAtomicState() >> atomicStateMap
+            // app / location are in HubitatCI's AppExecutor interface (so they
+            // resolve via @Delegate, not metaClass). Script code calls
+            // `app.id` (ruleLog) and `location.mode` (substituteVariables)
+            // unconditionally; provide non-null stubs typed to the interface
+            // Spock expects (raw Map returns trip a GroovyCastException).
+            _ * getApp() >> new TestChildApp(id: 1L, label: 'TestRuleApp')
+            // Shared TestLocation — mutable fields (mode, sunrise, sunset,
+            // hsmStatus) reset in setup(), so specs can drive them per-test
+            // without the closure-based Map-as-Location trick from the original
+            // harness (which returned a fresh frozen view on every call).
+            _ * getLocation() >> testLocation
+            _ * now() >> 1234567890000L
+            _ * getLog() >> sharedLog
+            // Script delegates `settings` reads to api.getSettings(); see
+            // support.HarnessSpec for the rationale.
+            _ * getSettings() >> settingsMap
+        }
+        // Permanent recording stubs for AppExecutor methods the rule engine
+        // dispatches via @Delegate. Tests assert on the recorded *Calls lists
+        // (Spock's `1 * appExecutor.foo(...)` verification on a @Shared mock
+        // from given:/then: doesn't work reliably — stubs must live here to
+        // take effect). Mutable @Shared fields (stubTimeOfDayResult etc.) are
+        // read at invocation time so tests can drive behaviour per-feature.
+        mock.runIn(*_) >> { args -> runInCalls << (args as List) }
+        mock.runOnce(*_) >> { args -> runOnceCalls << (args as List) }
+        mock.schedule(*_) >> { args -> scheduleCalls << (args as List) }
+        mock.unsubscribe() >> { unsubscribeCount++ }
+        mock.unschedule() >> { unscheduleAllCount++ }
+        mock.unschedule(_ as String) >> { args -> unscheduleCalls << (args[0] as String) }
+        mock.sendLocationEvent(_) >> { args -> sendLocationEventCalls << (args[0] as Map) }
+        // Invoke the response closure with a fake 200 so success-path response handlers
+        // run (e.g. the redacted log.debug inside http_request). Benign for specs that
+        // only assert on the recorded request args.
+        mock.httpGet(_, _) >> { args ->
+            httpGetCalls << (args as List)
+            if (stubHttpGetException) throw stubHttpGetException
+            if (args[1] instanceof Closure) args[1].call([status: 200])
+        }
+        mock.httpPost(_, _) >> { args ->
+            httpPostCalls << (args as List)
+            if (args[1] instanceof Closure) args[1].call([status: 200])
+        }
+        // subscribe(source, attribute, handlerName) is class-2 (declared on
+        // AppExecutor). Route every call into SubscriptionRecorder so specs
+        // can both assert on the wire-up ("device_event rule subscribed
+        // device 1 for 'switch' to handleDeviceEvent") and fire synthetic
+        // events back at the recorded handler. Without this stub the call
+        // silently no-ops through the Mock's @Delegate chain.
+        mock.subscribe(_, _ as String, _ as String) >> { args ->
+            subscriptions.record(args[0], args[1] as String, args[2] as String)
+        }
+        // Catch-all for subscribe() overloads other than the 3-arg form the
+        // rule engine uses today (2-arg, 4-arg-with-options, and the
+        // MetaMethod variant on the Subscription interface). Production code
+        // only ever calls the 3-arg form. A future refactor that passes
+        // subscribe options (e.g. filterEvents) would fall into the Mock's
+        // @Delegate default (null return, silent no-op) and the recorder
+        // would silently miss the call. Fail loudly instead.
+        mock.subscribe(*_) >> { args ->
+            if (args.size() == 3 && args[1] instanceof String && args[2] instanceof String) {
+                // Already handled by the more-specific stub above — this
+                // catch-all should not fire for the 3-arg String/String form.
+                return
+            }
+            throw new IllegalStateException(
+                "Unstubbed subscribe() overload — ${args.size()} args: ${args}. " +
+                "Extend SubscriptionRecorder + the RuleHarnessSpec subscribe stubs " +
+                "if a new overload is in production use. See " +
+                "src/test/groovy/support/SubscriptionRecorder.groovy.")
+        }
+        mock.timeOfDayIsBetween(_, _, _) >> { args -> stubTimeOfDayResult }
+        mock.timeOfDayIsBetween(_, _, _, _) >> { args -> stubTimeOfDayResult }
+        mock.getSunriseAndSunset(_) >> { args -> stubSunriseSunset }
+        mock.getSunriseAndSunset() >> { stubSunriseSunset }
+        return mock
+    }
+
+    private void compileSharedScript() {
+        def sandbox = new HubitatAppSandbox(new File('hubitat-mcp-rule.groovy'))
+        def validator = new PassThroughAppValidator([
+            Flags.DontValidatePreferences,
+            Flags.DontValidateDefinition,
+            Flags.DontRestrictGroovy,
+            Flags.DontRunScript,
+            // subscribeToTriggers() passes plain TestDevice POJOs into
+            // subscribe(). The AppSubscriptionReader delegate-layer
+            // validator (runs before our Mock's subscribe stub) rejects
+            // anything that isn't a DeviceWrapper, which would force every
+            // rule-engine integration test to wrap its fixtures in the
+            // full DeviceWrapper trait machinery.
+            //
+            // This flag ALSO disables AppSubscriptionReader.validateHandler,
+            // which normally asserts each handler name resolves to a method
+            // on the script with a single Object parameter. With validation
+            // off, a regression that renames handleDeviceEvent →
+            // handleDeviceEventV2 but misses the string literal in
+            // subscribeToTriggers() will pass every pure-wire-up spec
+            // (they compare a bad literal to a bad literal) — the typo
+            // only surfaces when SubscriptionRecorder.fireEvent() dispatches
+            // through the name, where MissingMethodException is loud.
+            // Specs that want handler-name safety for pure wire-up asserts
+            // should follow each subscribe assertion with a fireEvent() call.
+            //
+            // The finer-grained AllowAnyDeviceAttribute* flags don't help —
+            // they relax the capability check but still require a
+            // DeviceWrapper instance (AppSubscriptionReader.validateSubscribeMethod
+            // line 110 in eighty20results' source). DontValidateSubscriptions
+            // is the only flag that unblocks TestDevice POJOs here.
+            Flags.DontValidateSubscriptions
+        ])
+        SHARED_SCRIPT = sandbox.run(
+            api: appExecutor,
+            userSettingValues: settingsMap,
+            childAppResolver: { String ns, String name ->
+                throw new IllegalStateException(
+                    "childAppResolver fired for ${ns}:${name} — RuleHarnessSpec " +
+                    "does not expect child-app creation from the rule engine.")
+            } as Closure,
+            validator: validator
+        )
+    }
+
+    def setup() {
+        stateMap.clear()
+        atomicStateMap.clear()
+        settingsMap.clear()
+        settingsMap._harness = true
+        // Reset the shared TestLocation's mutable fields so a spec that mutates
+        // mode / sunrise / hsmStatus doesn't leak state into the next feature.
+        testLocation.setMode('Home')
+        testLocation.modeSetCalls.clear()
+        testLocation.sunrise = null
+        testLocation.sunset = null
+        testLocation.hsmStatus = null
+        // Clear TestChildApp.settingsStore so auto-disable writes from a
+        // prior feature's loop-guard trip don't leak forward. The Mock's
+        // `>> new TestChildApp(...)` is evaluated once at construction, so
+        // the same instance is returned every call — mutations persist
+        // across tests without an explicit reset.
+        appExecutor.getApp().settingsStore.clear()
+        // Reset AppExecutor call recorders + stub-driver fields so they
+        // don't leak between feature methods.
+        runInCalls.clear()
+        runOnceCalls.clear()
+        scheduleCalls.clear()
+        unscheduleAllCount = 0
+        unscheduleCalls.clear()
+        unsubscribeCount = 0
+        sendLocationEventCalls.clear()
+        httpGetCalls.clear()
+        httpPostCalls.clear()
+        subscriptions.reset()
+        stubTimeOfDayResult = false
+        stubSunriseSunset = null
+        stubHttpGetException = null
+        sharedLog.messages.clear()
+        // Propagate unconditionally so the script's parent exactly matches
+        // a freshly-reset `_parent` (null) on entry to each test.
+        // eighty20results' sandbox installs a default InstalledAppWrapperImpl
+        // when options.parent is absent at run() time, so without this reset
+        // a spec that expects `parent == null` would see the default wrapper
+        // instead — or worse, the previous test's parent.
+        _parent = null
+        script.setParent(null)
+        // Drop any per-test metaClass writes from the previous feature
+        // before re-installing the standard hooks below — prevents
+        // per-feature stubs (e.g. `script.metaClass.getGlobalVar = { ... }`
+        // installed directly in given: blocks) from leaking forward.
+        // Both wipes matter when SHARED_SCRIPT is reused across spec
+        // classes: removeMetaClass(class) clears the class-level
+        // ExpandoMetaClass; script.setMetaClass(null) clears the
+        // per-instance one. See support.HarnessSpec.setup() for the
+        // full rationale.
+        GroovySystem.metaClassRegistry.removeMetaClass(script.getClass())
+        script.setMetaClass(null)
+        support.HarnessSpec.checkMetaClassClean(script, 'RuleHarnessSpec')
+        // Re-run per-test wires (metaClass overrides etc.) after clearing
+        // state. Called from setup() rather than setupSpec() so subclass
+        // overrides can capture the current feature instance's fields.
+        wireOverrides()
+    }
+
+
+    protected void wireOverrides() {
+        // All runtime shims (state, atomicState, log, now) route through
+        // the AppExecutor mock. Subclasses override to add script-method overrides
+        // that can't be stubbed via the mock.
+    }
+}

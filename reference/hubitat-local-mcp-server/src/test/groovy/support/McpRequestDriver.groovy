@@ -1,0 +1,382 @@
+package support
+
+import groovy.json.JsonSlurper
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * Drives {@code handleMcpRequest()} through its in-process request pipeline:
+ * the script reads {@code request.JSON}, dispatches JSON-RPC, and writes back
+ * through {@code render(Map)}. This is the tier-2 integration dispatch seam —
+ * one JVM, Spock Mocks, no real HTTP boundary — distinct from the tier-1
+ * unit specs that call {@code script.handleToolsCall(msg)} directly and from
+ * the tier-3 fake-hub work tracked in #77.
+ *
+ * The existing server specs call JSON-RPC-layer methods directly
+ * ({@code script.handleToolsCall(msg)} etc.), which covers the JSON-RPC
+ * dispatch + tool execution, but skips two hub-runtime seams:
+ *
+ *   1. {@code request.JSON} — the sandbox dynamic property the hub populates
+ *      with the parsed POST body. Production code must survive missing,
+ *      unparsable, and weirdly-shaped bodies without crashing. The getter
+ *      itself can throw on malformed bodies (see {@link #pushBodyThrowing});
+ *      the app wraps the read in try/catch to turn that into a
+ *      JSON-RPC -32700 response.
+ *   2. {@code render(Map)} — the hub-side response writer. Production code
+ *      assembles status / contentType / data and hands them to render; tests
+ *      that bypass render never verify the envelope the hub actually sends.
+ *   3. {@code request.headers} — the inbound HTTP headers, which the modern
+ *      (2026-07-28) transport validates against the body. The hub hands them
+ *      over case-normalized and List-wrapped, and older firmware may not hand
+ *      them over at all; {@link #pushHeaders} reproduces that shape (see
+ *      {@link #headers}) so the production lookup is what gets exercised.
+ *
+ * All three are in the {@code handleMcpRequest()} path in
+ * hubitat-mcp-server.groovy. This driver plugs into the harness so specs can
+ * push a body and headers, invoke {@code handleMcpRequest}, and read the
+ * captured render args.
+ *
+ * Wiring (done by {@link HarnessSpec}):
+ *   - {@code render(Map)} is declared on {@code AppExecutor} — stubbed in
+ *     {@code setupSpec()} via the {@code >>} dispatcher pattern that
+ *     captures the Map into {@link #lastRenderArgs}. This matches the
+ *     dispatch cheat sheet in docs/testing.md.
+ *   - {@code request} is resolved via {@code HubitatAppScript}'s
+ *     {@code @CompileStatic getProperty(String)} override, which
+ *     short-circuits the name {@code "request"} to
+ *     {@code injectedMappingHandlerData['request']} before MOP dispatch.
+ *     metaClass hooks are never consulted for this name, so the driver's
+ *     {@link #scriptRequest} proxy is written directly into that private
+ *     field via reflection. The write happens per-test in
+ *     {@code HarnessSpec.setup()} (via {@code wireScriptOverrides()}) —
+ *     not once in {@code setupSpec()} — because {@code setup()} wipes the
+ *     script's metaClass and the re-wire guarantees the field survives.
+ *     Since {@link #scriptRequest} is a stable instance that dispatches
+ *     its {@code getJSON()} at access time based on {@link #throwingRequest}
+ *     / {@link #request}, state changes made in a test's {@code given:}
+ *     block ({@link #pushBody} / {@link #pushBodyThrowing}) take effect
+ *     without re-wiring.
+ *
+ * State lifecycle: {@link #reset()} is called from the harness's per-test
+ * {@code setup()} so each feature starts with an empty pending body and no
+ * captured render output. The instance itself is {@code @Shared}; its
+ * references stay stable while their contents get cleared.
+ */
+class McpRequestDriver {
+
+    /** Script the driver invokes through. Bound once by HarnessSpec.compileSharedScript(). */
+    Object boundScript
+
+    private final AtomicInteger idCounter = new AtomicInteger(0)
+
+    /** Last JSON-RPC id callTool generated; tests assert response.id against it. */
+    int lastSentId
+
+    /**
+     * Backing store for the parsed body the script sees when it reads
+     * {@code request.JSON}. {@link #pushBody} mutates this in place so the
+     * reference stays stable across tests — the harness wires
+     * {@link #scriptRequest} (which reads this) into the script's
+     * {@code injectedMappingHandlerData['request']} slot.
+     */
+    final Map request = [JSON: null]
+
+    /**
+     * If non-null, {@link #scriptRequest#getJSON()} throws this instead of
+     * returning {@link #request}.JSON. Set by {@link #pushBodyThrowing} to
+     * exercise the {@code handleMcpRequest} try/catch that turns hub-side
+     * JSON parse failures into JSON-RPC -32700 responses; cleared by
+     * {@link #reset}.
+     */
+    Throwable throwingRequest = null
+
+    /**
+     * Backing store for the inbound HTTP headers the script sees when it reads
+     * {@code request.headers}. Shaped like the map REAL hub firmware exposes —
+     * verified by a live probe over both the LAN endpoint and the
+     * cloud.hubitat.com relay:
+     *
+     *   - header NAMES arrive case-normalized to first-character-upper /
+     *     rest-lower ({@code MCP-Protocol-Version} → {@code Mcp-protocol-version},
+     *     {@code User-Agent} → {@code User-agent});
+     *   - header VALUES arrive List-wrapped ({@code ["tools/list"]}).
+     *
+     * Staging headers through {@link #pushHeaders} therefore exercises the
+     * production case-insensitive lookup and List-unwrap rather than a
+     * convenient plain-map shape the hub never sends. Default is an empty map
+     * (headers exposed, none set) — which is what the headerless legacy path
+     * sees, so every spec that never calls {@code pushHeaders} is unaffected.
+     */
+    final Map headers = [:]
+
+    /**
+     * When true, {@code request.headers} reads back {@code null} — firmware that
+     * exposes the property but no map. Production must degrade to the legacy
+     * headerless path rather than crash.
+     */
+    boolean nullHeaders = false
+
+    /**
+     * If non-null, {@code request.headers} throws this — firmware that does not
+     * expose the property at all (a {@code MissingPropertyException} in the
+     * sandbox). Production must swallow it and fall back to the legacy path.
+     */
+    Throwable throwingHeaders = null
+
+    /**
+     * Backing store for {@code request.requestSource}, the mapped-endpoint property the
+     * hub sets to {@code "local"} or {@code "cloud"}. Default null reproduces firmware
+     * that does not expose it — production reads that as local.
+     */
+    String requestSource = null
+
+    /**
+     * Proxy the harness wires into {@code injectedMappingHandlerData['request']}.
+     * Its {@code getJSON()} dispatches dynamically at access time: if
+     * {@link #throwingRequest} is set it throws, otherwise it returns the
+     * current {@link #request}.JSON value. The indirection is what lets a
+     * test's {@code given:} block call {@link #pushBody} or
+     * {@link #pushBodyThrowing} and have it take effect without re-running
+     * the harness's {@code wireScriptOverrides()}.
+     */
+    final ScriptRequestProxy scriptRequest = new ScriptRequestProxy(this)
+
+    /**
+     * Last {@code render(Map)} call args captured from the script. Tests
+     * read this after invoking {@code handleMcpRequest()} to verify the
+     * status / contentType / data that real hub clients would see.
+     */
+    Map lastRenderArgs = null
+
+    /**
+     * Stage a JSON-RPC request body to be returned from {@code request.JSON}
+     * on the next {@code handleMcpRequest()} call. Accepts a Map (standard
+     * request), a List (batch request), or {@code null} to simulate an
+     * empty body (production handles that via the -32700 parse-error path).
+     *
+     * Mutates {@link #request} in place so the Map reference wired into
+     * {@code injectedMappingHandlerData['request']} stays live across tests.
+     */
+    void pushBody(Object body) {
+        throwingRequest = null
+        request.clear()
+        request.JSON = body
+    }
+
+    /**
+     * Stage a {@code request.JSON} access that throws the given Throwable.
+     * Covers the {@code handleMcpRequest()} try/catch branch that turns
+     * hub-side JSON parse failures into JSON-RPC -32700 responses.
+     * {@link #pushBody}(null) only hits the subsequent
+     * {@code requestBody == null} branch — it does not exercise the catch.
+     */
+    void pushBodyThrowing(Throwable t) {
+        throwingRequest = t
+    }
+
+    /**
+     * Stage the inbound HTTP headers for the next {@code handleMcpRequest()}
+     * call, given in whatever casing a real client would send
+     * ({@code ['MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': 'tools/list']}).
+     * Each entry is rewritten into the hub's own wire shape before it lands in
+     * {@link #headers} — name case-normalized, value List-wrapped — so the
+     * production case-insensitive lookup and List-unwrap are what a spec
+     * exercises. An already-List value is kept as-is (so a spec can stage a
+     * multi-valued or empty-list header deliberately).
+     *
+     * Mutates {@link #headers} in place: the map reference is read live by
+     * {@link ScriptRequestProxy#getHeaders()}.
+     */
+    void pushHeaders(Map raw) {
+        nullHeaders = false
+        throwingHeaders = null
+        headers.clear()
+        raw?.each { k, v ->
+            headers[hubHeaderName(k as String)] = (v instanceof List) ? v : [v?.toString()]
+        }
+    }
+
+    /**
+     * Case-normalize a header name the way the hub does: first character upper,
+     * every other character lower. Exposed so a spec can pin the normalization
+     * against the live probe independently of {@link #pushHeaders}.
+     */
+    static String hubHeaderName(String name) {
+        if (name == null || name.isEmpty()) return name
+        return name.substring(0, 1).toUpperCase() + name.substring(1).toLowerCase()
+    }
+
+    /**
+     * Clear per-test fixture state. Called from the harness's {@code setup()}.
+     * Mutates the existing {@link #request} / {@link #headers} maps so the
+     * references stay stable for the
+     * {@code injectedMappingHandlerData['request']} wiring.
+     */
+    void reset() {
+        request.clear()
+        request.JSON = null
+        headers.clear()
+        nullHeaders = false
+        throwingHeaders = null
+        requestSource = null
+        lastRenderArgs = null
+        throwingRequest = null
+    }
+
+    /**
+     * Record the render call. Wired into the AppExecutor Mock's {@code >>}
+     * stub — every {@code render(Map)} from the script lands here. Production
+     * code's {@code return render(...)} expects a value back; the hub's real
+     * render returns a response object, but from the script's perspective the
+     * return value is ignored on the last line of a handler. Returning the
+     * args Map lets specs that do introspect the return see something
+     * identical to what was captured.
+     */
+    Object captureRender(Map args) {
+        lastRenderArgs = args
+        return args
+    }
+
+    /**
+     * Parse the captured {@code data} as JSON and return the result. The
+     * production code passes {@code data: groovy.json.JsonOutput.toJson(...)}
+     * when the response has a body; for empty responses (the 202 all-notifications
+     * POST) {@code data}
+     * is an empty string and this returns {@code null}. Throws if render
+     * was never called (which means {@code handleMcpRequest} returned before
+     * reaching any render — a bug to surface loudly, not swallow). Throws
+     * with the captured args echoed if the body was non-empty but unparseable
+     * JSON, so diagnosis points at the render layer rather than swallowing
+     * the parse error.
+     */
+    Object parseResponseJson() {
+        if (lastRenderArgs == null) {
+            throw new IllegalStateException(
+                "No render() call captured. Did handleMcpRequest() short-circuit " +
+                "before writing a response? Check the driver wiring in HarnessSpec " +
+                "or the test's pushBody() call.")
+        }
+        String data = lastRenderArgs.data as String
+        if (data == null || data.isEmpty()) {
+            return null
+        }
+        try {
+            // Fresh parser, like the decode helpers below: JsonSlurper is not thread-safe
+            // and a shared instance would be reachable from any spec that drives the
+            // request path off more than one thread.
+            return new JsonSlurper().parseText(data)
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                "render() data did not parse as JSON. Captured render args: " +
+                "${lastRenderArgs}. Underlying parse error: ${e.message}", e)
+        }
+    }
+
+    /** Drive a tool through the production handleMcpRequest envelope and return the parsed response. */
+    Map callTool(String toolName, Map args) {
+        lastSentId = idCounter.incrementAndGet()
+        // Default to empty so callers can omit when the tool takes no args.
+        def envelope = [
+            jsonrpc: '2.0',
+            id: lastSentId,
+            method: 'tools/call',
+            params: [name: toolName, arguments: args ?: [:]]
+        ]
+        pushBody(envelope)
+        boundScript.handleMcpRequest()
+        return parseResponseJson() as Map
+    }
+
+    /**
+     * Decode the serialize-once sentinel returned by a direct
+     * {@code handleToolsCall()} invocation. The production HTTP dispatcher
+     * unwraps this before writing the wire response; tier-1 dispatcher specs
+     * call the method below that boundary and therefore need the same decode.
+     * A fresh slurper is intentional because concurrency specs invoke this
+     * helper from multiple threads.
+     */
+    Map decodeToolCallResponse(Map response) {
+        if (response != null && response.containsKey('__preserialized')) {
+            def raw = response.__preserialized
+            if (raw == null) {
+                throw new IllegalStateException(
+                    'The __preserialized tools/call response carried a null payload')
+            }
+            def decoded = new JsonSlurper().parseText(raw as String)
+            if (!(decoded instanceof Map)) {
+                throw new IllegalStateException(
+                    'The __preserialized tools/call response did not decode to a JSON object')
+            }
+            return decoded as Map
+        }
+        return response
+    }
+
+    /**
+     * Parse the inner tool-result payload from a successful tools/call response.
+     * MCP wraps tool output as {@code response.result.content[0].text}, JSON-encoded;
+     * dispatch-envelope specs commonly assert on the decoded shape. Centralized here
+     * with a fresh parser because concurrency specs call this helper from
+     * multiple threads and JsonSlurper is not thread-safe.
+     */
+    Object parseInner(Map response) {
+        Map decoded = decodeToolCallResponse(response)
+        new JsonSlurper().parseText(decoded.result.content[0].text as String)
+    }
+
+    /**
+     * Stand-in for the hub's {@code request} that the script's
+     * {@code @CompileStatic getProperty("request")} returns (after the
+     * harness wires this into {@code injectedMappingHandlerData['request']}).
+     * Exposes a single {@code getJSON()} method that dispatches dynamically
+     * at access time — necessary because the harness wires once per test in
+     * {@code setup()} (before {@code given:}), and test blocks need to be
+     * able to stage a throwing or non-throwing body without re-running the
+     * wire step.
+     */
+    static class ScriptRequestProxy {
+        private final McpRequestDriver driver
+
+        ScriptRequestProxy(McpRequestDriver driver) {
+            this.driver = driver
+        }
+
+        /**
+         * Called at each {@code request.JSON} access. Throws
+         * {@link McpRequestDriver#throwingRequest} when set, otherwise
+         * returns the currently-staged {@link McpRequestDriver#request}.JSON.
+         */
+        Object getJSON() {
+            if (driver.throwingRequest != null) {
+                throw driver.throwingRequest
+            }
+            return driver.request.JSON
+        }
+
+        /**
+         * Called at each {@code request.headers} access. Dispatches the same way
+         * {@link #getJSON()} does so a spec's {@code given:} block can stage
+         * headers (or an absent/throwing header map) without re-wiring: throws
+         * {@link McpRequestDriver#throwingHeaders} when set, returns null when
+         * {@link McpRequestDriver#nullHeaders} is set, otherwise the live
+         * {@link McpRequestDriver#headers} map in the hub's wire shape.
+         */
+        Object getHeaders() {
+            if (driver.throwingHeaders != null) {
+                throw driver.throwingHeaders
+            }
+            if (driver.nullHeaders) {
+                return null
+            }
+            return driver.headers
+        }
+
+        /**
+         * Called at each {@code request.requestSource} access — the hub's
+         * {@code "local"} / {@code "cloud"} relay marker. Reads the live driver field so a
+         * test's {@code given:} block can flip it without re-wiring.
+         */
+        Object getRequestSource() {
+            return driver.requestSource
+        }
+    }
+}

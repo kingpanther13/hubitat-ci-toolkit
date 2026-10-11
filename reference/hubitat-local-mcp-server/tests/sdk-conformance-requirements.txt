@@ -1,0 +1,29 @@
+# Pinned dependencies for tests/sdk_conformance_test.py -- the official Model Context Protocol
+# Python SDK as an INDEPENDENT REFEREE for this server's hand-written protocol layer. The pin is
+# DELIBERATE, not incidental: an unpinned SDK would silently change what "conformant" means
+# between runs, so the script reads `mcp==` from this file and refuses to run against any other
+# version. It is deliberately NOT Dependabot-tracked -- a bump changes what the harness asserts.
+#
+# This v2 pin is the independent referee for the modern 2026-07-28 catalog, resource,
+# result-model, and automatic request-to-request continuation scenarios. The live E2E harness
+# deliberately does not exercise the server's retained legacy fallback. Procedure for any later
+# bump: docs/testing.md § Conformance harness.
+#
+# Pinned here are ONLY the packages whose behaviour can move a verdict: mcp-types (the v2 result
+# models), pydantic/pydantic-core (their parsing), typing-extensions (the `__deprecated__` markers
+# the preflight reads), and httpx2 + anyio
+# (the transport/timing hooks and exception-group shapes `_failure_detail` unwraps). The rest of
+# the closure is left to the resolver on purpose: it is server/auth plumbing imported by the
+# package but not executed on this client-only path. Extra transitive pins can fail a future
+# `python-version: '3.x'` install for platform-wheel reasons unrelated to conformance.
+#
+# `requests` is deliberately NOT here -- this file stays single-purpose -- but a clean venv needs
+# it too: the script imports tests/e2e_test.py for the shared hub config, and that module imports
+# requests at module scope. hub-e2e.yml installs it on its own line.
+mcp==2.0.0
+mcp-types==2.0.0
+anyio==4.14.2
+httpx2==2.12.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+typing-extensions==4.16.0

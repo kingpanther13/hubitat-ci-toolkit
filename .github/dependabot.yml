@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: monthly
+    ignore:
+      - dependency-name: org.codehaus.groovy:groovy-all
+        update-types: [version-update:semver-major]
+      - dependency-name: org.spockframework:spock-core
+      - dependency-name: com.github.eighty20results:hubitat_ci
+      - dependency-name: su.litvak.chromecast:api-v2

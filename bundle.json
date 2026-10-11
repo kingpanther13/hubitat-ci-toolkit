@@ -1,0 +1,9 @@
+{
+  "namespace": "toolkit",
+  "name": "hubitat-ci-example",
+  "files": [
+    {"type": "library", "path": "libraries/levels.groovy"},
+    {"type": "driver", "path": "drivers/example-driver.groovy"},
+    {"type": "app", "path": "apps/example-app.groovy"}
+  ]
+}

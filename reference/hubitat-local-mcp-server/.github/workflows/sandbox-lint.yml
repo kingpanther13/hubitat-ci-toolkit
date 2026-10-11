@@ -1,0 +1,48 @@
+name: Sandbox Lint
+on:
+  # Manual run on any ref, no PR needed -- opening a PR just to exercise a lane also
+  # books the single shared test hub for an hour of e2e. Path filters don't gate a dispatch.
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '*.groovy'
+      - 'packageManifest.json'
+      - 'tests/sandbox_lint.py'
+      - 'libraries/**'
+      - 'tools/build-release-app.py'
+      - 'tools/strip_source.py'
+      - 'tools/groovy_lex.py'
+      # TOOL_GUIDE.md is generated from the served guide; a hand edit must fail the lint.
+      - 'TOOL_GUIDE.md'
+      - 'tools/build-tool-guide.py'
+      # The MCP_SCHEMA_PROVENANCE check enforces the byte hashes recorded for the vendored
+      # MCP schemas. Without this entry a schema-only or README-only edit -- the exact change
+      # it guards -- would not run the lint at all.
+      - 'src/test/resources/mcp-schema/**'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Sandbox-lint scan
+        run: python tests/sandbox_lint.py
+      # The lint's own must-catch/must-not-catch fixtures. Without this step a
+      # broken fixture (or a dead check the fixtures would expose) never turns
+      # CI red — found live on PR #336, where a fixture regression was invisible
+      # because nothing ran --self-test.
+      - name: Sandbox-lint self-tests
+        run: python tests/sandbox_lint.py --self-test
+      # Release build smoke (issue #522): nothing under dist/ is committed -- delivery is the
+      # bundle-artifacts branch, fed by publish-bundle-artifact.yml on every push. This step
+      # only proves the builder still RUNS against the PR's sources (an unresolvable #include,
+      # an unincluded library or a source the stripper can't tokenize fails here, in-PR).
+      - name: Release builder runs against the PR's sources
+        run: python tools/build-release-app.py

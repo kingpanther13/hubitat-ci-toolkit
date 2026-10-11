@@ -1,0 +1,683 @@
+package server
+
+import groovy.json.JsonOutput
+import support.RMUtilsMock
+import support.ToolSpecBase
+
+/**
+ * Spec for toolRunRmRule (libraries/mcp-native-rules-lib.groovy).
+ * Gateway: hub_manage_native_rules_and_apps -> hub_call_rule.
+ *
+ * Covers: gate-throw, missing ruleId, action routing (rule via RMUtils; actions
+ * via the runAction page button; stop/start via the stopRule button toggle because
+ * RMUtils has no startRule verb), idempotent stop/start behavior based on state.stopped,
+ * invalid action rejection, String ruleId coercion, non-numeric ruleId rejection.
+ */
+class ToolRunRmRuleSpec extends ToolSpecBase {
+
+    RMUtilsMock rmUtils
+
+    def setup() {
+        rmUtils = new RMUtilsMock()
+        rmUtils.install()
+    }
+
+    def cleanup() {
+        rmUtils?.uninstall()
+    }
+
+    /**
+     * Minimal statusJson stub for stop/start toggle tests — carries
+     * appState entries so _readAppStateBoolean can find state.stopped.
+     */
+    private String minimalStatusJson(int ruleId, boolean stopped) {
+        JsonOutput.toJson([
+            installedApp: [id: ruleId],
+            appSettings: [],
+            eventSubscriptions: [],
+            scheduledJobs: [],
+            appState: [
+                [name: "running", value: false, type: "Boolean"],
+                [name: "stopped", value: stopped, type: "Boolean"]
+            ],
+            childAppCount: 0,
+            childDeviceCount: 0
+        ])
+    }
+
+    def "throws when Write master is disabled"() {
+        given:
+        settingsMap.enableWrite = false
+
+        when: 'the central executeTool gate blocks the write tool (tool body no longer self-gates)'
+        script.executeTool('hub_call_rule', [ruleId: 1])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('Write tools are disabled')
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch returns an isError validation result when Write master is disabled (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        settingsMap.enableWrite = false
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 1])
+
+        then:
+        response.error == null
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains('Write tools are disabled')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "throws when ruleId is missing"() {
+        when:
+        script.toolRunRmRule([:])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.toLowerCase().contains('ruleid is required')
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch returns isError validation result envelope when ruleId is missing (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [:])
+
+        then:
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.toLowerCase().contains('ruleid is required')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "action=rule dispatches runRule"() {
+        when:
+        def result = script.toolRunRmRule([ruleId: 101, action: 'rule'])
+
+        then:
+        result.success == true
+        result.ruleId == 101
+        rmUtils.calls.any { it.method == 'sendAction' && it.action == 'runRule' }
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch action=rule dispatches runRule (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 101, action: 'rule'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.ruleId == 101
+        rmUtils.calls.any { it.method == 'sendAction' && it.action == 'runRule' }
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "action=actions clicks the runAction button, not RMUtils"() {
+        given:
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: 102, action: 'actions'])
+
+        then: "the Run Actions page button is the load-immune route the hub UI takes"
+        result.success == true
+        result.ruleId == 102
+        result.ruleIds == [102]
+        result.rmAction == 'runAction button'
+        posts.count { it.path == '/installedapp/btn' && it.body.name == 'runAction' && it.body.id == '102' } == 1
+        !rmUtils.calls.any { it.method == 'sendAction' }
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch action=actions clicks the runAction button (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 102, action: 'actions'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.ruleId == 102
+        posts.any { it.path == '/installedapp/btn' && it.body.name == 'runAction' }
+        !rmUtils.calls.any { it.method == 'sendAction' }
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "action=actions reports a failed runAction click without touching RMUtils"() {
+        given:
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            throw new IllegalStateException('btn POST refused')
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: 109, action: 'actions'])
+
+        then:
+        result.success == false
+        result.ruleId == 109
+        result.error.contains('runAction button click failed')
+        result.error.contains('btn POST refused')
+        !rmUtils.calls.any { it.method == 'sendAction' }
+    }
+
+    def "array ruleId with action=actions clicks runAction per rule and aggregates"() {
+        given:
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            if (body.id == '121') throw new IllegalStateException('btn POST refused')
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: [120, 121], action: 'actions'])
+
+        then: "one click per rule; the failed id is named and the survivor is not undone"
+        result.success == false
+        result.partial == true
+        result.ruleIds == [120, 121]
+        result.rmAction == 'runAction button x2'
+        result.failedRuleIds == [121]
+        result.results*.ruleId == [120, 121]
+        result.results[0].success == true
+        result.results[1].success == false
+        result.error.contains('runAction button failed for rule(s) 121')
+        result.note.contains('runs that rule\'s actions again')
+        posts.count { it.path == '/installedapp/btn' && it.body.name == 'runAction' } == 2
+        !rmUtils.calls.any { it.method == 'sendAction' }
+    }
+
+    def "action=stop clicks stopRule button when rule is currently running (state.stopped=false)"() {
+        given:
+        hubGet.register('/installedapp/statusJson/103') { params -> minimalStatusJson(103, false) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: 103, action: 'stop'])
+
+        then: "stopRule button POST issued; not routed through RMUtils.sendAction"
+        result.success == true
+        result.ruleId == 103
+        posts.any { it.path == '/installedapp/btn' && it.body.name == 'stopRule' }
+        !rmUtils.calls.any { it.method == 'sendAction' && it.action == 'stopRuleAct' }
+
+        and: "a SCALAR call echoes ruleIds too, so callers read one key on every stop/start shape"
+        result.ruleIds == [103]
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch action=stop clicks stopRule button when running (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        hubGet.register('/installedapp/statusJson/103') { params -> minimalStatusJson(103, false) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 103, action: 'stop'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.ruleId == 103
+        posts.any { it.path == '/installedapp/btn' && it.body.name == 'stopRule' }
+        !rmUtils.calls.any { it.method == 'sendAction' && it.action == 'stopRuleAct' }
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "action=stop is idempotent — no-ops when rule is already stopped"() {
+        given:
+        hubGet.register('/installedapp/statusJson/104') { params -> minimalStatusJson(104, true) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: 104, action: 'stop'])
+
+        then: "no button click — clicking stopRule while stopped=true would toggle to running"
+        result.success == true
+        result.rmAction == 'noop'
+        posts.isEmpty()
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch action=stop is idempotent when already stopped (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        hubGet.register('/installedapp/statusJson/104') { params -> minimalStatusJson(104, true) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 104, action: 'stop'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.rmAction == 'noop'
+        posts.isEmpty()
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "action=start clicks stopRule button when rule is currently stopped (state.stopped=true)"() {
+        given:
+        hubGet.register('/installedapp/statusJson/105') { params -> minimalStatusJson(105, true) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: 105, action: 'start'])
+
+        then: "stopRule button POST toggles stopped flag off + re-inits + resets private boolean"
+        result.success == true
+        result.ruleId == 105
+        posts.any { it.path == '/installedapp/btn' && it.body.name == 'stopRule' }
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch action=start clicks stopRule button when stopped (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        hubGet.register('/installedapp/statusJson/105') { params -> minimalStatusJson(105, true) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 105, action: 'start'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.ruleId == 105
+        posts.any { it.path == '/installedapp/btn' && it.body.name == 'stopRule' }
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "action=start is idempotent — no-ops when rule is already running"() {
+        given:
+        hubGet.register('/installedapp/statusJson/106') { params -> minimalStatusJson(106, false) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: 106, action: 'start'])
+
+        then: "no button click — rule was already running"
+        result.success == true
+        result.rmAction == 'noop'
+        posts.isEmpty()
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch action=start is idempotent when already running (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        hubGet.register('/installedapp/statusJson/106') { params -> minimalStatusJson(106, false) }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 106, action: 'start'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.rmAction == 'noop'
+        posts.isEmpty()
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "default action (no action arg) dispatches runRule"() {
+        when:
+        def result = script.toolRunRmRule([ruleId: 107])
+
+        then:
+        result.success == true
+        rmUtils.calls.any { it.method == 'sendAction' && it.action == 'runRule' }
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch default action dispatches runRule (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 107])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        rmUtils.calls.any { it.method == 'sendAction' && it.action == 'runRule' }
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "invalid action throws IllegalArgumentException"() {
+        when:
+        script.toolRunRmRule([ruleId: 108, action: 'explode'])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.toLowerCase().contains('invalid action')
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch returns isError validation result envelope on invalid action (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 108, action: 'explode'])
+
+        then:
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.toLowerCase().contains('invalid action')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "String ruleId is coerced to Integer before dispatch"() {
+        when:
+        def result = script.toolRunRmRule([ruleId: '202'])
+
+        then:
+        result.success == true
+        result.ruleId == 202
+        result.ruleId instanceof Integer
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch coerces String ruleId to Integer (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: '202'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.ruleId == 202
+        inner.ruleId instanceof Integer
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "non-numeric ruleId throws IllegalArgumentException"() {
+        when:
+        script.toolRunRmRule([ruleId: 'not-a-number'])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.toLowerCase().contains('integer')
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch returns isError validation result envelope on non-numeric ruleId (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: 'not-a-number'])
+
+        then:
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.toLowerCase().contains('integer')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "gateway dispatch via handleGateway routes to hub_call_rule"() {
+        when:
+        def result = script.handleGateway('hub_manage_native_rules_and_apps', 'hub_call_rule', [ruleId: 300, action: 'rule'])
+
+        then:
+        result.success == true
+        rmUtils.calls.any { it.method == 'sendAction' && it.action == 'runRule' }
+    }
+
+    def "array ruleId runs the whole set in ONE sendAction dispatch"() {
+        when:
+        def result = script.toolRunRmRule([ruleId: [300, 301], action: 'rule'])
+
+        then:
+        result.success == true
+        result.ruleIds == [300, 301]
+        result.ruleId == null
+        def sends = rmUtils.calls.findAll { it.method == 'sendAction' && it.action == 'runRule' }
+        sends.size() == 1
+        sends[0].ruleIds == [300, 301]
+    }
+
+    def "array ruleId with action=stop toggles each rule and aggregates per-rule results"() {
+        given:
+        hubGet.register('/installedapp/statusJson/107') { params -> minimalStatusJson(107, false) }
+        hubGet.register('/installedapp/statusJson/108') { params -> minimalStatusJson(108, true) }
+        // Rule 107 is running, so its stop really clicks the stopRule button -- stub the POST
+        // explicitly rather than riding whatever ambient behavior the harness provides.
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when: 'stop 107 (running -> clicks) and 108 (already stopped -> no-op)'
+        def result = script.toolRunRmRule([ruleId: [107, 108], action: 'stop'])
+
+        then:
+        result.success == true
+        result.ruleIds == [107, 108]
+        result.results.size() == 2
+        result.results[0].ruleId == 107
+        result.results[1].ruleId == 108
+        result.results[1].rmAction == 'noop'
+    }
+
+    def "empty ruleId array throws IllegalArgumentException"() {
+        when:
+        script.toolRunRmRule([ruleId: []])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.toLowerCase().contains('must not be empty')
+    }
+
+    def "single-element ARRAY with action=stop echoes ruleIds (array-form contract)"() {
+        given:
+        hubGet.register('/installedapp/statusJson/111') { params -> minimalStatusJson(111, true) }
+
+        when: 'stop an already-stopped rule via a one-element array (no-op path)'
+        def result = script.toolRunRmRule([ruleId: [111], action: 'stop'])
+
+        then: 'the single-id shape (ruleId) and the universal echo (ruleIds) both present'
+        result.success == true
+        result.ruleId == 111
+        result.ruleIds == [111]
+
+        and: 'a one-element batch is still a single id, so it makes no verification claim'
+        !result.containsKey('idsVerified')
+    }
+
+    def "array ruleId with action=start toggles each rule and aggregates per-rule results"() {
+        given:
+        hubGet.register('/installedapp/statusJson/118') { params -> minimalStatusJson(118, true) }
+        hubGet.register('/installedapp/statusJson/119') { params -> minimalStatusJson(119, false) }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when: 'start 118 (stopped -> clicks) and 119 (already running -> no-op)'
+        def result = script.toolRunRmRule([ruleId: [118, 119], action: 'start'])
+
+        then: 'the start verb aggregates the same way stop does'
+        result.success == true
+        result.ruleIds == [118, 119]
+        result.rmAction == 'stopRule toggle x2'
+        result.results.size() == 2
+        result.results[0].ruleId == 118
+        result.results[1].rmAction == 'noop'
+    }
+
+    def "multi-rule stop where EVERY rule fails says so instead of naming survivors that do not exist"() {
+        given: "both rules' state reads throw, so neither toggle can run"
+        hubGet.register('/installedapp/statusJson/116') { params -> throw new IllegalStateException("statusJson read failed") }
+        hubGet.register('/installedapp/statusJson/117') { params -> throw new IllegalStateException("statusJson read failed") }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: [116, 117], action: 'stop'])
+
+        then: "the all-failed wording -- the partial-success text would claim 0 rules WERE actioned"
+        result.success == false
+        result.failedRuleIds == [116, 117]
+        result.error.contains("failed for EVERY rule in the batch")
+        !result.error.contains("WERE actioned")
+
+        and: "nothing succeeded, so this is a total failure, not a partial one"
+        result.partial == false
+        result.results.size() == 2
+        result.results.every { it.success == false }
+    }
+
+    def "multi-rule stop aggregate names the failed ids and marks partial when others succeeded"() {
+        given: "112 is stoppable; 113's state read throws, so its toggle fails structurally"
+        hubGet.register('/installedapp/statusJson/112') { params -> minimalStatusJson(112, false) }
+        hubGet.register('/installedapp/statusJson/113') { params -> throw new IllegalStateException("statusJson read failed") }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer t = 420 ->
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+
+        when:
+        def result = script.toolRunRmRule([ruleId: [112, 113], action: 'stop'])
+
+        then: "the aggregate names the failure instead of a bare success:false"
+        result.success == false
+        result.partial == true
+        result.failedRuleIds == [113]
+        result.error.contains("113")
+        result.error.contains("WERE actioned")
+        result.results.size() == 2
+        result.results[0].success == true
+        result.results[1].success == false
+    }
+
+    @spock.lang.Unroll
+    def "hub_call_rule via dispatch runs an ARRAY of ruleIds in one call (useGateways=#useGateways)"() {
+        given: 'the union-typed ruleId argument has to survive JSON-RPC round-tripping, not just a direct call'
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: [300, 301], action: 'rule'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.ruleIds == [300, 301]
+
+        and: 'one dispatch for the whole set, and the skipped-check flag rode the envelope out'
+        // No RMUtils rule-list stub here, so the existence check cannot run -- the false
+        // is the contract (a silent omission would read as "verified" to a caller).
+        inner.idsVerified == false
+        rmUtils.calls.findAll { it.method == 'sendAction' && it.action == 'runRule' }.size() == 1
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "multi-rule stop pauses at the response-budget checkpoint and hands back the remainder"() {
+        given: "the budget reads exhausted after the first toggle"
+        hubGet.register('/installedapp/statusJson/114') { params -> minimalStatusJson(114, true) }
+        script.metaClass._timeBudgetExceeded = { Long t0 -> true }
+
+        when: '114 no-ops (already stopped); 115 is never reached'
+        def result = script.toolRunRmRule([ruleId: [114, 115], action: 'stop', __reqT0: 1L])
+
+        then:
+        result.success == false
+        result.partial == true
+        result.remainingRuleIds == [115]
+        result.results.size() == 1
+        result.note.contains("ruleId=[115]")
+    }
+}

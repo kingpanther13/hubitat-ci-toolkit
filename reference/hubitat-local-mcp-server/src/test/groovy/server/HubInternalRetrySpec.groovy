@@ -1,0 +1,585 @@
+package server
+
+import spock.lang.Shared
+
+import support.ToolSpecBase
+
+/**
+ * Spec for the consolidated hub HTTP client core (_hubRequest) that backs the
+ * six hubInternal* variants. PR2b folded six near-duplicate request bodies into
+ * one shared core; these features pin the behaviours that were either newly
+ * added or easy to regress in that consolidation:
+ *
+ *  - the Hub Security cookie is cached in atomicState (thread-safe) and a live
+ *    cache entry skips the /login round-trip while still attaching the cookie;
+ *  - an auth failure (HTTP 401/403, read duck-typed off the exception) clears
+ *    the cached cookie and retries the request exactly once with a fresh cookie;
+ *  - a non-auth failure (e.g. 500) is NOT retried;
+ *  - a persistent auth failure retries once and then propagates (no loop);
+ *  - a body-read failure mid-stream is re-thrown, never swallowed into a
+ *    Reader.toString() junk string that downstream code would treat as a body.
+ *
+ * Interception point: hubInternalPost is pure dynamic Groovy with no metaClass
+ * shadow in the harness (unlike hubInternalGet), so calling it runs the real
+ * _hubRequest down to appExecutor.httpPost — intercepted here via the same
+ * setupSpec-dispatcher pattern ToolRoomsSpec documents. The dispatcher routes
+ * /login (cookie auth) and the app path (the request under test) by params.path.
+ */
+class HubInternalRetrySpec extends ToolSpecBase {
+
+    @Shared Closure httpPostHandler = null
+    @Shared Closure httpGetHandler = null
+
+    def setupSpec() {
+        appExecutor.httpPost(_, _) >> { args ->
+            if (httpPostHandler) {
+                httpPostHandler.call(args[0], args[1])
+            }
+        }
+        appExecutor.httpGet(_, _) >> { args ->
+            if (httpGetHandler) {
+                httpGetHandler.call(args[0], args[1])
+            }
+        }
+    }
+
+    def cleanup() {
+        httpPostHandler = null
+        httpGetHandler = null
+    }
+
+    /** Enable Hub Security with credentials so the cookie path is live. */
+    private void enableHubSecurity() {
+        settingsMap.hubSecurityEnabled = true
+        settingsMap.hubSecurityUser = 'admin'
+        settingsMap.hubSecurityPassword = 'secret'
+    }
+
+    /** Seed a live (unexpired) cached cookie so getHubSecurityCookie skips /login. */
+    private void seedCachedCookie(String value = 'JSESSIONID=cached') {
+        atomicStateMap.hubSecurityCookie = value
+        atomicStateMap.hubSecurityCookieExpiry = 1234567890000L + 60_000  // now() is fixed at 1234567890000L
+    }
+
+    /** An exception that carries an HTTP status the way HttpResponseException does (duck-typed). */
+    private static class FakeHttpException extends RuntimeException {
+        final def response
+        FakeHttpException(int status) {
+            super("HTTP ${status}")
+            this.response = [status: status]
+        }
+        // For the 3xx redirect path: also expose a Location header, which
+        // _hubRequest's handle3xx branch reads via resp.headers?."Location".
+        FakeHttpException(int status, String location) {
+            super("HTTP ${status}")
+            this.response = [status: status, headers: ['Location': location]]
+        }
+    }
+
+    /** An exception with NO parseable .response.status -- only a message carrying the auth signal. */
+    private static class FakeBareException extends RuntimeException {
+        FakeBareException(String msg) { super(msg) }
+    }
+
+    /** A Reader whose read() always fails, emulating a socket reset mid-body. */
+    private Reader failingReader(String msg) {
+        return new Reader() {
+            int read(char[] cbuf, int off, int len) throws IOException { throw new IOException(msg) }
+            void close() throws IOException {}
+        }
+    }
+
+    def "a live cached cookie is reused without a /login round-trip and is attached to the request"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and: 'record every POST by path so we can prove /login was never called'
+        def loginCalls = 0
+        def appCallHeaders = null
+        httpPostHandler = { Map params, Closure cb ->
+            if (params.path == '/login') {
+                loginCalls++
+                cb.call([headers: ['Set-Cookie': 'JSESSIONID=should-not-be-used; Path=/']])
+            } else {
+                appCallHeaders = params.headers
+                cb.call([status: 200, data: 'OK'])
+            }
+        }
+
+        when:
+        def result = script.hubInternalPost('/foo', [a: 1])
+
+        then: 'cached cookie short-circuits auth and is sent on the request'
+        result == 'OK'
+        loginCalls == 0
+        appCallHeaders?.Cookie == 'JSESSIONID=cached'
+    }
+
+    def "a 401 clears the cached cookie, re-authenticates, and retries once successfully"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=stale')
+
+        and: 'first app POST 401s; /login mints a fresh cookie; the retry succeeds'
+        def appCalls = 0
+        def loginCalls = 0
+        def retryHeaders = null
+        httpPostHandler = { Map params, Closure cb ->
+            if (params.path == '/login') {
+                loginCalls++
+                cb.call([headers: ['Set-Cookie': 'JSESSIONID=fresh; Path=/']])
+            } else {
+                appCalls++
+                if (appCalls == 1) {
+                    throw new FakeHttpException(401)
+                }
+                retryHeaders = params.headers
+                cb.call([status: 200, data: 'RETRIED-OK'])
+            }
+        }
+
+        when:
+        def result = script.hubInternalPost('/foo', [a: 1])
+
+        then: 'the request was retried once with a freshly-minted cookie'
+        result == 'RETRIED-OK'
+        appCalls == 2
+        loginCalls == 1
+        retryHeaders?.Cookie == 'JSESSIONID=fresh'
+
+        and: 'the refreshed cookie is what is now cached'
+        atomicStateMap.hubSecurityCookie == 'JSESSIONID=fresh'
+    }
+
+    def "a non-auth failure (500) is not retried"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and:
+        def appCalls = 0
+        httpPostHandler = { Map params, Closure cb ->
+            if (params.path == '/login') {
+                cb.call([headers: ['Set-Cookie': 'JSESSIONID=fresh; Path=/']])
+            } else {
+                appCalls++
+                throw new FakeHttpException(500)
+            }
+        }
+
+        when:
+        script.hubInternalPost('/foo', [a: 1])
+
+        then: 'the 500 propagates after a single attempt; the cached cookie is left intact'
+        def ex = thrown(Exception)
+        ex.message.contains('500')
+        appCalls == 1
+        atomicStateMap.hubSecurityCookie == 'JSESSIONID=cached'
+    }
+
+    def "a persistent 401 retries exactly once and then propagates (no infinite loop)"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=stale')
+
+        and: 'every app POST 401s, even after re-auth'
+        def appCalls = 0
+        def loginCalls = 0
+        httpPostHandler = { Map params, Closure cb ->
+            if (params.path == '/login') {
+                loginCalls++
+                cb.call([headers: ['Set-Cookie': 'JSESSIONID=fresh; Path=/']])
+            } else {
+                appCalls++
+                throw new FakeHttpException(401)
+            }
+        }
+
+        when:
+        script.hubInternalPost('/foo', [a: 1])
+
+        then: 'original attempt + exactly one retry, then the 401 surfaces'
+        thrown(Exception)
+        appCalls == 2
+        loginCalls == 1
+    }
+
+    def "a mid-stream body read failure is re-thrown, not swallowed into a junk string"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and: 'the POST itself succeeds but reading the response body fails'
+        httpPostHandler = { Map params, Closure cb ->
+            cb.call([status: 200, data: failingReader('simulated socket reset')])
+        }
+
+        when:
+        script.hubInternalPost('/foo', [a: 1])
+
+        then: 'the read error propagates rather than returning a Reader.toString() junk body'
+        def ex = thrown(IOException)
+        ex.message == 'simulated socket reset'
+    }
+
+    // ---- struct returnShape (form/raw/getRaw) + handle3xx + GET path: real _hubRequest ----
+
+    def "hubInternalPostForm returns a {status,location,data} struct on a 2xx success"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and: 'the hub returns a normal 2xx with a body'
+        def sentHeaders = null
+        httpPostHandler = { Map params, Closure cb ->
+            sentHeaders = params.headers
+            cb.call([status: 200, headers: ['Location': null], data: 'BODY'])
+        }
+
+        when:
+        def resp = script.hubInternalPostForm('/foo', [a: 1])
+
+        then: 'the struct shape carries status + body, with the cached cookie attached'
+        resp instanceof Map
+        resp.status == 200
+        resp.data == 'BODY'
+        resp.containsKey('location')
+        sentHeaders?.Cookie == 'JSESSIONID=cached'
+    }
+
+    def "hubInternalGetRaw on a 302 extracts the Location header into the struct (handle3xx)"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+        settingsMap.mcpLogLevel = 'debug'
+        script.log.messages.clear()
+
+        and: 'followRedirects:false makes HTTPBuilder throw on the 302; the exception carries the Location'
+        def sawFollowRedirects = null
+        httpGetHandler = { Map params, Closure cb ->
+            sawFollowRedirects = params.followRedirects
+            throw new FakeHttpException(302, '/installedapp/configure/9999/mainPage')
+        }
+
+        when:
+        def resp = script.hubInternalGetRaw('/installedapp/create/310')
+
+        then: 'the 302 is treated as success and the new-child Location is surfaced'
+        sawFollowRedirects == false
+        resp.status == 302
+        resp.location == '/installedapp/configure/9999/mainPage'
+        script.log.messages.any { it.contains('[MCP1] ') && it.contains('[hubrt] GET /installedapp/create/310') }
+        !script.log.messages.any { it.contains('[hubrt]') && it.contains('FakeHttpException') }
+    }
+
+    def "hubInternalGetRaw on a 404 (outside the 3xx window) propagates rather than returning a struct"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and:
+        httpGetHandler = { Map params, Closure cb -> throw new FakeHttpException(404) }
+
+        when:
+        script.hubInternalGetRaw('/installedapp/create/310')
+
+        then: 'a 404 is not mistaken for a redirect success -- it propagates'
+        thrown(Exception)
+    }
+
+    def "the GET branch of _hubRequest attaches the cached cookie and returns the body text"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and: 'capture the request headers on a GET (hubInternalGet is metaClass-shadowed by HarnessSpec, so drive _hubRequest directly)'
+        def sentHeaders = null
+        httpGetHandler = { Map params, Closure cb ->
+            sentHeaders = params.headers
+            cb.call([status: 200, data: 'GETBODY'])
+        }
+
+        when:
+        def body = script._hubRequest('GET', '/bar', [returnShape: 'text'])
+
+        then:
+        body == 'GETBODY'
+        sentHeaders?.Cookie == 'JSESSIONID=cached'
+    }
+
+    def "a struct (form) caller treats a committed 2xx with an unreadable body as success (status + null data), not a failure"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and: 'the POST commits (2xx) but the response body cannot be read'
+        httpPostHandler = { Map params, Closure cb ->
+            cb.call([status: 200, data: failingReader('body unreadable')])
+        }
+
+        when:
+        def resp = script.hubInternalPostForm('/foo', [a: 1])
+
+        then: 'no throw: status-only callers (e.g. _rmClickAppButton) see the committed 2xx with null data'
+        noExceptionThrown()
+        resp.status == 200
+        resp.data == null
+    }
+
+    // ---- status-less message-substring auth detection (shouldRetryWithFreshCookie fallback) ----
+
+    def "a status-less 401 detected only via the exception message clears the cookie and retries once"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=stale')
+
+        and: 'first app POST throws an exception with NO .response.status; message contains "Unauthorized"'
+        def appCalls = 0
+        def loginCalls = 0
+        def retryHeaders = null
+        httpPostHandler = { Map params, Closure cb ->
+            if (params.path == '/login') {
+                loginCalls++
+                cb.call([headers: ['Set-Cookie': 'JSESSIONID=fresh; Path=/']])
+            } else {
+                appCalls++
+                if (appCalls == 1) throw new FakeBareException('server returned: Unauthorized')
+                retryHeaders = params.headers
+                cb.call([status: 200, data: 'RETRIED-OK'])
+            }
+        }
+
+        when:
+        def result = script.hubInternalPost('/foo', [a: 1])
+
+        then: 'the message-substring fallback drove a single cookie-refresh retry'
+        result == 'RETRIED-OK'
+        appCalls == 2
+        loginCalls == 1
+        retryHeaders?.Cookie == 'JSESSIONID=fresh'
+    }
+
+    def "a status-less non-auth error (message lacks 401/403/Unauthorized) does NOT retry"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and:
+        def appCalls = 0
+        def loginCalls = 0
+        httpPostHandler = { Map params, Closure cb ->
+            if (params.path == '/login') { loginCalls++; cb.call([headers: ['Set-Cookie': 'JSESSIONID=fresh; Path=/']]) }
+            else { appCalls++; throw new FakeBareException('Connection reset by peer') }
+        }
+
+        when:
+        script.hubInternalPost('/foo', [a: 1])
+
+        then: 'a non-auth status-less error propagates after one attempt, cookie untouched'
+        thrown(Exception)
+        appCalls == 1
+        loginCalls == 0
+        atomicStateMap.hubSecurityCookie == 'JSESSIONID=cached'
+    }
+
+    // ---- hubInternalPostJson response-body contract (parsed Map / strict-empty null / sentinel) ----
+    // hubInternalPostJson has no metaClass shadow in the harness, so these run the real helper
+    // down to the httpPost dispatcher above. Callers key fail-open/fail-closed decisions on the
+    // three-way split, so each leg is pinned.
+
+    def "hubInternalPostJson parses a JSON response body into the response Map"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and:
+        httpPostHandler = { Map params, Closure cb ->
+            cb.call([status: 200, data: '{"success": true, "id": 7}'])
+        }
+
+        when:
+        def result = script.hubInternalPostJson('/app/saveOrUpdateJson', '{"id": 7, "source": "s"}')
+
+        then:
+        result instanceof Map
+        result.success == true
+        result.id == 7
+        !result.containsKey('_unparseable')
+    }
+
+    def "hubInternalPostJson returns null STRICTLY for an empty response body"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and: 'the POST commits but the response body is empty (the dropped-response signature)'
+        httpPostHandler = { Map params, Closure cb ->
+            cb.call([status: 200, data: ''])
+        }
+
+        when:
+        def result = script.hubInternalPostJson('/app/saveOrUpdateJson', '{"id": 1}')
+
+        then: 'null means empty body and nothing else -- the signal self-deploy callers treat leniently'
+        result == null
+    }
+
+    def "hubInternalPostJson returns the _unparseable sentinel (not null) on a non-JSON response body"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+
+        and: 'the hub answers the POST with an HTML body (e.g. a login or error page), not JSON'
+        httpPostHandler = { Map params, Closure cb ->
+            cb.call([status: 200, data: '<html>Hub Login</html>'])
+        }
+        def errorLogs = []
+        script.metaClass.mcpLog = { String level, String component, String msg ->
+            if (level == 'error') errorLogs << msg
+        }
+
+        when:
+        def result = script.hubInternalPostJson('/app/saveOrUpdateJson', '{"id": 1}')
+
+        then: 'callers can distinguish a non-JSON body from a legitimately empty (dropped) one'
+        result instanceof Map
+        result._unparseable == true
+        result.message.contains('non-JSON body')
+        result.message.contains('/app/saveOrUpdateJson')
+        result.message.contains('<html>Hub Login</html>')
+
+        and: 'the error log names the failing path'
+        errorLogs.any { it.contains('/app/saveOrUpdateJson') && it.contains('not JSON') }
+    }
+
+    def "malformed preference save response retains failure context without leaking its body"() {
+        given:
+        enableHubSecurity()
+        seedCachedCookie('JSESSIONID=cached')
+        settingsMap.mcpLogLevel = 'error'
+        script.log.messages.clear()
+        httpPostHandler = { Map params, Closure cb ->
+            cb.call([status: 200, data: '<html>password=fixture-preference-response-secret</html>'])
+        }
+
+        when:
+        def result = script.hubInternalPostJson('/device/preference/save',
+            '{"deviceId":10,"preferences":[{"name":"apiToken","type":"password","value":"fixture-request-secret"}]}')
+        def errorLogs = script.log.messages.findAll { it.startsWith('error:[MCP1] ') }
+
+        then:
+        result instanceof Map
+        result._unparseable == true
+        result.message.contains('/device/preference/save')
+        !result.toString().contains('fixture-preference-response-secret')
+        !result.toString().contains('<html>')
+        errorLogs.any { it.contains('/device/preference/save') }
+        !script.log.messages.join('\n').contains('fixture-preference-response-secret')
+        !script.log.messages.join('\n').contains('fixture-request-secret')
+        !script.log.messages.join('\n').contains('<html>')
+    }
+
+    // ---------- querystring-in-path guard ----------
+
+    @spock.lang.Unroll
+    def "a path carrying a querystring is refused up front (#variant)"() {
+        // The platform client ESCAPES a '?' embedded in `path`, so it stops separating the
+        // querystring and becomes part of the literal path. Exact hub routes then 404
+        // (/app/updateOAuth, /device/updateLabel, /device/setShowOnHome -- all verified live on
+        // firmware 2.5.0.159), while WILDCARD routes MASK it by swallowing the junk into their
+        // path-parameter. That asymmetry is why this is a hard guard and not a comment: without
+        // it, a converted-back caller returns a 404 that several call sites swallow, and the
+        // regression is invisible until someone probes the hub by hand.
+        given: 'a handler that must never be reached'
+        boolean reached = false
+        httpGetHandler = { Map params, Closure cb -> reached = true; cb.call([status: 200, data: 'x']) }
+        httpPostHandler = { Map params, Closure cb -> reached = true; cb.call([status: 200, data: 'x']) }
+
+        when:
+        invoke.call(script)
+
+        then: 'IllegalStateException, NOT IllegalArgumentException'
+        // An IAE maps to isError validation result and promises nothing was committed. This guard can fire on a
+        // LATER leg of a multi-step tool whose earlier legs already wrote, so it must remain
+        // an ISE and land in the generic -32603/isError path.
+        def ex = thrown(IllegalStateException)
+        !(ex instanceof IllegalArgumentException)
+        ex.message.contains('must not contain a querystring')
+        ex.message.contains('query map')
+
+        and: 'the request was never issued'
+        !reached
+
+        where:
+        // hubInternalGet is deliberately absent: HarnessSpec metaClass-shadows it onto the
+        // HubInternalGetMock, so a call here would never reach _hubRequest. That shadow is why
+        // the mock enforces the same guard itself (see HubInternalGetMock.call). Every variant
+        // below reaches _hubRequest, and they all funnel through the same guard line.
+        variant                  | invoke
+        'hubInternalGetRaw'      | { s -> s.hubInternalGetRaw('/installedapp/create/5?x=1') }
+        'hubInternalPost'        | { s -> s.hubInternalPost('/hub/x?y=1', [:]) }
+        'hubInternalPostForm'    | { s -> s.hubInternalPostForm('/installedapp/update/json?a=b', [:]) }
+        'hubInternalPostJson'    | { s -> s.hubInternalPostJson('/app/saveOrUpdateJson?a=b', '{}') }
+        'hubInternalPostFormRaw' | { s -> s.hubInternalPostFormRaw('/installedapp/btn?a=b', 'k=v') }
+    }
+
+    def "the guard message redacts a secret-bearing path"() {
+        // The WiFi-join leg carries the network password. Even though that path now rides a query
+        // map, a REGRESSION that put it back in the path must not leak the psk into the error
+        // envelope or the hub log.
+        when:
+        script.hubInternalPost('/hub/advanced/setWiFiNetworkInfo?ssid=Net&psk=supersecret', [:])
+
+        then:
+        def ex = thrown(IllegalStateException)
+        !ex.message.contains('supersecret')
+        ex.message.contains('psk=***')
+    }
+
+    def "a bare path with query parameters supplied as a map is passed through as path + query"() {
+        // The correct shape: parameters ride `query`, and the platform client -- not us -- does
+        // the URL-encoding. A value pre-encoded by the caller would be double-encoded on the wire.
+        // Driven through hubInternalGetRaw because hubInternalGet is metaClass-shadowed onto the
+        // mock in the harness; both build the same params map in _hubRequest.
+        given:
+        Map seen = null
+        httpGetHandler = { Map params, Closure cb -> seen = params; cb.call([status: 200, data: 'true']) }
+
+        when:
+        def out = script.hubInternalGetRaw('/device/updateLabel', [deviceId: '777', label: 'Garage Bridge'])
+
+        then:
+        out.status == 200
+        out.data == 'true'
+
+        and: 'the path stays bare and the parameters ride query, verbatim'
+        seen.path == '/device/updateLabel'
+        !seen.path.contains('?')
+        seen.query == [deviceId: '777', label: 'Garage Bridge']
+    }
+
+    @spock.lang.Unroll
+    def "hubInternalPostForm records the trail an update/json answer returns and the next submit from that page reuses it (#form)"() {
+        given: 'the first answer renders offMeansPage with its trail; later answers render nothing'
+        def bodies = []
+        httpPostHandler = { Map params, Closure cb ->
+            bodies << params.body
+            cb.call([status: 200, headers: [:], data: bodies.size() == 1 ? answer : '{"status":"success"}'])
+        }
+
+        when: 'a submit whose answer renders offMeansPage, then a navigation leaving offMeansPage'
+        script.hubInternalPostForm('/installedapp/update/json', [id: '2518', formAction: 'update'])
+        script._rmNavigateToPage(2518, 'offMeansPage', 'mainPage')
+
+        then: 'the navigation posts the trail the hub returned, not its own fallback'
+        bodies.size() == 2
+        bodies[1].currentPage == 'offMeansPage'
+        bodies[1].pageBreadcrumbs == expected
+
+        where:
+        form           | answer                                                                                                                  | expected
+        'URL-encoded'  | '{"status":"success","pageBreadcrumbs":"%5B%22mainPage%22%5D","configPage":{"name":"offMeansPage","sections":[]}}'     | '%5B%22mainPage%22%5D'
+        'JSON-escaped' | '{"status":"success","pageBreadcrumbs":"[\\"mainPage\\",\\"x\\"]","configPage":{"name":"offMeansPage","sections":[]}}' | '["mainPage","x"]'
+    }
+}

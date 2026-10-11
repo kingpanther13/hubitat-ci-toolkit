@@ -1,0 +1,445 @@
+package server
+
+import spock.lang.Shared
+import support.TestHub
+import support.TestLocation
+import support.ToolSpecBase
+
+/**
+ * Contract spec asserting that {@code customRuleEngineEnabled} and
+ * {@code developerModeEnabled} are present in the {@code getHubInfo()} response
+ * (the merged successor to the removed {@code getHubDetails()}).
+ *
+ * {@code .github/scripts/mcp_setup_env.sh} reads {@code developerModeEnabled}
+ * to decide whether to bootstrap Developer Mode before enabling toggles.
+ *
+ * Mocking strategy:
+ *   - location.hub -> appExecutor.getLocation() returns sharedLocation
+ */
+class HubInfoFieldContractSpec extends ToolSpecBase {
+
+    @Shared private TestLocation sharedLocation = new TestLocation()
+
+    def setupSpec() {
+        appExecutor.getLocation() >> sharedLocation
+    }
+
+    def cleanup() {
+        sharedLocation.hub = null
+    }
+
+    // -------- toolGetHubInfo --------
+
+    def "getHubInfo exposes whether setup completed for the running version"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        stateMap.setupVersion = completed ? script.currentVersion() : null
+        def field = script.getClass().getDeclaredField('SETUP_CURRENT')
+        field.accessible = true
+        field.set(null, completed)
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.setupCurrent == completed
+        result.setupVersion == (completed ? script.currentVersion() : null)
+
+        where:
+        completed << [true, false]
+    }
+
+    def "getHubInfo includes customRuleEngineEnabled=true when enableCustomRuleEngine is true"() {
+        given:
+        settingsMap.enableCustomRuleEngine = true
+        sharedLocation.hub = new TestHub()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('customRuleEngineEnabled')
+        result.customRuleEngineEnabled == true
+    }
+
+    def "getHubInfo includes developerModeEnabled=true when enableDeveloperMode is true"() {
+        given:
+        settingsMap.enableDeveloperMode = true
+        sharedLocation.hub = new TestHub()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('developerModeEnabled')
+        result.developerModeEnabled == true
+    }
+
+    def "getHubInfo reports each endpoint's access toggle, on unless explicitly off (issue #453)"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        if (local != null) settingsMap.enableLocalAccess = local
+        if (cloud != null) settingsMap.enableCloudAccess = cloud
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.localAccessEnabled == (local != false)
+        result.cloudAccessEnabled == (cloud != false)
+
+        where:
+        local | cloud
+        null  | null
+        false | true
+        true  | false
+    }
+
+    // issue #237: a self-deploy can't return its result on the deploy call (success reloads the app;
+    // a big-file compile failure 504s), so toolUpdateItemCodeInner records the hub's verbatim outcome
+    // to atomicState.lastSelfDeploy and hub_get_info surfaces it for a follow-up read (CI recovers the
+    // real compile error this way). These pin that the field is exposed when set and omitted otherwise.
+    def "getHubInfo exposes atomicState.lastSelfDeploy when present (issue #237)"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        atomicStateMap.lastSelfDeploy = [success: false, error: 'name cannot be empty in definition section',
+                                         sourceMode: 'importUrl', importUrl: 'https://x/app.groovy', at: 1234567890000L]
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.lastSelfDeploy?.success == false
+        result.lastSelfDeploy.error == 'name cannot be empty in definition section'
+        result.lastSelfDeploy.importUrl == 'https://x/app.groovy'
+        // freshness affordance: ageMs (now - at) is computed at read so a consumer can spot a STALE
+        // record (lastSelfDeploy persists in atomicState across reloads and is not cleared on update).
+        result.lastSelfDeploy.ageMs instanceof Number
+        result.lastSelfDeploy.ageMs >= 0
+        // computed on a copy -- the persisted atomicState record itself is not mutated.
+        !atomicStateMap.lastSelfDeploy.containsKey('ageMs')
+    }
+
+    def "getHubInfo settles a self-deploy still saving once the App Code row's version has passed the starting one"() {
+        given:
+        atomicStateMap.lastSelfDeploy = [success: true, assumed: true, status: 'saving', startedVersion: 5,
+                                         appId: '228', sourceMode: 'importUrl', at: 1234567890000L - 60000L]
+        hubGet.register('/app/list/single/data/228') { params -> '[{"id": 228, "version": 6}]' }
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.lastSelfDeploy.success == true
+        result.lastSelfDeploy.confirmedVersion == 6
+        !result.lastSelfDeploy.containsKey('status')
+        !result.lastSelfDeploy.containsKey('assumed')
+        atomicStateMap.lastSelfDeploy.confirmedVersion == 6
+    }
+
+    def "getHubInfo keeps a young self-deploy record saving while the row has not advanced, and fails it after 20 minutes"() {
+        given:
+        hubGet.register('/app/list/single/data/228') { params -> '[{"id": 228, "version": 5}]' }
+        atomicStateMap.lastSelfDeploy = [success: true, assumed: true, status: 'saving', startedVersion: 5,
+                                         appId: '228', at: 1234567890000L - 60000L]
+
+        when:
+        def young = script.toolGetHubInfo()
+
+        then:
+        young.lastSelfDeploy.status == 'saving'
+        young.lastSelfDeploy.success == true
+
+        when:
+        atomicStateMap.lastSelfDeploy = [success: true, assumed: true, status: 'saving', startedVersion: 5,
+                                         appId: '228', at: 1234567890000L - 21L * 60L * 1000L]
+        def old = script.toolGetHubInfo()
+
+        then:
+        old.lastSelfDeploy.success == false
+        old.lastSelfDeploy.error.contains('did not land')
+        !old.lastSelfDeploy.containsKey('status')
+    }
+
+    def "getHubInfo never fails a saving self-deploy record while the App Code row is unreadable"() {
+        given:
+        hubGet.register('/app/list/single/data/228') { params -> '<html>busy</html>' }
+        atomicStateMap.lastSelfDeploy = [success: true, assumed: true, status: 'saving', startedVersion: 5,
+                                         appId: '228', at: 1234567890000L - 21L * 60L * 1000L]
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.lastSelfDeploy.status == 'saving'
+        result.lastSelfDeploy.success == true
+        atomicStateMap.lastSelfDeploy.status == 'saving'
+    }
+
+    def "getHubInfo omits lastSelfDeploy when the app has never self-deployed"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        atomicStateMap.lastSelfDeploy = null
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        !result.containsKey('lastSelfDeploy')
+    }
+
+    def "getHubInfo includes both fields as false when toggles are off"() {
+        given:
+        settingsMap.enableCustomRuleEngine = false
+        settingsMap.enableDeveloperMode = false
+        sharedLocation.hub = new TestHub()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('customRuleEngineEnabled')
+        result.customRuleEngineEnabled == false
+        result.containsKey('developerModeEnabled')
+        result.developerModeEnabled == false
+    }
+
+    // -------- issue #466: model comes from /hub/details/json, not the internal hardwareID --------
+
+    private List captureMcpLogs() {
+        def entries = []
+        script.metaClass.mcpLog = { String level, String component, String message,
+                                    String ruleId = null, Map extra = null ->
+            entries << [level: level, component: component, message: message]
+        }
+        return entries
+    }
+
+    def "getHubInfo model is the trimmed /hub/details/json hardwareVersion, hardwareID surfaces as platformHardwareId"() {
+        given:
+        sharedLocation.hub = new TestHub(hardwareID: '000D')
+        hubGet.register('/hub/details/json') { params -> body }
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.model == expected
+        result.platformHardwareId == '000D'
+
+        where:
+        body                                              | expected
+        '{"hardwareVersion":"C-8 Pro","hubName":"x"}'     | 'C-8 Pro'
+        '{"hardwareVersion":" C-7 "}'                     | 'C-7'
+    }
+
+    def "getHubInfo model is null (never a placeholder) and logged when /hub/details/json read fails"() {
+        given:
+        sharedLocation.hub = new TestHub(hardwareID: '000D')
+        hubGet.register('/hub/details/json') { params -> throw new IOException('timeout') }
+        def logs = captureMcpLogs()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        hubGet.calls.any { it.path == '/hub/details/json' }
+        result.containsKey('model')
+        result.model == null
+        result.platformHardwareId == '000D'
+        logs.any { it.level == 'warn' && it.message.startsWith('_hubHardwareModel: /hub/details/json read/parse failed: timeout') }
+    }
+
+    def "getHubInfo model is null and logged when hardwareVersion is unusable"() {
+        given:
+        sharedLocation.hub = new TestHub(hardwareID: '000D')
+        hubGet.register('/hub/details/json') { params -> body }
+        def logs = captureMcpLogs()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        hubGet.calls.any { it.path == '/hub/details/json' }
+        result.containsKey('model')
+        result.model == null
+        result.platformHardwareId == '000D'
+        logs.any { it.level == 'warn' && it.message.startsWith('_hubHardwareModel: ') }
+
+        where:
+        body << ['{"hubName":"x"}', '{"hardwareVersion":"  "}', 'not json at all', '',
+                 '{"hardwareVersion":8}', '{"hardwareVersion":null}', '{"hardwareVersion":{"x":1}}', '[]']
+    }
+
+    // -------- toolGetHubInfo identify-LED --------
+
+    def "getHubInfo identifyHub=true fires /hub/advanced/blinkLED and reports identifyHubTriggered=true"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        hubGet.register('/hub/advanced/blinkLED') { params -> 'true' }
+
+        when:
+        def result = script.toolGetHubInfo([identifyHub: true])
+
+        then:
+        result.identifyHubTriggered == true
+        !result.containsKey('identifyHubError')
+        hubGet.calls.any { it.path == '/hub/advanced/blinkLED' }
+    }
+
+    def "getHubInfo without identifyHub arg does not hit the blinkLED endpoint or emit the field"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        // No hubGet.register — the no-call assertion is the strict-stronger guarantee;
+        // field-absent alone would miss a fire-and-forget regression that calls the
+        // endpoint without ever writing the result field.
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        !result.containsKey('identifyHubTriggered')
+        !result.containsKey('identifyHubError')
+        !hubGet.calls.any { it.path == '/hub/advanced/blinkLED' }
+    }
+
+    def "getHubInfo identifyHub=false does not hit the blinkLED endpoint"() {
+        given:
+        sharedLocation.hub = new TestHub()
+
+        when:
+        def result = script.toolGetHubInfo([identifyHub: false])
+
+        then:
+        !result.containsKey('identifyHubTriggered')
+        !hubGet.calls.any { it.path == '/hub/advanced/blinkLED' }
+    }
+
+    def "getHubInfo identifyHub=true with endpoint failure surfaces identifyHubTriggered=false and identifyHubError"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        hubGet.register('/hub/advanced/blinkLED') { params -> throw new RuntimeException('LED endpoint missing on this firmware') }
+
+        when:
+        def result = script.toolGetHubInfo([identifyHub: true])
+
+        then:
+        result.identifyHubTriggered == false
+        result.identifyHubError == 'LED endpoint missing on this firmware'
+    }
+
+    def "getHubInfo identifyHub=true with null-message exception falls back to e.toString()"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        hubGet.register('/hub/advanced/blinkLED') { params -> throw new IOException() }
+
+        when:
+        def result = script.toolGetHubInfo([identifyHub: true])
+
+        then:
+        result.identifyHubTriggered == false
+        result.identifyHubError != null
+        result.identifyHubError.toLowerCase().contains('ioexception')
+    }
+
+    // -------- toolGetHubInfo toggle-field contract (was toolGetHubDetails, merged in) --------
+
+    def "getHubInfo (merged from getHubDetails) includes customRuleEngineEnabled=true when enableCustomRuleEngine is true"() {
+        given:
+        settingsMap.enableCustomRuleEngine = true
+        sharedLocation.hub = new TestHub()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('customRuleEngineEnabled')
+        result.customRuleEngineEnabled == true
+    }
+
+    def "getHubInfo (merged from getHubDetails) includes developerModeEnabled=true when enableDeveloperMode is true"() {
+        given:
+        settingsMap.enableDeveloperMode = true
+        sharedLocation.hub = new TestHub()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('developerModeEnabled')
+        result.developerModeEnabled == true
+    }
+
+    def "getHubInfo (merged from getHubDetails) includes both fields as false when toggles are off"() {
+        given:
+        settingsMap.enableCustomRuleEngine = false
+        settingsMap.enableDeveloperMode = false
+        sharedLocation.hub = new TestHub()
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('customRuleEngineEnabled')
+        result.customRuleEngineEnabled == false
+        result.containsKey('developerModeEnabled')
+        result.developerModeEnabled == false
+    }
+
+    def "getHubInfo includes readEnabled/writeEnabled=true by default (masters unset)"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        // enableRead/enableWrite unset -- both masters default ON.
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('readEnabled')
+        result.readEnabled == true
+        result.containsKey('writeEnabled')
+        result.writeEnabled == true
+        // The legacy field names are gone.
+        !result.containsKey('hubAdminReadEnabled')
+        !result.containsKey('hubAdminWriteEnabled')
+        !result.containsKey('builtinAppEnabled')
+    }
+
+    def "getHubInfo includes the PII keys by default (Read master ON when unset)"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        // enableRead unset -- the PII block runs by default, so the PII keys are
+        // present (values come from the stubs) and no read-disabled note is emitted.
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        result.containsKey('name')
+        result.containsKey('localIP')
+        result.containsKey('timeZone')
+        !result.containsKey('readDisabledNote')
+    }
+
+    def "getHubInfo does NOT throw when Read master is OFF; excludes PII and surfaces readDisabledNote"() {
+        given:
+        sharedLocation.hub = new TestHub()
+        settingsMap.enableRead = false
+        // toolGetHubInfo gates only PII when the Read master is off (the tool itself
+        // is reachable via the central gate only when Read is on; called directly here
+        // it surfaces a readDisabledNote and still returns the toggle fields). PII is
+        // included by default and excluded ONLY when enableRead == false.
+
+        when:
+        def result = script.toolGetHubInfo()
+
+        then:
+        noExceptionThrown()
+        result.containsKey('readDisabledNote')
+        result.readDisabledNote.contains('Read master')
+        !result.containsKey('name')
+        !result.containsKey('localIP')
+        result.containsKey('customRuleEngineEnabled')
+        result.readEnabled == false
+    }
+}

@@ -1,0 +1,90 @@
+name: Publish bundle artifact
+# THE release delivery pipeline. Builds the release app files (tools/build-release-app.py: the
+# parent with every #include library inlined, and the child, both comment-stripped) on EVERY push
+# and stores them on the bot-only `bundle-artifacts` branch, keyed by branch name AND full commit SHA:
+#
+#   branches/<branch>/hubitat-mcp-server.groovy, hubitat-mcp-rule.groovy (+ .size markers)
+#   shas/<full-sha>/hubitat-mcp-server.groovy, hubitat-mcp-rule.groovy   (+ .size markers)
+#
+# packageManifest.json's apps[].location points at branches/main/ -- HPM users install from this
+# branch. The e2e deploy installs the PR's shas/<sha>/ entry (byte-verified against its own CI
+# build), so every consumer rides the ONE mechanism e2e proves on every run. No paths filter: every
+# push (incl. release-bot bookkeeping commits) gets a shas/ entry, so an install pinned to any main
+# SHA always resolves. The .size marker is the cheap existence probe. Entries published before the
+# inlined build (mcp-libraries.zip) are left in place, so old refs keep resolving.
+#
+# Nobody rebases bundle-artifacts, so it has zero merge-conflict surface; identical files across
+# commits dedupe to one git blob. (The workflow and branch keep their bundle-era names so existing
+# URLs and refs stay valid.)
+on:
+  push:
+    branches-ignore: [bundle-artifacts]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bundle-artifacts
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Build and publish the keyed release app files
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python tools/build-release-app.py
+          FILES="hubitat-mcp-server.groovy hubitat-mcp-rule.groovy"
+
+          git fetch origin bundle-artifacts || true
+          if git show-ref --verify --quiet refs/remotes/origin/bundle-artifacts; then
+            git worktree add ../artifacts origin/bundle-artifacts
+          else
+            # First run: bootstrap the orphan branch in a detached worktree.
+            git worktree add --detach ../artifacts
+            git -C ../artifacts checkout --orphan bundle-artifacts
+            git -C ../artifacts rm -rfq . 2>/dev/null || true
+          fi
+
+          for KEY in "branches/${REF_NAME}" "shas/${HEAD_SHA}"; do
+            mkdir -p "../artifacts/${KEY}"
+            for F in $FILES; do
+              cp "dist/$F" "../artifacts/${KEY}/$F"
+              wc -c < "dist/$F" | tr -d '[:space:]' > "../artifacts/${KEY}/$F.size"
+            done
+          done
+
+          cd ../artifacts
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Artifact already current for ${REF_NAME} @ ${HEAD_SHA} -- nothing to publish."
+            exit 0
+          fi
+          git commit -m "release artifact: ${REF_NAME} @ ${HEAD_SHA}"
+          # Default-token pushes don't retrigger workflows; the retry covers a concurrent
+          # publish from another branch's push landing between our fetch and push.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:bundle-artifacts; then
+              echo "Published release artifact for ${REF_NAME} @ ${HEAD_SHA} (attempt $attempt)."
+              exit 0
+            fi
+            # A failed rebase must not leave a half-finished rebase for the next attempt to
+            # trip over (and then mis-report as a push failure) -- abort it and retry clean.
+            if ! git pull --rebase origin bundle-artifacts; then
+              echo "::warning::rebase onto bundle-artifacts failed on attempt $attempt -- aborting the rebase and retrying."
+              git rebase --abort 2>/dev/null || true
+            fi
+          done
+          echo "::error::Could not push the release artifact after 3 attempts."
+          exit 1

@@ -1,0 +1,642 @@
+# Testing
+
+Groovy unit tests run under Spock + HubitatCI via the Gradle wrapper. CI runs `./gradlew test` on every PR and push to `main` (`.github/workflows/unit-tests.yml`).
+
+- **Test framework:** Spock 2.3 on Groovy 3.0 (Hubitat's hub runtime is Groovy 2.4, and `eighty20results/hubitat_ci` actively tests its behaviour against that runtime — case-insensitive enum matching, locale-safe `toLowerCase`, etc. — so Groovy 3.0 stays the closest practical match).
+- **Hubitat sandbox:** [eighty20results/hubitat_ci](https://github.com/eighty20results/hubitat_ci) — an actively-maintained Groovy 3.0 fork of the original [biocomp/hubitat_ci](https://github.com/biocomp/hubitat_ci) (Apache 2.0). Consumed as `com.github.eighty20results:hubitat_ci:<tag>` via JitPack; the pinned release tag in `build.gradle` is bumped by tracking issues from `.github/workflows/hubitat-ci-version-check.yml`. Sandbox-loaded production code that references `hubitat.helper.{RMUtils, NetworkUtils}` is routed through `support.PassThroughSandboxClassLoader` (installed via `support.PassThroughAppValidator`) so our literal-named stubs at `src/main/groovy/hubitat/helper/` resolve without hitting the JVM's §5.3.5 name-equality check — the raw-vs-remapped class mismatch that would otherwise NCDFE at runtime. Groovy 3 is module-aware, so the JDK 11+ `--add-opens` workaround from the Groovy-2.5 era is no longer needed.
+- **JVM:** OpenJDK 17 in CI; locally, JDK 11+ via the Gradle toolchain
+- **Build:** Gradle 9.5.1 via wrapper (`./gradlew test`)
+- **Python tests and E2E:** Python 3.11 or newer. The suite imports `datetime.UTC` and uses union type annotations and strict `zip`; CI selects the current Python 3 release.
+
+### Additive hub-closer lanes
+
+Two standalone lanes complement the primary Groovy 3.0 lane without touching it — Hubitat's hub
+runtime is Groovy 2.4.x, so a 3.0-green can still hide hub failures:
+
+- **Groovy 2.4 Parse Check** (`ci/groovy24-parse/`) — checks the apps, included libraries, watchdogs,
+  and deployed e2e fixtures under stock Groovy 2.4.21. After CONVERSION, its AST visitor rejects
+  closures with null parameters (`{ -> ... }`), including nested expressions and GString interpolation;
+  empty parameter arrays (implicit `it`) remain allowed. Findings retain original library locations.
+  This is the authoritative closure guard; `sandbox_lint.py` only points to this lane. Stock Groovy
+  processes the same AST successfully. An isolated app on firmware 2.5.1.181 rejected `{ -> 42 }`
+  with HTTP 500 while identical source using `{ 42 }` compiled; the private compiler mechanism
+  remains unproven. See [the live evidence](issue-407-findings.md). The lane also checks syntax
+  and sandbox-blocked classes. `parse24` runs its positive/negative fixtures first;
+  they can also run directly via `parse_check.groovy --self-test <absolute-repo-root>`.
+- **Groovy 2.5 Spock** (`ci/groovy2x-spock/`) — runs this same spec corpus against a Groovy 2.5
+  runtime via [joelwetzel/hubitat_ci](https://github.com/joelwetzel/hubitat_ci) (the biocomp-API fork
+  the harness used before the eighty20results migration; Apache 2.0), catching 2.x-vs-3.0 **runtime**
+  divergence (issue #230). A REQUIRED status check (`groovy2x-spock` in the `main-required-checks`
+  ruleset), not informational -- it references the specs read-only and carries its own
+  joelwetzel-shaped `HarnessSpec`/`RuleHarnessSpec` under `ci/groovy2x-spock/scaffold/`. See
+  [docs/groovy2x-spock-lane.md](groovy2x-spock-lane.md). Run locally with
+  `./gradlew -p ci/groovy2x-spock test`.
+
+## Test-hub watchdog maintenance
+
+Updating the watchdog requires an explicit `hub-e2e.yml` dispatch with
+`watchdog_update=true`, a ref with passing non-E2E CI, and the exclusive test-hub
+lease. Normal E2E does not update watchdog source. Watchdog v3 refuses to replace its
+own code unless the MCP server's endpoint answers, so restore the MCP package first
+if it is broken.
+
+Before deployment, maintenance uploads `watchdog-before-maintenance-<attempt>`
+and downloads it again to verify the prior source and its metadata. An upload,
+download, or verification failure stops deployment. The artifact contains the
+complete `watchdog-before.groovy` and `watchdog-before.json`, including the Apps
+Code class ID, source checksum, and workflow identity.
+
+If deployment fails or the runner stops, download that artifact from the
+maintenance run. To recover without the watchdog endpoint, open the recorded
+class ID under **Apps Code** on the test hub, replace its source with
+`watchdog-before.groovy`, and save. Check the hub's current source and deployment
+status first: a relay timeout can leave the original write still running.
+
+## Running locally
+
+```bash
+./gradlew test                                # all tests
+./gradlew test --tests "*ToolGetHubLogsSpec"  # a single spec
+./gradlew test --info                         # verbose output
+```
+
+HTML report at `build/reports/tests/test/index.html`. CI uploads it as the `test-report` artifact on failure.
+
+## Architecture
+
+### `HarnessSpec` — base for server tool tests
+
+`src/test/groovy/support/HarnessSpec.groovy`. Lifecycle:
+
+1. **First spec class to run** triggers `HubitatAppSandbox.run()` once and caches the compiled script in a JVM-static `SHARED_SCRIPT`. The compile uses `support.PassThroughAppValidator` providing `Flags.DontValidatePreferences / DontValidateDefinition / DontRestrictGroovy / DontRunScript`. We use `run()` rather than `compile()` because `compile()` eagerly adds `DontRunScript` to `validationFlags`, which flips HubitatCI's `readValidator` precedence and silently discards the `validator:` option — meaning a custom `PassThroughAppValidator` would never fire. The validator carries `DontRunScript` itself so `setupImpl` still skips the auto-`script.run()` call; the multi-page `preferences { page(name: "mainPage") }` body HubitatCI's `AppPreferencesReader` mishandles stays unexecuted. All `def method() { }` handlers remain callable on the returned script.
+2. **Every spec's `setupSpec`** builds its own `AppExecutor` Mock (Spock 2.x ties Mocks to their creating Spec's MockController via thread-local registration, so a JVM-shared Mock can't accept setupSpec stub additions from subsequent specs — a Mock created in spec A's setupSpec has no controller wired up when spec B's setupSpec runs). The fresh Mock is reflectively rebound onto `SHARED_SCRIPT.api` via the `HubitatAppScript.api` private field, replacing the previous spec's Mock. The script's `userSettingsMap` / `preferencesReader` wiring stays valid because the underlying Map references are JVM-shared (`SHARED_STATE_MAP`, `SHARED_SETTINGS_MAP`, etc.).
+3. The Mock exposes `state`, `atomicState`, `getChildDevices()`, `now()`, `log`, and `getSettings()` — eighty20results' `AppChildExecutor` leaves these on the `@Delegate` path to the supplied `AppExecutor`. `getSettings()` must be stubbed explicitly on the per-spec Mock because sandbox.run()'s implicit wiring of `api.getSettings()` only applies to the originally-bound Mock; rebinding swaps that wiring out.
+4. **Every test's `setup()`** clears the JVM-shared collection refs (`stateMap`, `atomicStateMap` -- a `TestAtomicState` LinkedHashMap subclass implementing the hub's per-entry `atomicState.updateMapValue`, with a call counter readable via `.@updateMapValueCalls` for pinning that production routed through it, etc.), resets `mcpDriver` / `hubGet`, and wipes **both** the class-level metaClass (`GroovySystem.metaClassRegistry.removeMetaClass(script.getClass())`) **and** the per-instance metaClass (`script.setMetaClass(null)`). Both wipes matter when `SHARED_SCRIPT` is reused across spec classes: per-instance ExpandoMetaClass overrides like `script.metaClass.mcpLog = closure` survive class-level removal and would otherwise leak into subsequent specs. `wireScriptOverrides()` then re-installs the standard per-test hooks.
+5. `hubInternalGet` isn't part of `AppExecutor`'s interface, so it's metaclass-injected on the loaded script in `wireScriptOverrides()` along with the `Map`-backed `stateMap` / `atomicStateMap` / `HubInternalGetMock` wiring.
+6. `addChildApp`, `getChildApps`, `getChildAppById`, `getChildAppByLabel`, and `deleteChildApp` are intercepted by reflecting into `HubitatAppScript`'s private `childAppFactory` and `childAppAccessor` closure fields and replacing them with harness closures that route to spec-controlled fixtures (`mockChildAppForCreate`, `childAppsList`). eighty20results' `HubitatAppScript` defines these as concrete methods that call those private closures internally, and per-instance `metaClass` overrides are bypassed by the script body's intra-class dispatch — verified empirically in PR #100's first CI run before the reflective approach replaced the metaClass attempt.
+7. A `childAppResolver` closure is passed into `sandbox.run()` so eighty20results' options validator accepts the sandbox options; the closure throws `IllegalStateException` on call, because the reflective `childAppFactory` replacement should short-circuit first. If the resolver ever fires, it means an eighty20results API change broke the harness and the error points the spec author at the right place to look.
+
+Spec authors don't see most of this — extend `ToolSpecBase`, use `appExecutor`/`script`/`stateMap` as usual, and the per-JVM caching is transparent. The one rule for harness maintainers: don't add `getApp() >> X` to the base Mock; several specs already layer their own additive `getApp() >> sharedAppStub` in setupSpec and a base stub would stack against them with Spock-version-dependent resolution order.
+
+Tool specs extend `ToolSpecBase` (which extends `HarnessSpec`). `ToolSpecBase` is currently an empty marker class — the `settings` / `getChildDevices()` / `getChildApps()` / `now()` fixtures all live on `HarnessSpec` itself. The marker exists to keep the "this is a server tool spec" distinction explicit and to give us a place to add tool-test-specific helpers later.
+
+### `RuleHarnessSpec` — base for rule-engine tests
+
+`src/test/groovy/rules/RuleHarnessSpec.groovy`. Same JVM-cache + per-spec-Mock + reflective-api-rebind pattern as `HarnessSpec`, but loads `hubitat-mcp-rule.groovy` instead of the server file, and exposes a mockable `parent` (the server reference the rule engine reads from for `findDevice` etc.).
+
+One asymmetry to know about: the mutable collection fields (`settingsMap` / `stateMap` / `atomicStateMap`) are per-spec-instance `@Shared` fields on `RuleHarnessSpec` rather than JVM-static like `HarnessSpec`'s `SHARED_*` constants — the script-cache and per-spec-Mock rebind pattern is the same. `sandbox.run()` captures the FIRST subclass's `settingsMap` into eighty20results' `AppPreferencesReader` for the JVM's lifetime; subsequent specs' settings reads flow through `api.getSettings()` (stubbed per-spec to the current instance's `settingsMap`), so the orphan reference is unreachable today. If a future eighty20results change ever routes `script.settings` through `preferencesReader` directly, those fields should be hoisted to JVM-static to keep cross-spec isolation honest.
+
+`parent` is a writable property on the spec: specs assign it in their `given:` block (e.g. `parent = new SmokeParent(...)`), and the setter propagates the value to the loaded script via `HubitatAppScript.setParent()`. eighty20results' `HubitatAppScript` defines `parent` as a private field accessed via its `@CompileStatic` `getProperty("parent")` override, so mocking `AppExecutor.getParent()` no longer intercepts property access — `setParent()` is the only reliable hook.
+
+### Mocks
+
+- **`HubInternalGetMock`** — `register(path) { params -> response }`. Unstubbed paths throw `IllegalStateException` so tests fail loudly rather than silently returning null.
+- **`NetworkUtilsMock`** — install/uninstall pattern. Records calls to `hubitat.helper.NetworkUtils.sendHubitatCommand(Map)`.
+- **`RMUtilsMock`** — install/uninstall pattern. Records calls to `hubitat.helper.RMUtils.{getRuleList, sendAction, pauseRule, resumeRule, setRuleBoolean}`. `install()` mutates the static metaClass on `hubitat.helper.RMUtils` (the main-source-set stub at `src/main/groovy/hubitat/helper/RMUtils.groovy`); both test-side direct calls and sandbox-loaded production calls (the latter routed through `PassThroughSandboxClassLoader` bypass of eighty20results' remap) land on the mock. `RMUtilsSandboxInterceptionSpec` is the end-to-end regression proving the sandbox path works — bump that spec if an eighty20results upgrade breaks the PassThrough scaffold.
+- **`McpRequestDriver`** — integration dispatch drive-through for `handleMcpRequest()`. Stages a JSON-RPC body, fires the request, captures the `render(Map)` envelope. Also supports `pushBodyThrowing(t)` to exercise the `request.JSON`-throws try/catch branch. Wired by `HarnessSpec` (see the integration dispatch section below).
+- **`SubscriptionRecorder`** — records `subscribe(source, attribute, handler)` calls from the rule engine and replays them via `fireEvent(script, source, attribute, value)`. Defensive shallow-copies the event Map per handler so mutation doesn't leak across dispatches. Wired by `RuleHarnessSpec`.
+- **`TestParent`** — common parent stub for rule-engine specs. Devices map + settings map + `findDevice(id as Long)`. Specs with additional lookup needs (variables, etc.) extend it.
+
+### Main-source-set helper stubs
+
+`src/main/groovy/hubitat/helper/RMUtils.groovy` and `.../NetworkUtils.groovy` are main-source-set stubs of Hubitat's platform helpers. They exist so both test-side Groovy references AND sandbox-loaded production code can resolve these classes under the test JVM. Sandbox-loaded references get here via `support.PassThroughSandboxClassLoader`, which bypasses eighty20results' standard `hubitat.X` → `me.biocomp.hubitat_ci.api.X` remap for the specific class names we stub. Main-source-set rather than test-source-set because `SandboxClassLoader`'s parent chain (AppClassLoader) sees Gradle's main source-set output but not the test classpath. Not deployed to the hub — `packageManifest.json` ships only `hubitat-mcp-server.groovy` and `hubitat-mcp-rule.groovy`. To add a new helper, stub at `src/main/groovy/hubitat/<pkg>/<Class>.groovy` AND add its FQN to `PassThroughSandboxClassLoader.PASSTHROUGH_NAMES`.
+
+## Test pyramid: direct-call vs dispatch-envelope
+
+Every tool feature should have coverage at **both** layers:
+
+| Layer | Entry point | What it covers | When to use |
+|---|---|---|---|
+| **Direct-call (unit)** | `script.toolFoo(args)` — invokes the tool method on the loaded script directly. | The tool's internal logic: argument validation, state reads/mutations, hub-call shapes, return value. Fast and pinpoints the exact line that regressed. | Always. This is the default for any new tool feature or bug fix; one direct-call test per branch (golden path + each error condition). |
+| **Dispatch-envelope (integration)** | `mcpDriver.callTool('tool_name', args)` — drives the full production path: `request.JSON → handleMcpRequest → tools/call dispatch → gateway routing (when applicable) → tool method → error mapping → render(Map)` envelope. | Wiring: that the tool is reachable by its public name from the JSON-RPC catalog, that gateway routing resolves correctly, that thrown exceptions land in the right JSON-RPC envelope shape, and that the response wrapper produces a parsable body. | At least one per tool feature (the happy path), plus an error-path counterpart for any tool that throws `IllegalArgumentException` (validation) or other exceptions (runtime). A direct-call-only suite can pass while a tool is silently unreachable through the production envelope. |
+
+A regression in the dispatch layer (gateway routing changes, render envelope tweaks, JSON-RPC error mapping) shows up in dispatch tests without affecting direct-call tests. A regression in tool internals (bad state mutation, wrong hub endpoint) shows up in direct-call tests first. Keeping both layers makes the failure surface unambiguous.
+
+### `mcpDriver.callTool(toolName, args)` helper
+
+Signature: `Map callTool(String toolName, Map args)`. Returns the parsed JSON-RPC response Map. Internally:
+
+1. Generates a fresh monotonic `id` (readable via `mcpDriver.lastSentId` for `response.id == mcpDriver.lastSentId` assertions).
+2. Builds the canonical envelope `[jsonrpc: '2.0', id: <id>, method: 'tools/call', params: [name: toolName, arguments: args ?: [:]]]`.
+3. Pushes it through `mcpDriver.pushBody(...)` so the next `request.JSON` read returns it.
+4. Calls `script.handleMcpRequest()` — production code runs end-to-end.
+5. Captures the `render(Map)` payload and parses `data` as JSON.
+
+`args` may be `null` or `[:]` for tools that take no arguments. For deliberately-malformed envelopes (missing `name`, batch shape, throwing `request.JSON`), bypass the helper and use `mcpDriver.pushBody(...)` / `pushBodyThrowing(...)` directly — see `HandleToolsCallSpec` "missing tool name returns -32602".
+
+### `@Unroll where: useGateways << [true, false]` pattern
+
+Each dispatch test pins the gateway toggle explicitly via a data-driven Spock feature so the same envelope path runs under both routing modes in one feature method:
+
+```groovy
+import spock.lang.Unroll
+
+@Unroll
+def "create_room dispatches successfully through the envelope (useGateways=#useGateways)"() {
+    given:
+    settingsMap.useGateways = useGateways
+    httpPostHandler = { Map params, Closure responseCb ->
+        responseCb.call([status: 200, data: ''])
+    }
+
+    when:
+    def response = mcpDriver.callTool('create_room', [name: 'Garage', confirm: true])
+
+    then:
+    response.jsonrpc == '2.0'
+    response.id == mcpDriver.lastSentId
+    response.result.isError != true
+
+    where:
+    useGateways << [true, false]
+}
+```
+
+The CI matrix (see "CI" below) runs the full suite under both default modes, but pinning per-feature keeps the dispatch test honest even under the single-mode matrix entry the developer happens to run locally.
+
+### Error-path envelope shapes
+
+Two distinct production paths produce different envelope shapes — assert the right one:
+
+- **`IllegalArgumentException` from a tool → success envelope with `isError: true`.** The 2026-07-28 tools page classes input validation as a tool execution error that clients SHOULD show the model, so a leaf validation refusal rides the result, with the reactive guide pointer appended to its `error` text:
+
+  ```groovy
+  response.error == null
+  response.result.isError == true
+  mcpDriver.parseInner(response).error.startsWith('Device not found')
+  ```
+
+  A **protocol** fault still uses `response.error.code == -32602`: unknown tool or gateway, a malformed `tools/call` envelope, or a bad `requestState`. `_isProtocolValidation` in `hubitat-mcp-server.groovy` is the single list of thrown leaf messages; envelope faults that never throw call `jsonRpcError` directly.
+
+- **Generic `Exception` from a tool → success envelope with `isError: true`.** Per the MCP spec, tool *execution* errors stay in the success channel so clients can present them as tool output:
+
+  ```groovy
+  response.error == null
+  response.result.isError == true
+  response.result.content[0].type == 'text'
+  response.result.content[0].text.startsWith('Tool error:')
+  ```
+
+`HandleToolsCallSpec` is the canonical reference for both shapes.
+
+## Adding a new server tool spec
+
+1. Create `src/test/groovy/server/Tool<Name>Spec.groovy` extending `support.ToolSpecBase`.
+2. In `given:`, seed any device/child-app fixtures and settings flags the tool reads. Example: `settingsMap.enableRead = true`, `childDevicesList << myMockDevice`.
+3. Stub `hubGet.register(path) { ... }` for every internal endpoint the tool calls.
+4. **Add direct-call tests** that call `script.tool<Name>(args)` in `when:` and assert on the return value AND any state mutations or mock interactions. Always include at least one error-path test alongside the golden path.
+5. **Add dispatch-counterpart tests** that drive `mcpDriver.callTool('<tool_name>', args)` for the happy path and for each error condition the tool can produce. Use `@Unroll where: useGateways << [true, false]` so the dispatch feature runs under both routing modes. Assert envelope shape (`response.jsonrpc`, `response.id == mcpDriver.lastSentId`) plus the layer-specific shape from the error-path table above.
+6. If the tool is reached through a gateway (`manage_rooms`, `manage_rule_machine`, etc.), the dispatch test catches gateway-routing regressions automatically by virtue of running with `useGateways=true` — no separate gateway-routing test needed.
+
+## Which interception point to use (dispatch cheat sheet)
+
+The HubitatCI / eighty20results stack has three distinct classes of method, and the right way to stub them differs by class. Using the wrong one silently no-ops and eats hours — this table is authoritative.
+
+| Method class | Examples | How to stub | Why this one works |
+|---|---|---|---|
+| **Purely dynamic** (not declared anywhere in the eighty20results class hierarchy — resolved entirely through Groovy's dynamic dispatch; verified absent via `javap -p .../BaseExecutor.class` and `.../HubitatAppScript.class`) | `hubInternalGet`, `getRooms`, `getHubSecurityCookie`, `getAllGlobalConnectorVariables`, `getGlobalConnectorVariable`, `setGlobalConnectorVariable`, `uploadHubFile` | `script.metaClass.methodName = { ... }` in `given:` | No concrete inherited method exists, so Groovy's callsite dispatch has nothing to resolve except the metaClass. Per-instance EMC entries win. The harness uses this pattern for `hubInternalGet` (wired once in `wireScriptOverrides()` in `setup()`). |
+| **Platform methods declared on `AppExecutor` / `BaseExecutor`** (and therefore also on every layer of eighty20results' delegate chain: `AppMappingsReader` → `AppDefinitionReader` → `AppPreferencesReader` → `AppSubscriptionReader` → `AppChildExecutor` → your `Mock(AppExecutor)`) | `httpPost`, `httpGet`, `httpPostJson`, `sendEvent`, `subscribe`, `schedule`, `runIn`, `sendSms`, `setLocationMode` | **Permanent `>>` stub in `setupSpec()`** that dispatches to a per-feature `@Shared Closure` handler (recipe below). | Two independent reasons other approaches fail:<br>• **metaClass routes are bypassed by the delegate chain** — each layer forwards via Groovy callsite to the next `delegate`; the final hop at `AppChildExecutor` uses `invokeinterface` directly on the mock proxy, skipping any per-instance or class-level metaClass overrides on the script (same intra-class-dispatch trap PR #100 hit with `addChildApp`).<br>• **`>>` stubs added in `given:` on a `@Shared` Mock are a Spock scoping issue, not a dispatch issue** — they don't propagate into the mock's interaction set across features.<br>• **`setupSpec` permanent stubs work** because they're registered in the mock's baseline interaction set before any feature runs. |
+| **Concrete methods with private-closure routing in `HubitatAppScript`** | `addChildApp`, `getChildApps`, `getChildAppById`, `getChildAppByLabel`, `deleteChildApp` | Reflect into `HubitatAppScript`'s private `childAppFactory` / `childAppAccessor` closure fields and replace them — already wired by `HarnessSpec.wireScriptOverrides()`. Specs just assign `mockChildAppForCreate` and/or populate `childAppsList`. | eighty20results' `AppChildExecutor` excludes these from the `@Delegate` chain, and `HubitatAppScript` defines its own concrete implementations that route through private closure fields. Both per-instance metaClass and `AppExecutor` mock stubs added in `given:` are bypassed — reflective replacement of the closures is the only reliable path. See PR #100 discussion. |
+
+### Recipe: stubbing `httpPost` (or any platform method on `BaseExecutor`)
+
+```groovy
+class ToolRoomsSpec extends ToolSpecBase {
+    // Per-feature handler. Tests assign a closure in `given:`.
+    @Shared Closure httpPostHandler = null
+
+    def setupSpec() {
+        // Permanent stub installed once, dispatches to the per-feature hook.
+        // Must live on the @Shared Mock(AppExecutor) in setupSpec — per-feature
+        // `>>` stubs added in given: on a @Shared mock do not fire reliably.
+        appExecutor.httpPost(_, _) >> { args ->
+            if (httpPostHandler) {
+                httpPostHandler.call(args[0], args[1])
+            }
+        }
+    }
+
+    def cleanup() {
+        httpPostHandler = null  // reset between features
+    }
+
+    def "create_room posts to /room/save and reports success"() {
+        given:
+        httpPostHandler = { Map params, Closure responseCb ->
+            // emulate the hub's response shape (status + data) by calling
+            // responseCb — the production code's `httpPost(params) { resp -> ... }`
+            // body reads resp.data / resp.status inside that callback
+            responseCb.call([status: 200, data: ''])
+        }
+        // ... rest of setup
+
+        when:
+        script.toolCreateRoom([name: 'Garage', confirm: true])
+
+        then:
+        // ... assertions
+    }
+}
+```
+
+### Anti-patterns (don't waste cycles re-trying these for `BaseExecutor` methods)
+
+All of the below **look** plausible for `httpPost` / `httpGet` / other methods on `BaseExecutor`, but all **silently no-op**. If your stub isn't firing, first verify the method's declaration class before trying more variants. From a shell in the repo root:
+
+```bash
+cd ~/.gradle/caches/modules-2/files-2.1/com.github.eighty20results/hubitat_ci/v0.28.6/*
+jar xf hubitat_ci-v0.28.6.jar
+javap -p me/biocomp/hubitat_ci/api/common_api/BaseExecutor.class | grep <methodName>
+javap -p me/biocomp/hubitat_ci/app/HubitatAppScript.class | grep <methodName>
+```
+
+If the method appears in either output, it's in class 2 of the cheat sheet above (platform method on `BaseExecutor` / concrete on `HubitatAppScript`) and needs the `setupSpec`-dispatcher pattern.
+
+- `script.metaClass.httpPost = { ... }` — bypassed by intra-class dispatch.
+- `HubitatAppScript.metaClass.httpPost = { ... }` — same.
+- `script.getClass().metaClass.httpPost = { ... }` — same.
+- `appExecutor.httpPost(_, _) >> { ... }` in `given:` — not routed into the @Shared Mock's interaction set.
+- `1 * appExecutor.httpPost(_, _) >> { ... }` in `then:` — Spock `then:` interactions are consumed AFTER the `when:` block runs; they can't stub responses during the code-under-test's execution.
+- Reflecting into `AppChildExecutor.delegate` and swapping it for a custom JDK `Proxy` — **works** but is a hack that bypasses hubitat_ci's intended mock surface. Use the `setupSpec` dispatcher pattern instead.
+
+Reference spec that uses the `setupSpec` dispatcher pattern correctly: `src/test/groovy/server/ToolRoomsSpec.groovy` (covers `httpPost` for `create_room` / `delete_room` / `rename_room`).
+
+## Recipe: testing PR #79's `manage_rule_machine` tools (RMUtils)
+
+The `RMUtilsMock` is wired into the harness explicitly so PR #79's `manage_rule_machine` gateway tools can be unit-tested without a real hub. Sandbox-loaded production code reaches the mock via the `PassThroughSandboxClassLoader` → main-source-set stub → metaClass-installed mock chain; test-side direct calls hit the same stub and mock. `RMUtilsSandboxInterceptionSpec` keeps the full chain honest across eighty20results bumps.
+
+Pattern:
+
+```groovy
+import support.RMUtilsMock
+import support.ToolSpecBase
+
+class ToolListRmRulesSpec extends ToolSpecBase {
+    RMUtilsMock rmUtils
+
+    def setup() {
+        rmUtils = new RMUtilsMock()
+        rmUtils.stubRuleList = [[id: 1L, label: 'Test Rule']]
+        rmUtils.install()
+    }
+
+    def cleanup() {
+        rmUtils?.uninstall()
+    }
+
+    def "list_rm_rules returns mocked rule list"() {
+        given:
+        settingsMap.enableRead = true  // Read master (default ON; explicit for clarity)
+
+        when:
+        def result = script.handleGateway('manage_rule_machine', 'list_rm_rules', [:])
+
+        then:
+        rmUtils.calls.any { it.method == 'getRuleList' }
+    }
+}
+```
+
+`RMUtilsMock.install()` uses Groovy metaclass static-method injection on `hubitat.helper.RMUtils` to intercept `{getRuleList, sendAction, pauseRule, resumeRule, setRuleBoolean}`. Always pair it with `uninstall()` in `cleanup()` — cleanup uses `GroovySystem.metaClassRegistry.removeMetaClass()` for reliable teardown between specs (simply setting `metaClass = null` is unreliable because of class-metaclass caching).
+
+## Integration dispatch drive-through (issue #77, tier-2)
+
+The test suite is layered:
+
+- **Tier 1 — unit / direct-call specs.** Call tool / rule-primitive methods directly (`script.toolFoo(args)`, `script.handleToolsCall(msg)`, `script.handleDeviceEvent(evt)`). Fast, focused, and pinpoints regressions at tool granularity. This is the right default for the "tool internals" half of the pyramid (see "Test pyramid" above).
+- **Tier 2 — integration dispatch specs (this section).** Drive the full in-process request-dispatch path (`request.JSON → handleMcpRequest → tools/call dispatch → gateway routing → tool method → error mapping → render`) via `mcpDriver.callTool('tool_name', args)`, or the full rule install loop (`initialize → subscribeToTriggers → subscribe → fireEvent → handler → action`). Still one JVM, Spock Mocks for the hub runtime, no real HTTP. Every tool feature should have at least one dispatch counterpart paired with its direct-call test.
+- **Tier 3 — true E2E with a fake hub.** Out-of-process HTTP, real JSON-RPC over real HTTP, real sandbox classloader. **Not implemented.** Tracked under issue #77 as a research item.
+
+Some seams only come alive at tier 2. Two are wired into the harness:
+
+### 1. `handleMcpRequest()` — dispatch pipeline
+
+`McpRequestDriver` lets a spec push a JSON-RPC body, invoke `handleMcpRequest()`, and read back the captured `render(...)` envelope. Covers the three hub-runtime seams that the JSON-RPC-layer specs skip:
+
+- `request.JSON` — the sandbox dynamic property the hub populates with the parsed POST body. `handleMcpRequest()` wraps the read in try/catch to surface malformed bodies as JSON-RPC -32700 parse errors. The driver can stage either a staged body (`pushBody(...)`) OR a throwing access (`pushBodyThrowing(t)`) so both the `null`-body branch and the try/catch branch are reachable.
+- `request.headers` — the inbound HTTP headers, which the 2026-07-28 transport validates against the body (`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`) and which the Origin check reads. `pushHeaders(map)` takes names in whatever casing a client would send and rewrites them into the hub's own wire shape before staging — names case-normalized to first-char-upper (`MCP-Protocol-Version` → `Mcp-protocol-version`), values List-wrapped — so the production case-insensitive lookup and List-unwrap are what a spec exercises rather than a convenient plain map the hub never sends. Because `pushHeaders` normalizes both the input and the expectation, a spec proving the lookup is genuinely case-insensitive must write `mcpDriver.headers` directly with a third casing. `nullHeaders = true` and `throwingHeaders = t` model firmware that exposes no header map; production must degrade to the headerless legacy path.
+- `render(Map)` — the hub-side response writer. Production assembles status / contentType / data; driving `handleToolsCall()` directly bypasses this. The driver's captured `lastRenderArgs.status` is how the transport-status contract is pinned (absent = the JSON-RPC-native 200; 400 / 403 / 404 / 202 / 405 are each asserted explicitly).
+
+Wiring (in `HarnessSpec`):
+
+- `render(Map)` is on `AppExecutor` (class-2 on the dispatch cheat sheet), stubbed via a `>>` dispatcher in `setupSpec()` that hands the Map to `McpRequestDriver.captureRender()`. A no-arg `render()` stub is also installed that throws — nothing in production calls it today, but if a future handler picked it up, silently dropping the call would let `parseResponseJson` read the previous test's state.
+- `request` is resolved by `HubitatAppScript`'s own `@CompileStatic getProperty(String)` override, which checks `injectedMappingHandlerData['request']` before falling through to MOP (only when the *map itself* is null — not when the map lacks the `request` key). That short-circuit means a metaClass hook on the script is *never consulted* for this property. The driver's stable `ScriptRequestProxy` is installed directly into that private field via reflection in `wireScriptOverrides()`, which runs per-test in `setup()` (after the metaClass wipe). The proxy dispatches `getJSON()` and `getHeaders()` dynamically at access time — tests can call `pushBody` / `pushBodyThrowing` / `pushHeaders` from their `given:` block and have the change take effect without re-running the wire step. (Same dispatch trap as `parent` — see `RuleHarnessSpec`'s Javadoc for the parallel case.)
+
+Spec pattern:
+
+```groovy
+class HandleMcpRequestDispatchSpec extends ToolSpecBase {
+    def "initialize returns protocolVersion and serverInfo via render(Map)"() {
+        given:
+        mcpDriver.pushBody([jsonrpc: '2.0', id: 1, method: 'initialize', params: [:]])
+
+        when:
+        script.handleMcpRequest()
+
+        then:
+        mcpDriver.lastRenderArgs.contentType == 'application/json'
+        def response = mcpDriver.parseResponseJson()
+        response.result.protocolVersion == '2025-11-25'
+        response.result.serverInfo.name == 'hubitat-mcp-rule-server'
+    }
+}
+```
+
+`pushBody(null)` simulates a missing body (→ -32700 empty-body branch). `pushBodyThrowing(throwable)` simulates a hub-side JSON parse failure (→ -32700 try/catch branch). `pushBody([...])` (a List) exercises the batch-request branch.
+
+Adding `pushHeaders(['MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': 'tools/list'])` flips the same request onto the **modern** era, so a spec can assert the 400 / 404 mappings and the `resultType` stamp. The era switch is the header's **value**: `pushHeaders(['MCP-Protocol-Version': '2025-11-25'])` is a *legacy* request that merely carries the header (which has been mandatory since 2025-06-18), and it must behave exactly like a headerless one — that pairing is the compatibility regression pin. Omitting `pushHeaders` entirely keeps the request headerless, which is what every pre-existing spec in the file relies on.
+
+The Origin check reads `location.hub.localIP`, so `HandleMcpRequestDispatchSpec` stubs `appExecutor.getLocation()` in `setupSpec()` and re-seeds `sharedLocation.hub = new TestHub(localIP: ...)` per test (`TestHub` carries `localIP` for exactly this).
+
+### 2. `subscribe(...)` + event replay — rule-engine install loop
+
+`SubscriptionRecorder` captures every `subscribe(source, attribute, handler)` call the rule engine makes during `subscribeToTriggers()` and exposes `fireEvent(script, source, attribute, value)` to dispatch a synthetic event back at the recorded handler. Covers gaps the direct-handler specs (`HandleDeviceEventSpec` etc.) can't reach:
+
+- Did `subscribeToTriggers()` register the right subscription for a given trigger config? (A regression that silently dropped a subscribe call would pass every handler-body spec.)
+- Does the handler route the event through to the rule's action on the right device?
+- Does `initialize()`'s `settings.ruleEnabled` kill-switch actually skip subscribe-time?
+
+The time / periodic trigger branches register via `schedule(cronExpr, handler)` and `runOnce(...)` rather than subscribe, so `RuleHarnessSpec` also records `scheduleCalls` (and `runOnceCalls`) for those assertions.
+
+Wiring (in `RuleHarnessSpec`):
+
+- `subscribe(_, _ as String, _ as String)` is stubbed via the `setupSpec` dispatcher pattern, forwarding into `SubscriptionRecorder.record()`. A wildcard `subscribe(*_)` stub is installed after it that throws on any other overload so unstubbed shapes fail loudly.
+- `RuleHarnessSpec` adds `Flags.DontValidateSubscriptions` to the `PassThroughAppValidator` — without it the `AppSubscriptionReader` delegate layer rejects anything that isn't a full `DeviceWrapper` before the Mock's stub can fire. Note: this flag also bypasses handler-name validation, so pure wire-up asserts that check `subscriptions[0].handler == 'handleDeviceEvent'` compare a literal string to a literal string — add a `fireEvent()` call if you want the handler-name typo path covered.
+
+Spec pattern:
+
+```groovy
+class SubscribeTriggerIntegrationSpec extends RuleHarnessSpec {
+    def "firing a matching event routes through the handler to the action device"() {
+        given:
+        def sourceDevice = new TestDevice(id: 1, label: 'Front Door')
+        def targetDevice = Spy(TestDevice) { getId() >> 99 }
+        parent = new TestParent(devices: [1L: sourceDevice, 99L: targetDevice])
+        settingsMap.ruleEnabled = true
+        // deviceId MUST be a String — triggerMatchesDevice() does a strict == against
+        // the stringified event.device.id (rule engine's triggerMatchesDevice function,
+        // around the checkAllDevicesMatch block). Int deviceIds in the trigger never match.
+        atomicStateMap.triggers = [[type: 'device_event', deviceId: '1', attribute: 'contact', value: 'open']]
+        atomicStateMap.actions  = [[type: 'device_command', deviceId: 99, command: 'on']]
+        script.subscribeToTriggers()
+
+        when:
+        subscriptions.fireEvent(script, sourceDevice, 'contact', 'open')
+
+        then:
+        1 * targetDevice.on()
+    }
+}
+```
+
+### When to reach for the integration dispatch layer
+
+- **Use it when**: a behaviour depends on wiring (subscribe → handler → action, or initialize → subscribe), or on the HTTP shell (body parsing, render envelope, batch/notification semantics).
+- **Don't use it when**: a tool-level spec would pinpoint the regression more tightly. Over-using this layer widens blast radius — a handler-body change breaks every integration spec that touches it, not just the one unit spec that owns that logic.
+
+## Native Rule Machine access
+
+Issue #69 originally asked whether HubitatCI could install and drive the real `RuleMachine.groovy` app as a mock app for deeper coverage. Two subsequent developments settle the question without needing a probe:
+
+1. **PR #79 delivers the practical read + trigger surface** via `hubitat.helper.RMUtils` (list, run, pause, resume, set-boolean on RM 4.x and 5.x rules). `RMUtilsMock` is sufficient to unit-test those tools.
+2. **Structured-data read access to native RM rules exists** via `/installedapp/configure/json/<id>[/<pageName>]` — the SDK-level config-page serializer Hubitat's Web UI consumes. Same stability tier as `/hub2/appsList`. Returns triggers/conditions/actions/settings/childApps as structured JSON for any built-in app using `dynamicPage()` (RM 5.0/5.1, Room Lighting, HPM, Mode Manager, Button Controllers, Basic Rules). Future MCP tools that surface full RM rule definitions would stub this endpoint via the existing `HubInternalGetMock` — no new harness work needed.
+
+Mock-installing the real `RuleMachine.groovy` under HubitatCI is moot: Hubitat's built-in apps ship as compiled bytecode in the hub firmware; source code is not published by Hubitat, so there's nothing for `HubitatAppSandbox` to load. The two paths above cover the actual capability need.
+
+## Adding a new rule-engine spec
+
+1. Create `src/test/groovy/rules/<Feature>Spec.groovy` extending `rules.RuleHarnessSpec`.
+2. In `given:`, assign `parent = new SomeParentStub(...)` if the code path uses `parent.findDevice(...)` etc. The setter propagates into the script.
+3. Seed `stateMap`, `atomicStateMap`, or `settingsMap` as needed.
+4. Call `script.<method>(args)` in `when:`.
+5. Assert on return value, state mutations, or Spy interactions on the stubbed parent/device.
+
+## Adding a new Hubitat helper stub
+
+Some production code references platform helper classes like `hubitat.helper.RMUtils`. The sandbox can't resolve these at runtime out of the box — eighty20results remaps the name, but the JVM's §5.3.5 name-equality check rejects the remapped class. To make a new helper resolvable:
+
+1. Stub the class at `src/main/groovy/hubitat/<pkg>/<Class>.groovy`. Method signatures should mirror the real Hubitat API surface your production code uses. Return stub/no-op values — real behaviour is wired per-test via a metaClass-based mock (see `RMUtilsMock` for the pattern).
+2. Add the FQN (e.g. `'hubitat.helper.FooUtils'`) to `support.PassThroughSandboxClassLoader.PASSTHROUGH_NAMES`.
+3. If you want per-test behaviour mocking, add a `FooUtilsMock` in `src/test/groovy/support/` mirroring `RMUtilsMock`'s shape. Use `GroovySystem.metaClassRegistry.removeMetaClass()` in `uninstall()` for reliable teardown.
+4. Add a `FooUtilsSandboxInterceptionSpec` modeled on `RMUtilsSandboxInterceptionSpec` if sandbox-side interception matters for your tools; it's the bump-canary when eighty20results upgrades.
+
+## Conformance harness — official MCP tooling as the referee
+
+This server's protocol layer is **hand-written**. It has to be: the hub's Groovy sandbox whitelists imports (`Importing [com.fasterxml.jackson.databind.ObjectMapper] is not allowed`) and has no jar-loading mechanism, so no MCP SDK can run *on* the hub. Every other spec in this repo therefore checks the protocol layer against *our reading* of the spec. The conformance harness closes that gap with two legs whose referee is somebody else's code:
+
+| Leg | Referee | Runs | Proves |
+|---|---|---|---|
+| `src/test/groovy/server/McpWireSchemaConformanceSpec.groovy` | The MCP authors' own JSON Schemas, vendored under `src/test/resources/mcp-schema/` | Every `./gradlew test` (both lanes) | Rendered wire payloads satisfy the published schema for their era |
+| `tests/sdk_conformance_test.py` | The official `mcp` Python package's client, over Streamable HTTP | The e2e job's **SDK conformance** step, against the live test hub | A real client pinned to 2026-07-28 can list and call through the SDK's own validators |
+
+The two are complements, not duplicates: the schema leg covers shapes the SDK's permissive Python models don't police, including the server's retained legacy fallback; the live SDK leg uses only 2026-07-28 and covers transport status codes, automatic state-only continuation, and the actual modern HTTP headers it puts on the wire.
+
+**Neither leg may skip.** A soft skip that reports green is this repo's documented antipattern, and it is worse here than anywhere: "no violations found" and "the referee never ran" look identical from the outside. So `sdk_conformance_test.py` **fails** — nonzero exit, remediation printed — when the `mcp` package is missing, when the installed version isn't the pin, or when hub config is absent. The schema leg raises with the resolved absolute path if a vendored schema file isn't where it expects.
+
+### Leg 1 — wire-schema validation (unit side)
+
+`McpWireSchemaConformanceSpec` drives `handleMcpRequest()` through the normal `mcpDriver` seam and validates what `render(...)` produced — the bytes a client receives — against the vendored schema:
+
+- **legacy (2025-06-18, draft-07):** `initialize` → `InitializeResult` + the `JSONRPCResponse` envelope; `tools/list` → `ListToolsResult` in **both** catalog shapes (gateway and flat); `tools/call` → `CallToolResult` on both the success and `isError` paths; `ping` → `EmptyResult`.
+- **2026-07-28 (2020-12):** modern `tools/list` (`ListToolsResult` *requires* `tools`, `resultType`, `ttlMs`, `cacheScope`) and `tools/call` (`CallToolResult` requires `content` + `resultType` — the `ttlMs`/`cacheScope` cache hints belong to *list* responses, not call results), `server/discover` → `DiscoverResult` (requires `supportedVersions`, `capabilities`, `resultType`, `ttlMs`, `cacheScope`), and the `-32022` / `-32020` / `-32601` rejections against `UnsupportedProtocolVersionError`, `HeaderMismatchError`, and `MethodNotFoundError` + `JSONRPCErrorResponse`.
+
+Two details worth knowing before you edit it:
+
+- **The eras use different schemas on purpose.** The modern `ListToolsResult` *requires* `resultType`, which a legacy result must never carry. Cross-validating an era against the other schema is a test bug, not a finding.
+- **The `ping` regression needs a strict view.** `McpSchemaValidator.legacyStrictErrors` forces `additionalProperties: false` onto one named definition, reproducing the MCP TypeScript SDK's `EmptyResultSchema` (`ResultSchema.strict()`) — whose unknown-key rejection is what makes a stray `resultType` on a legacy `ping` a client-side protocol error. Published draft-07 can't express that: its `Result` carries `additionalProperties: {}` and accepts anything. That feature is `@Unroll`ed over a headerless request *and* one carrying `MCP-Protocol-Version: 2025-11-25`, because the clients #365 actually broke are header-bearing — every client that negotiated ≥ 2025-06-18 sends the header on every POST.
+- **Three features are negative controls; keep all three.** A validator wired up wrongly reports "no violations" for everything, so each schema needs one doctored-real-payload control of its own: the legacy `InitializeResult` with a required field removed, the modern `-32022` rejection with `error.data.supported` removed (that one alone exercises the `$defs` key, the `#/$defs/` ref prefix, the 2020-12 dialect, and `allOf` + nested-`$ref` resolution), and the strict `EmptyResult` view catching a stamped `resultType`.
+- **Vacuity guards are load-bearing.** Both schemas permit `tools: []` and `content: []`, so a catalog-size / content-block assertion sits next to every `errors == []` — otherwise an empty payload validates and proves nothing.
+
+```bash
+./gradlew test --tests "server.McpWireSchemaConformanceSpec"
+```
+
+The validator is `com.networknt:json-schema-validator`, a `testImplementation` dep. It bundles every standard meta-schema inside its own jar, so **validation never touches the network** — which is the whole reason the schemas are vendored rather than fetched. **Majors** are pinned out in `.github/dependabot.yml`: 3.x targets Java 17 and this project's test toolchain is JDK 11, so a major bump won't compile — minor and patch bumps inside 2.x are welcome and will still be proposed. Note also that `com.networknt.schema.Error` collides with `java.lang.Error` under Groovy's default imports — never name that type in a spec; `McpSchemaValidator` returns plain `List<String>` messages for exactly that reason.
+
+**Refreshing the vendored schemas** — full procedure, provenance (source URLs, upstream commit SHAs, byte hashes), and the `curl` commands are in [`src/test/resources/mcp-schema/README.md`](../src/test/resources/mcp-schema/README.md). The short version: fetch the exact published artifact, re-record the provenance block, re-run the lint and the spec. Published schemas are immutable. `.gitattributes` marks that directory `-text` so the recorded hashes survive a checkout on any platform. **Never hand-edit the schemas** — if a refresh turns the spec red, fix the server.
+
+**The recorded hashes are enforced.** `python tests/sandbox_lint.py` (rule `MCP_SCHEMA_PROVENANCE`) re-hashes both files and fails on drift in either direction — an edited schema, a refreshed file whose provenance wasn't re-recorded, a recorded hash with no file, or a schema vendored with no provenance section. Without that, a loosened or half-refreshed schema would quietly weaken every verdict above while the README still claimed the upstream bytes.
+
+### Client retry policy (offline SDK and server coverage)
+
+The pinned [Python SDK 2.0.0 retry driver](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/src/mcp/client/_input_required.py)
+allows ten retries after an initial `input_required` response. Reservation and worker-observation
+responses count toward this client limit even though they do not commit a server work slice.
+`mrtr.rounds` measures owner slices; the server's eight-slice cap cannot guarantee completion
+within ten client retries. Neither number is an MCP protocol requirement.
+
+`tests/test_sdk_mrtr_policy.py` exercises the real SDK `Client` and Streamable HTTP transport
+against `httpx2.MockTransport`, without a network socket, hub configuration, or fixture. It proves
+default exhaustion, completion with a higher configured limit, and resumption using captured
+state after exhaustion. Python Tests installs the same SDK pin as the live conformance lane;
+missing dependencies fail collection instead of skipping this coverage.
+
+The mock peer proves SDK behavior, not server correctness. `MrtrContinuationSpec` independently
+holds a detached worker open through more than ten polling legs, advances the virtual clock past
+the active TTL while the client is idle, and verifies that the write reservation remains held.
+Completion and terminal replay must execute the leaf once, report one owner slice, and never
+schedule a second worker. The normal live SDK scenario below separately measures real hub timing.
+
+For integrations that expect longer operations, configure
+`Client(..., input_required_max_rounds=20)` (an example limit, not a completion guarantee).
+For explicit recovery, capture state before handing control to the automatic loop:
+
+```python
+from mcp_types import InputRequiredResult
+
+# client is an entered modern SDK Client; name and arguments are the original call.
+first = await client.session.call_tool(name, arguments, allow_input_required=True)
+if isinstance(first, InputRequiredResult):
+    # This example handles Hubitat's state-only continuations.
+    if first.input_requests or not first.request_state:
+        raise RuntimeError("Expected a state-only Hubitat continuation")
+    saved_state = first.request_state
+    # Retain saved_state together with name and arguments before the next request.
+    result = await client.call_tool(name, arguments, request_state=saved_state)
+else:
+    result = first
+```
+
+If the automatic call raises `InputRequiredRoundsExceededError`, it does **not** carry the last
+state. Hubitat uses the same state string throughout this logical call, so the captured state can
+seed a later `client.call_tool(name, arguments, request_state=saved_state)`. Alternatively, drive
+`client.session.call_tool(..., allow_input_required=True)` manually from the beginning, retain
+every returned state, and pace retries. Never print state or original arguments in diagnostic logs.
+
+Exhaustion is a client stop, not server cancellation. A running worker may still commit while the
+client is idle. A fresh state-free call after completion creates another operation; it is not a
+substitute for terminal replay. State remains subject to exact outer-tool/argument binding, expiry
+and storage pressure. For clients with a fixed limit, keep operations small and inspect the target
+after an uncertain outcome; arbitrary-duration completion is not supported.
+
+### MRTR lifecycle coverage
+
+| Boundary | Established contract |
+|---|---|
+| Warm cache | Normal coordination reads use the write-through cache; the scheduler also consults exact terminal evidence. |
+| Cache-only invalidation | Reloads durable state but retains other statics. The synthetic stale-record tests prove defensive claim/generation matching, not a live disable/enable recovery path. |
+| `updated()` | Keeps MRTR state and terminal replay; the boundary test stubs unrelated `initialize()` work. |
+| Loss of class statics | Tests model loss of cache, evidence, leases, work items and live markers while retaining durable records. A terminal can replay; a claimed generation without a worker is not stolen and eventually expires. This does not establish Hubitat's disable/enable semantics. |
+| Fresh installation on a retained class | With empty durable state, `installed()` invalidates the old cache. Old continuation IDs and late queued callbacks cannot resurrect the prior installation's requests. |
+
+Idle active records have a three-minute TTL. Executing MRTR claims retain protection beyond it;
+a hard-killed worker can leave a live marker stranded until class reload. Write terminal records
+have a ten-minute TTL but may be evicted earlier under record pressure. These are finite replay
+and safety contracts, not proof of restart recovery or eventual completion.
+
+### Cooperative worker checkpoints
+
+Detached workers use their own 120-second target, independent of the cloud/LAN request budget.
+They check it between completed native bulk items, patch operations and walk-driver steps, and
+between driver installs or updates. Each checkpoint stores the untouched suffix, advances the
+owner generation, and renews the three-minute idle window. The next request with the same
+original arguments and state schedules the next slice with a fresh clock. Running claims keep
+their write reservation; duplicate callbacks do not repeat completed items.
+
+This is a cooperative target, not a platform execution deadline or maximum duration. An
+individual wizard operation or driver compile/save/delete runs uninterrupted. Native app
+creation and action replacement have no restart-safe intermediate checkpoint. A patch batch
+containing `replaceRequiredExpression` also stays together: its duplicate-replacement fence and
+deferred rollback context must survive through finalization. A guessed age cutoff cannot safely
+distinguish a slow write from a killed worker, so this change does not add one.
+
+At the eight-owner-slice cap, `continuation_limit` is terminal. Its aggregate records completed
+work and its remaining-work fields identify the exact unprocessed suffix. Native results retain
+the finalization guidance: settings may have landed while `updateRule`/Done is still deferred.
+Inspect that outcome before submitting a **new** smaller call containing only the remainder;
+replaying the old state only replays the terminal error.
+
+`MrtrWorkerBudgetSpec` uses virtual time and real tool dispatch to force safe native checkpoints,
+verify ordered results, cap recovery and one finalization, and protect atomic replacement
+batches. The regular live MRTR scenario uses six actions in nested and single-action patches;
+the official SDK scenario retains its bulk edit. Both independently check exact persisted
+settings. These small live calls need not cross 120 seconds; deterministic unit coverage proves
+the clock boundary without adding hub stress or a test-only production setting.
+
+### Leg 2 — official Python SDK client (e2e side)
+
+`tests/sdk_conformance_test.py` connects one official SDK high-level `Client` through its `streamable_http_client` to a real hub `/mcp` endpoint, pinned directly to `mode="2026-07-28"`. It never uses `mode="auto"` (which could fall back) or `mode="legacy"`. Catalog, benign call, resources, and the MRTR proof all share that modern client. One `Client.call_tool()` drives the Rule Machine write through multiple state-only continuation responses to one terminal `CallToolResult` — no project-owned loop and no low-level session call.
+
+**⚠️ The modern MRTR scenario WRITES.** It reads the guide section of each tool it writes with through the same high-level modern client and carries that section's published acknowledgment key on fixture writes, so the standalone command works whether the optional BPS gate is ON or OFF without changing that setting. It creates one UUID-named `BAT_E2E_SDK_MRTR_*` rule, makes one six-action edit, and deletes only that exact app in a `finally`; if the create response is lost, cleanup performs a bounded settle/retry and adopts at most one exact random-name match. It refuses ambiguous matches, never performs a prefix sweep, and never lists or deletes backups. Eligible runs may not soft-skip this proof. A `skip_install` dispatch intentionally excludes the write scenario and therefore cannot count as SDK/MRTR conformance evidence (see the `pull_request_target` note below).
+
+The MRTR proof keeps the SDK's default `input_required_max_rounds=10`. Observer-only `httpx2` hooks mark the measured `Client.call_tool()` window and retain only method, modern MCP routing headers, status, monotonic timing, and a derived `has_request_state` boolean — never URL, token, state value, arguments, or body. The proof requires an initial leg without state followed only by state-bearing automatic continuation legs, at least three `tools/call` legs total (the first leg reserves, schedules and observes for the relay budget, so a write that runs longer than ten seconds needs at least two further legs), a successful terminal `result_type='complete'`, aggregate duration over 10 seconds, and every leg the SERVER ANSWERED below 9.5 seconds. A leg the cloud relay drops (502/503/504) is replayed by the SDK and is excluded from that ceiling -- its duration is the relay's timeout, not the server's -- but drops may not outnumber answered legs, so a server tripping the relay as a rule still fails. It reports the continuation count and unchanged SDK limit so consumers with a lower cap can evaluate compatibility. `hub_set_rule` and `hub_set_native_app` run their claimed generation in an internal Hubitat worker after the mapped request has returned; continuation legs therefore include at least one coordination handoff rather than only completed owner slices. The terminal payload must report at least one owner slice and fewer owner slices than observed continuation rounds, and the log reports the difference explicitly. After that timing window, a separate high-level read fetches `hub_get_app_config(includeSettings=true)` and requires exactly six `messageActs/getLogMsg` action rows whose numeric `logmsg.<N>` values are the six requested distinct messages, in order, with no extra action or message row.
+
+The regular E2E runner also has one protocol mode: `HubitatMcpClient` derives `MCP-Protocol-Version: 2026-07-28`, `Mcp-Method`, and any required `Mcp-Name` for every standard request. Connectivity and capabilities use `server/discover`; the live suite never calls `initialize`, sends a headerless request, or selects a legacy revision. Negative raw transport tests may deliberately send malformed or unsupported modern headers, but none exercise legacy behavior. Its project-owned transport may replay an exact state-bearing MRTR POST after a lost HTTP response: a resumed call is bound to one `requestState` generation, so the replay can only rejoin or observe that logical operation. It never transport-replays a first request, which now starts the write, nor an ordinary write. This recovery is additional E2E behavior, not a claim that the official SDK retries HTTP 504 responses.
+
+The ordinary `mrtr` E2E group independently repeats the six-action Rule Machine edit through `HubitatMcpClient`. Its existing automatic `requestState` path must reach terminal `complete` after multiple continuation rounds, return all six successful action results, take more than 10 seconds as one logical call, and keep each ANSWERED HTTP POST below 9.5 seconds (relay-dropped legs are absorbed on the same terms as the SDK proof, and bounded the same way). It applies the same positive-owner-count/fewer-than-continuations invariant as the official SDK proof. Outside that call's timing window, it independently makes the same authoritative raw-settings read through its normal gateway path and applies the exact six-row/value assertion. This regular lane does not depend on the official-SDK scenario passing (and the SDK scenario does not consume the regular client's telemetry).
+
+The observer checks every real SDK POST, not reconstructed requests: each must carry `MCP-Protocol-Version: 2026-07-28`, a matching `Mcp-Method`, and `Mcp-Name` on `tools/call` and `resources/read`; every response must be observed and served as 200/202. Legacy header compatibility remains in the offline schema/server specs, not in live E2E.
+
+The script also **preflights the SDK surface it calls** for `@deprecated` markers and fails if any are found. It does not call the v2 legacy-only `Client.send_ping()` API.
+
+It shares config with `tests/e2e_test.py` (`tests/e2e_config.json` or `HUBITAT_HUB_URL`/`HUBITAT_APP_ID`/`HUBITAT_ACCESS_TOKEN`) and derives the endpoint path from `HubitatMcpClient`, so the cloud-vs-LAN path shapes can't drift between the two. Sharing the config does not share the restriction: `tests/e2e_test.py` itself is CI-only (its `main()` and cleanup refuse any hub but the leased sacrificial test hub, because its cleanup sweep deletes rollback baselines and forces settings), while this script only reads `load_config()` and may be run locally against any hub.
+
+**This SDK harness requires the token in the URL query.** `HubitatMcpClient.endpoint` is the bare `<prefix>/mcp` — that client keeps `access_token` separate and attaches it per request as `params={"access_token": …}`. The SDK's transport is constructed from one URL and no separate auth configuration, so handing it `client.endpoint` sends an unauthenticated request and the hub answers a bare **401** that reads like a hub or permissions problem rather than a harness bug. Hubitat's OAuth layer also accepts `Authorization: Bearer` on both the LAN endpoint and cloud relay (the regular E2E suite proves that separately), but this SDK scenario intentionally uses the canonical query form. `_load_hub_config` appends it and asserts it is present.
+
+That token in the URL is also why the script's printed output is **structurally token-free rather than scrubbed**. httpx2 quotes the full URL in the message of every URL-bearing exception it raises, so a 401 would otherwise put a live credential in the CI log. Instead of masking those messages, nothing printed is derived from them:
+
+- the tokenized URL lives only in `config["endpoint"]` and is passed to `streamable_http_client` and nowhere else — never printed, never string-sliced;
+- every printed message uses `config["safe_endpoint"]`, i.e. `HubitatMcpClient.endpoint`, built from `hub_url` + `app_id` only, so it never held the token;
+- httpx2 failures are described by `_http_failure_detail` from structured fields — exception class, numeric status, its standard reason phrase, request method — and never from `str(exc)`;
+- the request trace records redacted routing/timing fields but deliberately no URL or body;
+- the SDK's own DEBUG line that logs the endpoint is silenced.
+
+Diagnosability is unaffected: a wrong token still prints `HTTPStatusError HTTP 401 Unauthorized on POST to <endpoint>` plus the remediation line.
+
+**Why structural and not a `_redact` helper:** an earlier version did scrub, and CodeQL's `py/clear-text-logging-sensitive-data` flagged three sinks — correctly. A mask built by slicing the token (`token[:4] + "…"`) still discloses part of it, and the "sanitizer" was itself what fed token-derived data into a `print`. The repo carries no CodeQL suppressions — there is no `lgtm`/`codeql` comment anywhere and no query is filtered in config, so a finding is fixed rather than silenced. The precedent for this query is `tests/e2e_test.py`'s OAuth leg, which keeps secret-bearing values out of prints entirely and validates them through asserts instead (`assert` is not a logging sink). Follow that pattern rather than adding a scrubber.
+
+```bash
+pip install -r tests/sdk-conformance-requirements.txt
+pip install requests    # tests/e2e_test.py's dep; the script imports it for the shared hub config
+python tests/sdk_conformance_test.py
+```
+
+The `requests` line is not optional in a clean venv and is deliberately *not* in the requirements file (which stays single-purpose): `sdk_conformance_test.py` imports `tests/e2e_test.py` to reuse its config resolution, and that module imports `requests` at module scope. `mcp` does not depend on it. `hub-e2e.yml` installs it on its own line for the same reason.
+
+**Bumping the SDK pin.** The version lives in `tests/sdk-conformance-requirements.txt` and nowhere else; `hub-e2e.yml` installs that file and the script refuses to run against any other version, so CI and a local run cannot silently diverge. The verdict-moving client packages are pinned too: `mcp-types`, `httpx2`, `anyio`, `pydantic`, `pydantic-core`, and `typing-extensions`. To bump: edit `mcp==`, resolve in a clean venv, update those direct pins deliberately, reinstall, run the helper tests and live script, and read the SDK release notes for protocol/API changes. The modern header contract fails if any SDK POST leaves the 2026-07-28 path; the MRTR scenario fails if automatic input-required handling, modeled terminal results, transport headers, or the default round limit change.
+
+### `pull_request_target`: what the SDK leg does and doesn't exercise in-PR
+
+The e2e job runs on `pull_request_target`, so the **workflow file** always comes from `main` while the **checkout** is the PR head (see AGENTS.md § *e2e CI: `pull_request_target` trigger*). Both halves of this leg — the `pip install -r tests/sdk-conformance-requirements.txt` line and the **SDK conformance** step — are in `main`, so **every PR's auto e2e run reaches the step**: main's step definition, running the PR's checked-out `tests/sdk_conformance_test.py`. Changing the SCRIPT is exercised in-PR; iterate normally.
+
+Changing the STEP is not. Adding, removing, renaming, or re-conditioning it (or the install line) is a workflow-FILE change, and the auto run executes main's file — so it must be validated the documented way:
+
+```bash
+gh workflow run hub-e2e.yml --ref <branch>    # workflow_dispatch runs the BRANCH's own workflow file
+```
+
+That dispatch run is the merge-readiness proof for the workflow-file half. This is the permanent rule for this step, not a one-off.
+
+**Why a separate script instead of an `e2e_test.py` group.** The SDK client is async (anyio) while the e2e runner is sync, so an in-suite group would need an async bridge. The decisive reason is different: the group must fail rather than skip when `mcp` is absent, so it would turn the whole e2e lane red for a reason unrelated to the rest of the suite — and a module-level `import mcp` there would kill the entire runner instead of one group. Its own step and its own file keep the existing suite's signal clean.
+
+The step's outcome **is** folded into the required `Full e2e (runs with label)` gate status, so it cannot fail silently — the gate is computed from named step outcomes, and a step left out of that condition would fail the job while the gate still posted success. The flip side of a named-outcome gate: the step is skipped under a `skip_install` dispatch (it writes, and would otherwise judge already-deployed code while its outcome fed the gate as the PR's verdict), and the gate counts a skip as a pass — the same handling `pkg_validate` gets.
+
+## CI
+
+- Workflow: `.github/workflows/unit-tests.yml`
+- Triggers on `pull_request` targeting `main` and `push` to `main`
+- JDK 17 (Temurin) via `actions/setup-java@v5`
+- Gradle wrapper cached by `gradle/actions/setup-gradle@v6`
+- Runs `./gradlew test --info --warning-mode all` under the matrix below
+- Uploads `build/reports/tests/test/` per matrix entry as `test-report-<mode>-<dispatch-mode>` on failure
+
+### Matrix (4 parallel lanes)
+
+The Unit Tests workflow expands a 2×2 strategy matrix — every PR runs the full Spock suite four times in parallel, with wall-clock unchanged versus a single run:
+
+| `mode` | `dispatch-mode` | Gradle flags | What it isolates |
+|---|---|---|---|
+| `normal` | `gateway` | (none) | Baseline. Default settings: lenient metaClass check, `useGateways=true`. |
+| `strict` | `gateway` | `-PharnessStrictMetaClass=true` | Flags any per-instance ExpandoMetaClass entries that survive the dual wipe in `HarnessSpec.setup()`. A `strict`-only failure attributes the regression to a metaClass-wipe escape rather than tool behaviour. See `HarnessSpec#checkMetaClassClean`. |
+| `normal` | `flat` | `-Pharness.useGateways=false` | `HarnessSpec.setup()` reads the system property and seeds `settingsMap.useGateways = false` before each test, so any spec that doesn't explicitly pin `useGateways` in `given:` runs under the flat dispatch path (tests that do pin it still win). A `flat`-only failure attributes the regression to the gateway-toggle code path rather than tool behaviour. |
+| `strict` | `flat` | both | Combined corner. Catches metaClass-wipe escapes that only surface under flat dispatch. |
+
+A status-check summary job named `test` aggregates the four matrix entries into a single check the branch ruleset can gate on (the matrix expansion produces `test (normal, gateway)` / `test (normal, flat)` / `test (strict, gateway)` / `test (strict, flat)` — none of which match the literal `test` check name on their own).
+
+Local equivalents of the non-baseline lanes:
+
+```bash
+./gradlew test -PharnessStrictMetaClass=true              # strict-only
+./gradlew test -Pharness.useGateways=false                # flat-only
+./gradlew test -PharnessStrictMetaClass=true -Pharness.useGateways=false  # both
+```

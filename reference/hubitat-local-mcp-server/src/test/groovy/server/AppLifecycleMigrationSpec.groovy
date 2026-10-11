@@ -1,0 +1,731 @@
+package server
+
+import spock.lang.Shared
+import support.TestChildApp
+import support.TestHub
+import support.TestLocation
+import support.ToolSpecBase
+
+/**
+ * Spec for the one-time migrations and sheds inside updated(), plus app-lifecycle teardown.
+ *
+ * Background: the legacy setting was `enableRuleEngine` (defaultValue: true).
+ * The setting was renamed to `enableCustomRuleEngine` (defaultValue: false).
+ * Hubitat firmware upgrades on 2.5.0.x re-evaluate renamed Boolean inputs
+ * against their defaultValue and can silently flip a user-set `false` back
+ * to `true`. The migration in updated() corrects that flip exactly once,
+ * then marks state.customEngineMigrated = true to prevent future firings.
+ *
+ * Mocking strategy:
+ *   - initialize()        -- purely dynamic script method; stubbed via
+ *                            script.metaClass in given: so platform helpers
+ *                            (createAccessToken, schedule, checkForUpdate)
+ *                            don't need to be individually mocked.
+ *   - app.updateSetting   -- routes through appExecutor.getApp(), which is
+ *                            stubbed in setupSpec() to return sharedAppStub
+ *                            (a TestChildApp). The Map overload
+ *                            updateSetting(String, Map) stores the Map in
+ *                            settingsStore so tests can assert on it.
+ *   - mcpLog              -- purely dynamic; captured via script.metaClass
+ *                            so tests can assert that a log line was (or was
+ *                            not) emitted.
+ *   - state.*             -- stateMap (the shared Map backed by AppExecutor).
+ *   - settings.*          -- settingsMap (the shared Map backed by sandbox).
+ *
+ * All five scenarios of the enableCustomRuleEngine rename migration are covered:
+ *   1. Golden path: migration fires and forces OFF.
+ *   2. Idempotent: already migrated -- migration block skipped.
+ *   3. Fresh install: no legacy setting -- migration block skipped.
+ *   4. New setting already false -- migration block skipped (no double-write).
+ *   5. Post-migration user toggle ON -- state.customEngineMigrated stays true,
+ *      new setting stays true (migration does not undo a deliberate user choice).
+ */
+class AppLifecycleMigrationSpec extends ToolSpecBase {
+
+    @Shared private TestChildApp sharedAppStub = new TestChildApp(id: 1L, label: 'MCP')
+
+    // location.hub.firmwareVersionString drives _hubSecurityObsolete(). Reset in setup() so a
+    // feature added later cannot inherit a retired-firmware hub from the one before it.
+    @Shared private TestLocation sharedLocation = new TestLocation()
+
+    // Ordered record of lifecycle wire-up calls. schedule()/unschedule() are
+    // class-2 (declared on the eighty20results delegate chain), so a per-instance
+    // metaClass stub on the script is bypassed -- they must be recorded via
+    // permanent >> dispatchers on the appExecutor mock installed in setupSpec.
+    // Tests reset this in given: with .clear().
+    @Shared protected final List<String> lifecycleCalls = []
+
+    def setupSpec() {
+        // Additive stub layered on top of HarnessSpec.setupSpec's appExecutor.
+        // Gives app.updateSetting(...) a non-null target (same pattern as
+        // ToolManageLogsSpec). Must be in setupSpec (not given:) because the
+        // @Shared Mock's interaction set is read-only after setup() completes.
+        appExecutor.getApp() >> sharedAppStub
+        appExecutor.getLocation() >> sharedLocation
+        // Record schedule/unschedule call order for the schedule-symmetry test.
+        appExecutor.schedule(*_) >> { args -> lifecycleCalls << 'schedule' }
+        appExecutor.unschedule() >> { lifecycleCalls << 'unschedule' }
+        // createAccessToken is class-2 (declared on AppExecutor) -- a per-instance
+        // script.metaClass stub would be bypassed -- so stub it here. Models the real
+        // OAuth API: it populates state.accessToken. Used by the token-regenerate test.
+        appExecutor.createAccessToken() >> { stateMap.accessToken = 'new'; 'new' }
+    }
+
+    def setup() {
+        // Clear the settingsStore between tests. stateMap / settingsMap are
+        // already cleared by HarnessSpec.setup(), so only the stub-app needs
+        // explicit cleanup.
+        sharedAppStub.settingsStore.clear()
+        sharedLocation.hub = null   // each Hub Security feature sets its own firmware
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: install a no-op initialize() stub + mcpLog capture so tests
+    // can call script.updated() without triggering platform-method calls
+    // (createAccessToken, schedule, checkForUpdate). Returns the capture list.
+    // -----------------------------------------------------------------------
+    private List<Map> stubUpdatedDeps() {
+        // initialize() is a script-defined method -- purely dynamic, per-instance
+        // metaClass wins (dispatch cheat sheet class 1).
+        script.metaClass.initialize = { -> }
+        def mcpLogCalls = []
+        script.metaClass.mcpLog = { String level, String component, String msg ->
+            mcpLogCalls << [level: level, component: component, msg: msg]
+        }
+        return mcpLogCalls
+    }
+
+    def "updated() sheds retired output-schema settings and state on repeated upgrades"() {
+        given:
+        stubUpdatedDeps()
+        sharedAppStub.settingsStore.publishOutputSchemas = [type: 'bool', value: true]
+        sharedAppStub.settingsStore.enableRead = [type: 'bool', value: false]
+        atomicStateMap.publishOutputSchemasForcedOff = true
+        atomicStateMap.unrelatedState = 'keep'
+
+        when:
+        script.updated()
+        script.updated()
+
+        then:
+        !sharedAppStub.settingsStore.containsKey('publishOutputSchemas')
+        !atomicStateMap.containsKey('publishOutputSchemasForcedOff')
+        sharedAppStub.settingsStore.enableRead == [type: 'bool', value: false]
+        atomicStateMap.unrelatedState == 'keep'
+    }
+
+    def "updated() discards kept report errors unless error retention is on (#setting)"() {
+        given:
+        stubUpdatedDeps()
+        if (setting != null) settingsMap.retainReportErrors = setting
+        atomicStateMap.reportErrors = [[message: 'kept']]
+
+        when:
+        script.updated()
+
+        then:
+        atomicStateMap.containsKey('reportErrors') == kept
+
+        where:
+        setting | kept
+        null    | false
+        false   | false
+        true    | true
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Golden path: migration fires and forces enableCustomRuleEngine OFF
+    // -----------------------------------------------------------------------
+
+    def "updated() forces enableCustomRuleEngine OFF when legacy enableRuleEngine is present and new setting was never set"() {
+        given: 'pre-rename install: legacy setting present, new setting absent (null -- never touched by user or firmware)'
+        def mcpLogCalls = stubUpdatedDeps()
+        settingsMap.enableRuleEngine = true          // legacy setting present
+        // enableCustomRuleEngine deliberately NOT set: migration condition is == null
+
+        when:
+        script.updated()
+
+        then: 'app.updateSetting was called to force the new setting to false'
+        sharedAppStub.settingsStore['enableCustomRuleEngine'] == [type: 'bool', value: false]
+
+        and: 'migration marker is set so subsequent calls skip'
+        stateMap.customEngineMigrated == true
+
+        and: 'an info log line was emitted for the migration'
+        mcpLogCalls.any { it.level == 'info' && it.component == 'engine-migration' && it.msg.contains('one-time rename migration') }
+    }
+
+    def "updated() does not overwrite enableCustomRuleEngine when it is already explicitly set to true"() {
+        given: 'pre-rename install: legacy setting present, new setting is already explicitly true (user set, not null)'
+        def mcpLogCalls = stubUpdatedDeps()
+        settingsMap.enableRuleEngine = true          // legacy setting present
+        settingsMap.enableCustomRuleEngine = true    // explicitly set -- not null -- migration must not fire
+
+        when:
+        script.updated()
+
+        then: 'app.updateSetting was NOT called -- explicitly-set true is preserved'
+        sharedAppStub.settingsStore['enableCustomRuleEngine'] == null
+
+        and: 'no migration log line emitted'
+        !mcpLogCalls.any { it.component == 'engine-migration' }
+
+        and: 'migration marker is set'
+        stateMap.customEngineMigrated == true
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Idempotent: already migrated -- block must NOT fire a second time
+    // -----------------------------------------------------------------------
+
+    def "updated() skips migration when state.customEngineMigrated is already true"() {
+        given: 'migration was already run in a prior updated() call'
+        def mcpLogCalls = stubUpdatedDeps()
+        stateMap.customEngineMigrated = true
+        settingsMap.enableRuleEngine = true          // legacy setting still present
+        settingsMap.enableCustomRuleEngine = true    // would be corrected if migration fired
+
+        when:
+        script.updated()
+
+        then: 'app.updateSetting was NOT called a second time'
+        sharedAppStub.settingsStore['enableCustomRuleEngine'] == null
+
+        and: 'no migration log line emitted'
+        !mcpLogCalls.any { it.component == 'engine-migration' }
+
+        and: 'migration marker remains true'
+        stateMap.customEngineMigrated == true
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Fresh install: no legacy setting present -- migration must NOT fire
+    // -----------------------------------------------------------------------
+
+    def "updated() skips migration when enableRuleEngine is absent (fresh install, no legacy)"() {
+        given: 'fresh post-rename install: no legacy enableRuleEngine setting exists'
+        def mcpLogCalls = stubUpdatedDeps()
+        // settings.enableRuleEngine is NOT set -- null in settingsMap
+        settingsMap.enableCustomRuleEngine = false   // new setting at its default
+
+        when:
+        script.updated()
+
+        then: 'app.updateSetting was NOT called'
+        sharedAppStub.settingsStore['enableCustomRuleEngine'] == null
+
+        and: 'no migration log line emitted'
+        !mcpLogCalls.any { it.component == 'engine-migration' }
+
+        and: 'migration marker is still set (updated() always sets it at the end)'
+        stateMap.customEngineMigrated == true
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. New setting already false -- no unnecessary double-write
+    // -----------------------------------------------------------------------
+
+    def "updated() skips migration when enableCustomRuleEngine is already false"() {
+        given: 'legacy setting present but new setting is already correct (false)'
+        def mcpLogCalls = stubUpdatedDeps()
+        settingsMap.enableRuleEngine = true          // legacy present
+        settingsMap.enableCustomRuleEngine = false   // already correct
+
+        when:
+        script.updated()
+
+        then: 'app.updateSetting was NOT called (no redundant write)'
+        sharedAppStub.settingsStore['enableCustomRuleEngine'] == null
+
+        and: 'no migration log line emitted'
+        !mcpLogCalls.any { it.component == 'engine-migration' }
+
+        and: 'migration marker is set'
+        stateMap.customEngineMigrated == true
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Post-migration user toggle ON -- migration must not undo user choice
+    //
+    // Scenario: user migrated (state.customEngineMigrated = true), then
+    // deliberately toggled enableCustomRuleEngine back to true via the settings
+    // page (which fires another updated() call). The migration guard must
+    // not overwrite their explicit choice.
+    // -----------------------------------------------------------------------
+
+    def "updated() does not undo a deliberate user toggle to ON after migration"() {
+        given: 'already migrated; user explicitly toggled the new setting ON'
+        def mcpLogCalls = stubUpdatedDeps()
+        stateMap.customEngineMigrated = true
+        settingsMap.enableRuleEngine = true          // legacy still present
+        settingsMap.enableCustomRuleEngine = true    // user deliberate choice
+
+        when:
+        script.updated()
+
+        then: 'app.updateSetting was NOT called -- user choice is respected'
+        sharedAppStub.settingsStore['enableCustomRuleEngine'] == null
+
+        and: 'no migration log line emitted'
+        !mcpLogCalls.any { it.component == 'engine-migration' }
+
+        and: 'migration marker stays true'
+        stateMap.customEngineMigrated == true
+    }
+
+    // -----------------------------------------------------------------------
+    // uninstalled(): tears down in-use registrations + subscriptions + schedule
+    // (issue #105 PR2b lifecycle-uninstalled-teardown). Do NOT stubUpdatedDeps()
+    // -- that no-ops initialize, irrelevant here; we drive uninstalled() direct.
+    // -----------------------------------------------------------------------
+
+    def "uninstalled() removes only this app's cleanup and migration hints"() {
+        given:
+        def schedules = scriptStaticField('MRTR_CLEANUP_SCHEDULES') as Map
+        def cleaned = scriptStaticField('RETIRED_TOOL_STATE_CLEANED') as Set
+        def retries = scriptStaticField('RETIRED_TOOL_STATE_RETRY_AT') as Map
+        script._mrtrEnsureCleanupScheduled()
+        schedules.putAll(['1': [checked: true], 'other': [checked: true]])
+        cleaned.addAll(['1', 'other'])
+        retries.putAll(['1': 123L, 'other': 456L])
+
+        when:
+        script.uninstalled()
+
+        then:
+        schedules.keySet() == ['other'] as Set
+        !(scriptStaticField('MRTR_CLEANUP_CHECK_AT') as Map).containsKey('1')
+        cleaned == ['other'] as Set
+        retries == [other: 456L]
+    }
+
+    def "uninstalled() removes each tracked in-use var, clears the set, and unsubscribes"() {
+        given: 'two tracked in-use registrations and a clean unsubscribe counter'
+        UNSUBSCRIBE_CALL_COUNT.set(0)
+        atomicStateMap.inUseHubVars = ['v1', 'v2']
+        def removed = []
+        // class-1 (absent from hubitat_ci jar -> purely dynamic): metaClass wins.
+        script.metaClass.removeInUseGlobalVar = { String n -> removed << n; true }
+
+        when:
+        script.uninstalled()
+
+        then: 'each tracked var was de-registered'
+        removed.toSet() == ['v1', 'v2'] as Set
+
+        and: 'the tracking set was cleared'
+        atomicStateMap.inUseHubVars == null
+
+        and: 'subscriptions were torn down'
+        UNSUBSCRIBE_CALL_COUNT.get() == 1
+    }
+
+    @spock.lang.Unroll
+    def "uninstalled() is a no-op for in-use vars when tracking is #desc, without NPE"() {
+        given: 'no tracked registrations (null key, or an explicit empty list)'
+        UNSUBSCRIBE_CALL_COUNT.set(0)
+        if (val == null) {
+            atomicStateMap.remove('inUseHubVars')
+        } else {
+            atomicStateMap.inUseHubVars = val
+        }
+        def removed = []
+        script.metaClass.removeInUseGlobalVar = { String n -> removed << n; true }
+
+        when:
+        script.uninstalled()
+
+        then: 'no de-registration calls and no exception'
+        removed == []
+        noExceptionThrown()
+
+        and: 'unsubscribe still fired (best-effort teardown)'
+        UNSUBSCRIBE_CALL_COUNT.get() == 1
+
+        where:
+        desc    | val
+        'null'  | null
+        'empty' | []
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize(): unschedule() must precede rearming so each lifecycle
+    // cycle rebuilds the cron set (lifecycle-schedule-symmetry). Direct call;
+    // checkForUpdate/_subscribe*/_refresh* are class-1 script methods.
+    // -----------------------------------------------------------------------
+
+    def "initialize() unschedules BEFORE rearming MRTR cleanup and the daily update check"() {
+        given:
+        lifecycleCalls.clear()
+        stateMap.accessToken = 'tok'                  // skip createAccessToken
+        stateMap.updateCheck = [checkedAt: 1L]        // suppress the immediate check (gate)
+        script.metaClass.checkForUpdate = { -> }
+        script.metaClass._subscribeToAllHubVariables = { -> }
+        script.metaClass._refreshHubVarInUseRegistrations = { -> }
+        script.metaClass._mrtrEnsureCleanupScheduled = { boolean reset -> lifecycleCalls << "mrtrCleanup:${reset}".toString() }
+
+        when:
+        script.initialize()
+
+        then: 'MRTR cleanup rearms after unschedule and before the daily job'
+        lifecycleCalls.indexOf('unschedule') >= 0
+        lifecycleCalls.indexOf('schedule') >= 0
+        lifecycleCalls.indexOf('mrtrCleanup:true') > lifecycleCalls.indexOf('unschedule')
+        lifecycleCalls.indexOf('mrtrCleanup:true') < lifecycleCalls.indexOf('schedule')
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize(): immediate checkForUpdate() only on first install
+    // (lifecycle-version-check-on-every-save). state.updateCheck is the key
+    // handleUpdateCheckResponse writes; null == never checked == first install.
+    // -----------------------------------------------------------------------
+
+    def "initialize() runs the immediate version check on first install (state.updateCheck null)"() {
+        given:
+        lifecycleCalls.clear()
+        stateMap.accessToken = 'tok'
+        stateMap.remove('updateCheck')                // first install: never checked
+        def checkCalls = 0
+        script.metaClass.checkForUpdate = { -> checkCalls++ }
+        script.metaClass._subscribeToAllHubVariables = { -> }
+        script.metaClass._refreshHubVarInUseRegistrations = { -> }
+
+        when:
+        script.initialize()
+
+        then: 'the immediate check fired for first-install freshness'
+        checkCalls == 1
+    }
+
+    def "initialize() skips the immediate version check on a routine save (state.updateCheck set)"() {
+        given:
+        lifecycleCalls.clear()
+        stateMap.accessToken = 'tok'
+        stateMap.updateCheck = [checkedAt: 1234567890000L]   // already checked before
+        def checkCalls = 0
+        script.metaClass.checkForUpdate = { -> checkCalls++ }
+        script.metaClass._subscribeToAllHubVariables = { -> }
+        script.metaClass._refreshHubVarInUseRegistrations = { -> }
+
+        when:
+        script.initialize()
+
+        then: 'no GitHub egress on a routine settings save'
+        checkCalls == 0
+    }
+
+    // -----------------------------------------------------------------------
+    // appButtonHandler(regenerateTokenBtn): user-initiated, on-demand token
+    // rotation (issue #105 PR2b lifecycle-token-rotation / Q9, UI-only). The
+    // token is otherwise stable -- only this button (and the first-install
+    // guard) ever calls createAccessToken (class-2, stubbed on appExecutor).
+    // -----------------------------------------------------------------------
+
+    def "appButtonHandler regenerates the access token when the regenerate button is pressed"() {
+        given: 'an existing token and a captured mcpLog'
+        stateMap.accessToken = 'old'
+        def logCalls = []
+        script.metaClass.mcpLog = { String level, String component, String msg ->
+            logCalls << [level: level, component: component, msg: msg]
+        }
+
+        when:
+        script.appButtonHandler('regenerateTokenBtn')
+
+        then: 'createAccessToken (appExecutor stub) re-issued a fresh token'
+        stateMap.accessToken == 'new'
+
+        and: 'a warn-level audit line was emitted for the rotation'
+        logCalls.any { it.level == 'warn' && it.component == 'server' && it.msg.toLowerCase().contains('token') }
+    }
+
+    def "appButtonHandler does nothing to the token for an unknown button name"() {
+        given:
+        stateMap.accessToken = 'old'
+        script.metaClass.mcpLog = { String level, String component, String msg -> }
+
+        when:
+        script.appButtonHandler('someUnknownBtn')
+
+        then: 'the token is untouched (no regenerate, no createAccessToken)'
+        stateMap.accessToken == 'old'
+        noExceptionThrown()
+    }
+    // (confirmRegenerateTokenPage is static UI: dynamicPage cannot be rendered outside a
+    // preferences() reader context in this harness, so its body is compile-validated by the
+    // sandbox load; the regenerate behaviour is covered by the appButtonHandler test above.)
+
+    // -----------------------------------------------------------------------
+    // handleUpdateCheckResponse failure paths stamp a checkedAt so the
+    // first-install gate flips + the 24h guard engages on offline hubs, but
+    // MUST NOT clobber a previously-known update result (lifecycle-version-
+    // check-on-every-save fix + its review follow-up).
+    // -----------------------------------------------------------------------
+
+    def "handleUpdateCheckResponse on a non-200 stamps checkedAt + lastError without flagging an update"() {
+        given:
+        stateMap.remove('updateCheck')
+
+        when:
+        script.handleUpdateCheckResponse([status: 500, data: ''], null)
+
+        then: 'the gate is flipped (record exists) and the 24h guard is armed, no banner'
+        stateMap.updateCheck != null
+        stateMap.updateCheck.checkedAt == 1234567890000L
+        stateMap.updateCheck.lastError == 'http 500'
+        !stateMap.updateCheck.updateAvailable
+    }
+
+    def "handleUpdateCheckResponse on a 200 with no version field stamps a failure record"() {
+        given:
+        stateMap.remove('updateCheck')
+
+        when:
+        script.handleUpdateCheckResponse([status: 200, data: '{}'], null)
+
+        then:
+        stateMap.updateCheck.checkedAt == 1234567890000L
+        stateMap.updateCheck.lastError == 'no version field'
+        !stateMap.updateCheck.updateAvailable
+    }
+
+    def "handleUpdateCheckResponse on unparseable body stamps a failure record (caught)"() {
+        given:
+        stateMap.remove('updateCheck')
+
+        when:
+        script.handleUpdateCheckResponse([status: 200, data: 'not json at all'], null)
+
+        then:
+        noExceptionThrown()
+        stateMap.updateCheck.checkedAt == 1234567890000L
+        stateMap.updateCheck.lastError != null
+        !stateMap.updateCheck.updateAvailable
+    }
+
+    def "a transient version-check failure does NOT clobber a previously-surfaced 'update available' result"() {
+        given: 'a prior successful check that found an update'
+        stateMap.updateCheck = [latestVersion: '9.9.9', updateAvailable: true, checkedAt: 1L]
+
+        when: 'a later check fails (GitHub briefly unreachable)'
+        script.handleUpdateCheckResponse([status: 503, data: ''], null)
+
+        then: 'the known update is preserved (banner stays); only checkedAt + lastError refresh'
+        stateMap.updateCheck.updateAvailable == true
+        stateMap.updateCheck.latestVersion == '9.9.9'
+        stateMap.updateCheck.checkedAt == 1234567890000L
+        stateMap.updateCheck.lastError == 'http 503'
+    }
+
+    // -----------------------------------------------------------------------
+    // Hub Security retirement (firmware >= hubSecurityRetiredFw(), 2.5.0)
+    //
+    // The credentials never authenticated anything: Hubitat exempts an app's own
+    // loopback requests to 127.0.0.1:8080 from the admin-UI login, verified live on
+    // 2.5.1.181 with Hub Login Security enforcing. updated() sheds them on a hub past
+    // the cutoff; an older or UNREADABLE firmware keeps them (the escape hatch).
+    // -----------------------------------------------------------------------
+
+    def "updated() wipes stored Hub Security credentials and forces the toggle off on #fw"() {
+        given:
+        def mcpLogCalls = stubUpdatedDeps()
+        sharedLocation.hub = new TestHub(firmwareVersionString: fw)
+        settingsMap.hubSecurityEnabled = true
+        settingsMap.hubSecurityUser = 'hubadmin'
+        settingsMap.hubSecurityPassword = 'hunter2'
+        sharedAppStub.settingsStore.hubSecurityUser = 'hubadmin'
+        sharedAppStub.settingsStore.hubSecurityPassword = 'hunter2'
+        atomicStateMap.hubSecurityCookie = 'JSESSIONID=stale'
+        atomicStateMap.hubSecurityCookieExpiry = 1234567890000L + 60_000
+        atomicStateMap.unrelatedState = 'keep'
+
+        when: 'twice -- the shed must be idempotent, like the output-schema one above'
+        script.updated()
+        script.updated()
+
+        then: 'the toggle is forced off and both credential settings are gone'
+        sharedAppStub.settingsStore['hubSecurityEnabled'] == [type: 'bool', value: false]
+        !sharedAppStub.settingsStore.containsKey('hubSecurityUser')
+        !sharedAppStub.settingsStore.containsKey('hubSecurityPassword')
+
+        and: 'the cached session cookie is cleared, unrelated atomicState untouched'
+        !atomicStateMap.containsKey('hubSecurityCookie')
+        !atomicStateMap.containsKey('hubSecurityCookieExpiry')
+        atomicStateMap.unrelatedState == 'keep'
+
+        and: 'the one-shot marker is stamped and the retirement is logged once for the user who had configured it'
+        stateMap.hubSecurityRetired == true
+        mcpLogCalls.count { it.level == 'warn' && it.component == 'hub-admin' && it.msg.contains('retired') } == 1
+
+        where:
+        // '2.10' and '2.10.0.1' pin the NUMERIC compare: lexically they sort below '2.5.0',
+        // numerically 10 > 5, so both are past the cutoff.
+        fw << ['2.5.0', '2.5.0.123', '2.5.1.181', '2.10', '2.10.0.1']
+    }
+
+    def "updated() leaves Hub Security settings alone on #fw (below the cutoff, or unreadable)"() {
+        given:
+        def mcpLogCalls = stubUpdatedDeps()
+        sharedLocation.hub = new TestHub(firmwareVersionString: fw)
+        settingsMap.hubSecurityEnabled = true
+        sharedAppStub.settingsStore.hubSecurityUser = 'hubadmin'
+        sharedAppStub.settingsStore.hubSecurityPassword = 'hunter2'
+        atomicStateMap.hubSecurityCookie = 'JSESSIONID=live'
+
+        when:
+        script.updated()
+
+        then: 'nothing is shed -- an old hub may genuinely need these'
+        sharedAppStub.settingsStore.hubSecurityUser == 'hubadmin'
+        sharedAppStub.settingsStore.hubSecurityPassword == 'hunter2'
+        !sharedAppStub.settingsStore.containsKey('hubSecurityEnabled')
+        atomicStateMap.hubSecurityCookie == 'JSESSIONID=live'
+
+        and: 'no retirement log line, and the one-shot marker is NOT stamped'
+        !mcpLogCalls.any { it.component == 'hub-admin' && it.msg.contains('retired') }
+        stateMap.hubSecurityRetired != true
+
+        where:
+        // null/blank firmware is the ESCAPE HATCH: _hubSecurityObsolete() must not inherit
+        // _firmwareAtLeast's assume-modern default, which would wipe an unidentifiable hub.
+        fw << ['2.4.9.999', '2.3.8.108', '2.4.99.99', null, '', '   ']
+    }
+
+    def "getHubSecurityCookie() returns null on retired firmware even before updated() has run"() {
+        given: 'an upgraded hub whose app has not re-saved, so the settings are still populated'
+        sharedLocation.hub = new TestHub(firmwareVersionString: '2.5.1.181')
+        settingsMap.hubSecurityEnabled = true
+        settingsMap.hubSecurityUser = 'hubadmin'
+        settingsMap.hubSecurityPassword = 'hunter2'
+        atomicStateMap.hubSecurityCookie = 'JSESSIONID=stale'
+        atomicStateMap.hubSecurityCookieExpiry = 1234567890000L + 60_000
+
+        expect: 'the runtime guard short-circuits before any setting or cached cookie is read'
+        script.getHubSecurityCookie() == null
+    }
+
+    def "getHubSecurityCookie() still authenticates below the cutoff"() {
+        given:
+        sharedLocation.hub = new TestHub(firmwareVersionString: '2.4.9.999')
+        settingsMap.hubSecurityEnabled = true
+        settingsMap.hubSecurityUser = 'hubadmin'
+        settingsMap.hubSecurityPassword = 'hunter2'
+        atomicStateMap.hubSecurityCookie = 'JSESSIONID=cached'
+        atomicStateMap.hubSecurityCookieExpiry = 1234567890000L + 60_000
+
+        expect: 'the live cached cookie is returned, not null'
+        script.getHubSecurityCookie() == 'JSESSIONID=cached'
+    }
+
+    def "the shed runs without updated() -- a package upgrade alone must not leave credentials on disk"() {
+        given: 'an upgraded hub whose owner never opens the app page, so updated() never fires'
+        sharedLocation.hub = new TestHub(firmwareVersionString: '2.5.1.181')
+        settingsMap.hubSecurityEnabled = true
+        sharedAppStub.settingsStore.hubSecurityUser = 'hubadmin'
+        sharedAppStub.settingsStore.hubSecurityPassword = 'hunter2'
+        atomicStateMap.hubSecurityCookie = 'JSESSIONID=stale'
+
+        when: 'the per-request hook fires'
+        script._retireHubSecuritySettingsOnce()
+
+        then:
+        sharedAppStub.settingsStore['hubSecurityEnabled'] == [type: 'bool', value: false]
+        !sharedAppStub.settingsStore.containsKey('hubSecurityUser')
+        !sharedAppStub.settingsStore.containsKey('hubSecurityPassword')
+        !atomicStateMap.containsKey('hubSecurityCookie')
+        stateMap.hubSecurityRetired == true
+    }
+
+    def "the one-shot marker short-circuits the shed so the per-request hook stays cheap"() {
+        given: 'already retired, and a credential re-appears (it cannot via the UI, but prove the guard)'
+        sharedLocation.hub = new TestHub(firmwareVersionString: '2.5.1.181')
+        stateMap.hubSecurityRetired = true
+        sharedAppStub.settingsStore.clear()
+        sharedAppStub.settingsStore.hubSecurityUser = 'leftover'
+
+        when:
+        script._retireHubSecuritySettings()
+
+        then: 'no further writes -- the marker returned before any settings access'
+        sharedAppStub.settingsStore.hubSecurityUser == 'leftover'
+        !sharedAppStub.settingsStore.containsKey('hubSecurityEnabled')
+    }
+
+    def "header readability touches state only on a transition and still logs the recovery"() {
+        given:
+        def mcpLogCalls = stubUpdatedDeps()
+
+        when: 'a repeat of the recorded value'
+        script._noteHeadersReadable(true)
+        stateMap.remove('headersReadable')
+        script._noteHeadersReadable(true)
+
+        then: 'state is not read or rewritten'
+        !stateMap.containsKey('headersReadable')
+
+        when: 'readability is lost, then recovers'
+        script._noteHeadersReadable(false)
+        script._noteHeadersReadable(true)
+
+        then:
+        stateMap.headersReadable == true
+        mcpLogCalls.count { it.level == 'error' && it.msg.contains('NOT readable') } == 1
+        mcpLogCalls.count { it.level == 'info' && it.msg.contains('readable again') } == 1
+    }
+
+    def "the latest-version cache fills on first read and only a successful check replaces it"() {
+        given:
+        stubUpdatedDeps()
+
+        expect: 'no check yet'
+        script._latestKnownVersion() == null
+
+        when:
+        script.handleUpdateCheckResponse([status: 200, data: '{"version":"999.0.0"}'], null)
+
+        then:
+        script._latestKnownVersion() == '999.0.0'
+
+        when: 'a later check fails'
+        script.handleUpdateCheckResponse([status: 500, data: ''], null)
+
+        then: 'the known version stands'
+        script._latestKnownVersion() == '999.0.0'
+        stateMap.updateCheck.lastError == 'http 500'
+    }
+
+    def "the request hook settles once per class load, but an unreadable firmware keeps retrying"() {
+        given: 'a readable firmware below the cutoff'
+        sharedLocation.hub = new TestHub(firmwareVersionString: '2.4.9.999')
+        sharedAppStub.settingsStore.hubSecurityUser = 'hubadmin'
+
+        when: 'the first request settles; a later request sees a firmware past the cutoff'
+        script._retireHubSecuritySettingsOnce()
+        sharedLocation.hub = new TestHub(firmwareVersionString: '2.5.1.181')
+        script._retireHubSecuritySettingsOnce()
+
+        then: 'warm requests do no further work until the class reloads'
+        sharedAppStub.settingsStore.hubSecurityUser == 'hubadmin'
+        stateMap.hubSecurityRetired != true
+
+        when: 'a class reload (firmware update or redeploy) clears the memo'
+        (scriptStaticField('HUB_SECURITY_CHECKED') as Set).clear()
+        sharedLocation.hub = new TestHub(firmwareVersionString: '')
+        script._retireHubSecuritySettingsOnce()
+        sharedLocation.hub = new TestHub(firmwareVersionString: '2.5.1.181')
+        script._retireHubSecuritySettingsOnce()
+
+        then: 'an unreadable firmware did not settle; its retry waits out the backoff'
+        sharedAppStub.settingsStore.hubSecurityUser == 'hubadmin'
+        (scriptStaticField('HUB_SECURITY_RETRY_AT') as Map).containsKey(sharedAppStub.id.toString())
+
+        when: 'the backoff has elapsed'
+        (scriptStaticField('HUB_SECURITY_RETRY_AT') as Map).clear()
+        script._retireHubSecuritySettingsOnce()
+
+        then: 'the next request sheds'
+        !sharedAppStub.settingsStore.containsKey('hubSecurityUser')
+        stateMap.hubSecurityRetired == true
+    }
+}

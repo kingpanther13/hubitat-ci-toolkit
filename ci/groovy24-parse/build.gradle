@@ -1,0 +1,32 @@
+// Standalone parse lane. Adapted from reference at 0e6094bf (MIT).
+plugins { id 'java' }
+repositories { mavenCentral() }
+java { toolchain { languageVersion = JavaLanguageVersion.of(11) } }
+configurations { groovy24 }
+dependencies { groovy24 'org.codehaus.groovy:groovy-all:2.4.21' }
+
+def repoRoot = projectDir.parentFile.parentFile
+// Replace or extend these roots for your repository. Libraries are parsed individually as well
+// as inlined into apps/drivers. The exact copied v3.1 watchdog is always included.
+def productionFiles = ['apps', 'drivers', 'libraries'].collectMany { directory ->
+    fileTree(new File(repoRoot, directory)) { include '**/*.groovy' }.files.toList()
+} + [new File(repoRoot, 'watchdog/e2e-deadman-watchdog-v3-1.groovy')]
+productionFiles.sort { it.path }
+
+tasks.register('parse24Fixtures', JavaExec) {
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(11) }
+    classpath = configurations.groovy24
+    mainClass = 'groovy.ui.GroovyMain'
+    args = [new File(projectDir, 'parse_check.groovy').absolutePath, '--self-test', repoRoot.absolutePath]
+}
+
+tasks.register('parse24', JavaExec) {
+    dependsOn 'parse24Fixtures'
+    group = 'verification'
+    description = 'Check production Groovy syntax, known sandbox hazards, and class-size budgets.'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(11) }
+    classpath = configurations.groovy24
+    mainClass = 'groovy.ui.GroovyMain'
+    args = [new File(projectDir, 'parse_check.groovy').absolutePath, '--libraries-dir',
+            new File(repoRoot, 'libraries').absolutePath] + productionFiles*.absolutePath
+}

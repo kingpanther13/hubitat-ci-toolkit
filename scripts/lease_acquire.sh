@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# Acquire test hub lease for a CI run.
+#
+# Usage:  lease_acquire.sh <by-identifier>
+# Env:    WATCHDOG_URL — the watchdog v3 cloud OAuth URL with access_token. The lease is read and
+#                        written through the WATCHDOG, never the MCP server under test: a PR that
+#                        breaks that server must not stop the watchdog from installing over it.
+#         LEASE_WAIT_TIMEOUT_S        — max seconds to WAIT for a successfully-read but HELD
+#                                       lease to free before aborting (default 14400 = 4h).
+#                                       Native concurrency (the hub-e2e-serialized group) already
+#                                       serializes CI runs, so at most one ever reaches the lease;
+#                                       this budget exists to wait out a HUMAN holding the hub by
+#                                       hand, which concurrency can't see. Set 0 to fail fast.
+#         LEASE_UNREACHABLE_TIMEOUT_S — max seconds to tolerate the endpoint being UNREADABLE
+#                                       (5xx on every read = hub/app down, not lease held)
+#                                       before fast-failing (default 120). Much shorter than the
+#                                       held-lease budget: a down hub won't free a lease, so
+#                                       waiting it out just burns ~10min per run.
+#         LEASE_POLL_INTERVAL_S       — seconds between polls while waiting (default 30).
+#
+# Exits 0 on successful claim. While the lease is read as held and not expired, this WAITS
+# (polling) and claims it the moment it frees, the holder's TTL lapses, OR the holding CI run is
+# found to have finished — a stranded lease from a hard-killed cancellation (GitHub can force-kill
+# a cancelled job's `if: always()` release step) is reclaimed at once instead of waiting out its
+# 30-min TTL. A run blocked by a manual hub session that GitHub's `concurrency` group can't see (a
+# human holding the lease by hand) still starts on its own instead of needing a re-run. Cross-PR CI queueing
+# is GitHub native concurrency's job now (the hub-e2e-serialized group), not the lease's. A brief
+# read failure or a malformed/corrupt lease value mid-wait is polled through, never treated as
+# free. Exits 1 if the lease is STILL held after LEASE_WAIT_TIMEOUT_S, if the endpoint stays
+# UNREADABLE past LEASE_UNREACHABLE_TIMEOUT_S (the fast-fail for a down hub/app), or if the
+# post-write race-check shows another claim last.
+#
+# Lease shape (JSON, written into Hubitat Hub Variable `_TEST_HUB_LEASED_BY`, a String variable that
+# must already exist -- the watchdog cannot create one, and the hub drops a String variable created
+# empty, so create it with "{}"):
+#   {"by":"<who>","since":<epoch_ms>,"until":<epoch_ms>}
+# Empty string or {} = released. See protocol in CLAUDE.md / issue #77 for context.
+
+set -euo pipefail
+
+BY="${1:?Usage: $0 <by-identifier>}"
+: "${WATCHDOG_URL:?WATCHDOG_URL env var required (watchdog v3 cloud OAuth URL with access_token)}"
+
+LEASE_DURATION_MIN=30
+LEASE_WAIT_TIMEOUT_S="${LEASE_WAIT_TIMEOUT_S:-14400}"
+LEASE_UNREACHABLE_TIMEOUT_S="${LEASE_UNREACHABLE_TIMEOUT_S:-120}"
+LEASE_POLL_INTERVAL_S="${LEASE_POLL_INTERVAL_S:-30}"
+VERIFY_SLEEP_S=2
+
+# Portable epoch helpers (date +%s%N is GNU-only — fails on BSD/macOS). Seconds are
+# derived from ms by the callers (NOW_MS / 1000) to avoid a second subprocess per poll.
+now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+# epoch-ms -> ISO8601 UTC, for human-readable log lines. timezone.utc (not datetime.UTC)
+# so this stays valid on Python 3.2+, not just 3.11+.
+fmt_ts() { python3 -c "import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1])//1000, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"; }
+
+# Retry on transient cloud-gateway failures (the ~10s relay ceiling returns a 504,
+# which --fail turns into curl exit 22). Without this a single 504 on lease acquire
+# fails the WHOLE e2e before any test runs -- exactly the transient-flake class we
+# don't want. A persistent failure (5 misses) still aborts honestly.
+mcp_call() {
+  local attempt=1 resp
+  while [ "$attempt" -le 5 ]; do
+    if resp=$(curl -sS --fail --max-time 30 -X POST "$WATCHDOG_URL" \
+        -H "Content-Type: application/json" -d "$1" 2>/dev/null); then
+      printf '%s' "$resp"
+      return 0
+    fi
+    echo "::warning::lease mcp_call attempt ${attempt}/5 failed (transient cloud-gateway error, e.g. 504). Retrying in 5s..." >&2
+    attempt=$((attempt + 1))
+    [ "$attempt" -le 5 ] && sleep 5
+  done
+  echo "::error::lease mcp_call: all 5 attempts failed (cloud gateway unreachable or persistent 5xx)." >&2
+  return 1
+}
+
+get_lease_value() {
+  # Prints the lease value (may be "" when released) + exit 0 for a well-formed tools/call
+  # result. A missing variable exits 2: the watchdog cannot create it, so no claim could land.
+  # Any OTHER non-result response exits 1 so the caller polls (read-fail path) and never falsely
+  # claims: a JSON-RPC error, a transport failure, a non-JSON body. `jq -e` distinguishes a real
+  # result from an error envelope; without it a missing .result.content collapsed to "" and
+  # read as "released", double-booking the single hub.
+  local resp
+  resp="$(mcp_call '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hub_manage_variables","arguments":{"action":"get","name":"_TEST_HUB_LEASED_BY"}}}')" || return 1
+  if printf '%s' "$resp" | jq -e '(.error.message // "") | test("not found"; "i")' >/dev/null 2>&1; then
+    echo "::error::Hub variable _TEST_HUB_LEASED_BY does not exist on the test hub. Create it (type String, value {}) in Settings > Hub Variables; the watchdog cannot create one." >&2
+    return 2
+  fi
+  local text
+  text="$(printf '%s' "$resp" | jq -e -r '.result.content[0].text')" || return 1
+  local value
+  value="$(printf '%s' "$text" | jq -e -r '.value // ""')" || return 1
+  [ "$(printf '%s' "$value" | jq -c . 2>/dev/null)" = "{}" ] && value=""
+  printf '%s' "$value"
+}
+
+set_lease_value() {
+  # Arg is the lease string; "" releases. Fails unless the watchdog confirms the write.
+  local resp
+  resp="$(mcp_call "$(jq -nc --arg v "$1" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"hub_manage_variables",arguments:{action:"set",name:"_TEST_HUB_LEASED_BY",value:$v,confirm:true}}}')")" || return 1
+  printf '%s' "$resp" | jq -e '.result.content[0].text | fromjson | .success == true' >/dev/null 2>&1
+}
+
+# True (exit 0) ONLY when the lease holder is a GitHub Actions run that has already FINISHED, so
+# its lease is stranded and reclaimable NOW rather than after the full 30-min TTL. This is the
+# safety net for a cancelled run: GitHub sends SIGINT->SIGTERM->kill within ~10s and hard-caps
+# cleanup at 5 min, so a cancelled job's `if: always()` lease-release can be force-killed before
+# it runs, leaving the lease held until its TTL. Fail-CLOSED: a holder that isn't a `ci-run-<N>`
+# id (a human hold), an unparseable id, no gh CLI / token, an API error, or a run still
+# in_progress/queued all return 1 (NOT dead) so the caller keeps WAITING -- never steal a live
+# run's hub, which would double-book it. Only a confirmed status=="completed" reclaims.
+holder_run_dead() {
+  local holder="$1" run_id status
+  case "$holder" in
+    ci-run-*) run_id="${holder#ci-run-}" ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$run_id" | grep -qE '^[0-9]+$' || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ] || return 1
+  status="$(gh run view "$run_id" ${GITHUB_REPOSITORY:+--repo "$GITHUB_REPOSITORY"} --json status --jq '.status' 2>/dev/null)" || return 1
+  [ "$status" = "completed" ]
+}
+
+# Wait (polling) until the lease is free, expired, or already ours — or until the
+# wait budget runs out. The job's own timeout-minutes bounds the total, and because
+# we claim only AFTER this wait, the lease TTL below starts at acquisition.
+WAIT_DEADLINE_S=$(( $(now_ms) / 1000 + LEASE_WAIT_TIMEOUT_S ))
+# Epoch-s of the FIRST of a run of consecutive read failures; reset to "" on any successful
+# read. Lets a persistently-unreachable endpoint (hub/app down) fast-fail on its own short
+# budget instead of burning the full held-lease wait below.
+read_fail_since=""
+while :; do
+  # A brief read failure (cloud gateway 5xx past mcp_call's own 5 retries) is NOT fatal mid-
+  # wait -- a failed read claims nothing, so ride out a transient blip. But a PERSISTENTLY
+  # unreachable endpoint means the hub or its MCP app is DOWN, not that the lease is held;
+  # a down hub never frees the lease, so waiting the full LEASE_WAIT_TIMEOUT_S there just burns
+  # ~10min per run (and every queued run repeats it). Read failures therefore get their own
+  # short LEASE_UNREACHABLE_TIMEOUT_S budget and fast-fail past it.
+  rc=0; CURRENT="$(get_lease_value)" || rc=$?
+  [ "$rc" -eq 2 ] && exit 1
+  if [ "$rc" -ne 0 ]; then
+    NOW_S=$(( $(now_ms) / 1000 ))
+    [ -z "$read_fail_since" ] && read_fail_since="$NOW_S"
+    UNREACH_S=$(( NOW_S - read_fail_since ))
+    if [ "$UNREACH_S" -ge "$LEASE_UNREACHABLE_TIMEOUT_S" ]; then
+      echo "::error::Test hub watchdog endpoint unreachable for ${UNREACH_S}s (5xx on every lease read) -- the hub or its watchdog app is down, not the lease held. Aborting fast instead of waiting out the ${LEASE_WAIT_TIMEOUT_S}s held-lease budget."
+      exit 1
+    fi
+    echo "::warning::Lease read failed (cloud gateway); endpoint unreachable ${UNREACH_S}s/${LEASE_UNREACHABLE_TIMEOUT_S}s, retrying next poll..."
+    sleep "$LEASE_POLL_INTERVAL_S"
+    continue
+  fi
+  read_fail_since=""  # a successful read clears the unreachable streak
+
+  if [ -z "$CURRENT" ]; then
+    # A single empty read is already trustworthy now that get_lease_value strict-parses (a
+    # degraded response returns non-zero and polls, never a false-empty). This confirming read
+    # closes the remaining race: a lease WRITTEN between read1 and our claim. If one appears,
+    # fall through to the BUSY parse below instead of claiming over it.
+    sleep "$VERIFY_SLEEP_S"
+    if ! CONFIRM="$(get_lease_value)"; then
+      echo "::notice::Lease read empty once but the confirm read failed; polling instead of claiming."
+      sleep "$LEASE_POLL_INTERVAL_S"
+      continue
+    fi
+    if [ -z "$CONFIRM" ]; then
+      break  # released (confirmed empty by two consecutive reads)
+    fi
+    CURRENT="$CONFIRM"  # a lease appeared between the two reads -- fall through to the BUSY parse below
+  fi
+
+  NOW_MS="$(now_ms)"
+  NOW_S=$(( NOW_MS / 1000 ))
+
+  # Parse defensively. A non-empty value that isn't well-formed JSON, or whose `until`
+  # is missing/non-numeric, means the variable holds SOMETHING (corrupt/truncated read,
+  # partial write) — treat it as BUSY, never as free. Claiming over an unparseable value
+  # would double-book the hub, which is exactly what the lease exists to prevent. (A bare
+  # `// 0` fallback here would read as "expired -> reclaimable" and silently double-claim.)
+  if ! CURRENT_BY="$(printf '%s' "$CURRENT" | jq -re '.by // ""' 2>/dev/null)" \
+     || ! CURRENT_UNTIL="$(printf '%s' "$CURRENT" | jq -re '.until' 2>/dev/null)" \
+     || ! printf '%s' "$CURRENT_UNTIL" | grep -qE '^[0-9]+$'; then
+    if [ "$NOW_S" -ge "$WAIT_DEADLINE_S" ]; then
+      echo "::error::Lease variable malformed/non-JSON through the ${LEASE_WAIT_TIMEOUT_S}s wait budget: $(printf '%.120s' "$CURRENT"). Aborting."
+      exit 1
+    fi
+    echo "::warning::Lease variable holds a malformed/non-JSON value (corrupt or truncated read?); treating as busy: $(printf '%.120s' "$CURRENT")"
+    sleep "$LEASE_POLL_INTERVAL_S"
+    continue
+  fi
+
+  if [ "$CURRENT_BY" = "$BY" ]; then
+    break  # re-entrant: already held by this run
+  fi
+  if [ "$CURRENT_UNTIL" -le "$NOW_MS" ]; then
+    break  # holder's TTL lapsed -> reclaimable
+  fi
+  if holder_run_dead "$CURRENT_BY"; then
+    # Held within its TTL, but the holding CI run has already finished -> its release step never
+    # cleared the lease (likely a hard-killed cancellation). Reclaim now instead of waiting it out.
+    echo "::notice::Lease holder '$CURRENT_BY' is a finished CI run (stranded lease); reclaiming now instead of waiting out its ${LEASE_DURATION_MIN}-min TTL."
+    break
+  fi
+
+  # Held by someone else and still valid — wait for it.
+  UNTIL_TS="$(fmt_ts "$CURRENT_UNTIL")"
+  if [ "$NOW_S" -ge "$WAIT_DEADLINE_S" ]; then
+    echo "::error::Test hub still leased by '$CURRENT_BY' until ${UNTIL_TS} after waiting ${LEASE_WAIT_TIMEOUT_S}s. Aborting."
+    exit 1
+  fi
+  REMAIN_S=$(( WAIT_DEADLINE_S - NOW_S ))
+  echo "::notice::Test hub leased by '$CURRENT_BY' until ${UNTIL_TS}; waiting for release (poll every ${LEASE_POLL_INTERVAL_S}s, up to ${REMAIN_S}s more)..."
+  sleep "$LEASE_POLL_INTERVAL_S"
+done
+
+# Claim. Compute the TTL now, at acquisition time, so a preceding wait doesn't eat into it.
+NOW_MS="$(now_ms)"
+EXPIRES_MS=$((NOW_MS + LEASE_DURATION_MIN * 60 * 1000))
+
+# Build the lease JSON (the variable's string value).
+CLAIM_JSON="$(jq -nc \
+  --arg  by    "$BY" \
+  --argjson since "$NOW_MS" \
+  --argjson until "$EXPIRES_MS" \
+  '{by: $by, since: $since, until: $until}')"
+set_lease_value "$CLAIM_JSON" || { echo "::error::The watchdog did not confirm the lease write; aborting."; exit 1; }
+
+# Post-write race-check: re-read after a short delay. If "by" isn't us, someone else's claim
+# landed last and stole the lease — abort. Ride out a lone transient read failure here the way
+# the wait loop does (one retry) so a blip in this 2s window doesn't fail a claim that actually
+# landed; a sustained failure still aborts safely (the 30-min TTL bounds the lease we wrote).
+sleep "$VERIFY_SLEEP_S"
+if ! AFTER="$(get_lease_value)"; then
+  echo "::warning::Post-write verify read failed transiently; re-reading once."
+  sleep "$VERIFY_SLEEP_S"
+  AFTER="$(get_lease_value)" || { echo "::error::Could not re-read the lease to verify our claim after writing; aborting (the 30-min TTL bounds the lease we wrote)."; exit 1; }
+fi
+AFTER_BY="$(printf '%s' "$AFTER" | jq -r '.by // ""' 2>/dev/null || echo "")"
+
+if [ "$AFTER_BY" != "$BY" ]; then
+  echo "::error::Lease stolen by '$AFTER_BY' before our verify check. Aborting."
+  exit 1
+fi
+
+EXPIRES_TS="$(fmt_ts "$EXPIRES_MS")"
+echo "Lease acquired: by=$BY, until=${EXPIRES_TS} (${LEASE_DURATION_MIN} min TTL)"

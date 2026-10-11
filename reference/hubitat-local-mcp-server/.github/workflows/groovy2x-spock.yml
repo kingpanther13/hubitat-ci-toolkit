@@ -1,0 +1,55 @@
+name: Groovy 2.5 Spock (additive)
+
+# Additive lane (issue #230). Hubitat's hub runtime is Groovy 2.4.x; the root Unit Tests lane runs
+# the same Spock corpus under Groovy 3.0 (eighty20results/hubitat_ci), so a 3.0-green can hide
+# 2.x-vs-3.0 RUNTIME-behaviour divergence. The sibling Groovy 2.4 Parse Check lane catches only
+# load-time/syntax failures; this lane runs the EXISTING src/test/groovy specs against a Groovy 2.5
+# runtime via joelwetzel/hubitat_ci (the biocomp-API fork, closest viable to the hub's 2.4).
+#
+# Fully standalone: a separate build under ci/groovy2x-spock/ that never touches the root
+# build.gradle or the existing 3.0 unit-test lane. The shared spec corpus is referenced read-only.
+#
+# GATE: the 2.5 corpus has a track record now, so this lane is a required status check
+# (`groovy2x-spock` in the `main-required-checks` ruleset) rather than an informational one.
+# NO `paths:` filter, deliberately: a path-filtered workflow does not trigger at all when nothing
+# matches, so no check is ever created and a required check that never reports leaves the PR
+# waiting on it forever -- a docs-only PR would wedge. The sibling required lanes (`test`, `guard`)
+# omit their filters for the same reason. The whole corpus runs in ~2 min, so it is cheap to
+# always run.
+on:
+  # Manual run on any ref, no PR needed -- opening a PR just to exercise a lane also
+  # books the single shared test hub for an hour of e2e.
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  groovy2x-spock:
+    # The ruleset gates on this job name — renaming it silently un-gates the lane.
+    name: groovy2x-spock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          # 17 for the Gradle 9 daemon; 11 for the test toolchain (Groovy 2.5.x is
+          # unhappy on JDK 17/21). Both are auto-detected by the toolchain resolver.
+          java-version: |
+            11
+            17
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Run the existing Spock specs under Groovy 2.5 (joelwetzel/hubitat_ci)
+        # -PharnessStrictMetaClass=true also exercises the harness metaClass dual-wipe under 2.5.
+        run: ./gradlew -p ci/groovy2x-spock test -PharnessStrictMetaClass=true --console=plain
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: groovy2x-spock-report
+          path: |
+            ci/groovy2x-spock/build/reports/tests/test/
+            ci/groovy2x-spock/build/test-results/test/

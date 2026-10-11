@@ -1,0 +1,14 @@
+gradlew text eol=lf
+*.groovy text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.gradle text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.bat -text
+*.jar binary
+*.zip binary
+# Vendored upstream MCP JSON Schemas. Their byte hashes are recorded as provenance in
+# src/test/resources/mcp-schema/README.md, so they must never be line-ending-normalized
+# (core.autocrlf=true would otherwise rewrite them on a Windows checkout).
+src/test/resources/mcp-schema/** -text

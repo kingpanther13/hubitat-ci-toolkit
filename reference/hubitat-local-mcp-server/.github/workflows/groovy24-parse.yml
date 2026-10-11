@@ -1,0 +1,58 @@
+name: Groovy 2.4 Parse Check
+
+# Additive lane (issues #105, #209, #522). Hubitat's hub runtime is Groovy 2.4.x with a security
+# sandbox, but the unit-test harness runs Groovy 3.0 with the sandbox OFF (Flags.DontRestrictGroovy),
+# so code can pass the 3.0 lane yet fail to LOAD on the hub. This lane resolves each production file's
+# #include libraries (so it checks the inlined source the hub compiles), also checks the shipped
+# dist/ files tools/build-release-app.py builds, and runs these gates under a stock Groovy 2.4.21:
+#   1. CONVERSION-phase parse -- catches 3.0-only syntax/operators that won't load on 2.4.
+#      Its AST visitor also rejects null closure parameters, including inside GStrings.
+#   2. CANONICALIZATION + AST walk -- resolves every class reference to its FQN and fails on any
+#      reference to a sandbox-blocked class (java.io / reflection / threads / GroovyShell / raw
+#      sockets) that the hub rejects at parse time ("ClassExpression not allowed"). This is the
+#      class of bug that previously only a real-hub deploy caught (e.g. `instanceof InputStream`).
+# Dynamic hub globals (log, state, ...) are never resolved as classes, so they are not false
+# positives; if a file references a hub-only TYPE by name the sandbox gate is skipped for it (notice)
+# while the syntax and closure-parameter gates still run.
+#
+# It is fully standalone: a separate build under ci/groovy24-parse/ that never touches the
+# root build.gradle or the existing 3.0 unit-test lane.
+on:
+  # Manual run on any ref, no PR needed -- opening a PR just to exercise a lane also
+  # books the single shared test hub for an hour of e2e. Path filters don't gate a dispatch.
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '*.groovy'
+      - 'libraries/**'
+      - 'tests/fixtures/**'
+      - 'tests/e2e_test.py'
+      - 'src/test/groovy/support/IncludeResolver.groovy'
+      - 'tools/build-release-app.py'
+      - 'tools/strip_source.py'
+      - 'tools/groovy_lex.py'
+      - 'ci/groovy24-parse/**'
+      - '.github/workflows/groovy24-parse.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  groovy24-parse:
+    name: groovy24-parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          # 17 for the Gradle 9 daemon; 11 for the parse runner's toolchain
+          # (Groovy 2.4.x is unhappy on JDK 17/21). Both are auto-detected by
+          # the toolchain resolver.
+          java-version: |
+            11
+            17
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Parse + sandbox-class-check production files under Groovy 2.4.21
+        run: ./gradlew -p ci/groovy24-parse parse24 --console=plain

@@ -7,12 +7,97 @@ on:
 permissions:
   contents: read
 jobs:
-  packaging:
+  python-and-packaging:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+      - name: Check immutable extraction
+        run: python3 tools/verify_reference.py
       - name: Packaging contracts
         run: python3 -m unittest discover -s toolkit-tests -v
+      - name: E2E scaffold offline tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Build example bundle
+        run: |
+          python3 tools/build_bundle.py
+          cd dist
+          sha256sum hubitat-bundle.zip > hubitat-bundle.zip.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: example-bundle
+          path: dist/
+  groovy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [primary, groovy25, parse24]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            17
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Primary Groovy 3 Spock tests
+        if: matrix.lane == 'primary'
+        run: ./gradlew test --no-daemon
+      - name: Groovy 2.5 compatibility
+        if: matrix.lane == 'groovy25'
+        run: ./gradlew -p ci/groovy2x-spock test --no-daemon
+      - name: Groovy 2.4 syntax and sandbox gate
+        if: matrix.lane == 'parse24'
+        run: ./gradlew -p ci/groovy24-parse parse24 --no-daemon
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: groovy-${{ matrix.lane }}-reports
+          if-no-files-found: ignore
+          path: |
+            build/reports/
+            ci/*/build/reports/
+  reference-watchdog:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reference/hubitat-local-mcp-server
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            17
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Original watchdog regression suite
+        run: ./gradlew test --tests 'server.Watchdog*' --no-daemon
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: reference-watchdog-reports
+          path: reference/hubitat-local-mcp-server/build/reports/
+  reference-infrastructure:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reference/hubitat-local-mcp-server
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Original lease and lane-gate regression suites
+        run: |
+          bash tests/lease_scripts_test.sh
+          node tests/lane_gate_test.js
+      - name: Shell syntax
+        working-directory: .
+        run: |
+          bash -n scripts/lease_acquire.sh
+          bash -n scripts/lease_release.sh

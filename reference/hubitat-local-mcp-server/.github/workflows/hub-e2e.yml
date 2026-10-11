@@ -1,0 +1,1091 @@
+name: Hub E2E (test hub)
+
+# End-to-end tests against a real Hubitat hub provided by @level99
+# (see issue #77 + the GitHub secret LEVEL99_TEST_HUB_MCP_URL).
+#
+# Failure mode: BLOCKING. Per the maintainer this check is required for merge --
+# a red e2e means the change could not be proven against a real hub, so it gates.
+#
+# Trigger is pull_request_target (NOT pull_request) so the run executes in the base
+# repo's trusted context and therefore has the hub secret even for fork PRs -- the
+# only way to auto-run e2e on a contributor's fork. The workflow file itself always
+# comes from the base branch under pull_request_target, so a PR cannot alter the CI
+# logic; it can only change the app source / tests that get deployed and run, which
+# is gated for untrusted authors by the `approve` job below. After approval, a fork PR's built apps
+# are published by the `fork-bundle` job, so a single approval click runs the whole install.
+#
+# Who runs automatically vs. who waits for approval is decided by the `approve` job's
+# environment selection. When the hub secret genuinely isn't configured (someone
+# forked the whole project without a donated test hub) the e2e job skips cleanly
+# rather than failing -- see the secret gate inside it. A confirmed infra/flake
+# failure is triaged by the maintainer, not auto-ignored.
+#
+# ============================ TWO-LANE FLOW (issue #237) ============================
+# This job runs in one of two LANES, chosen by whether a full-run label is on the PR
+# (release:patch | release:minor | release:major | e2e:full):
+#
+#   FOCUSED lane (no label)  -> runs ONLY the e2e groups affected by the changed files
+#                               (the file->group map in .github/scripts/e2e_scope.py) + a
+#                               smoke core. Fast iteration signal. NOT the merge gate.
+#   FULL lane    (label on)  -> runs the WHOLE suite. This is what the required gate needs.
+#
+# The REQUIRED merge gate is a POSTED COMMIT STATUS named "Full e2e (runs with label)" -- NOT this job's
+# own check ("e2e (run)") -- on purpose, so the focused lane can HOLD the merge without green-washing it:
+#   - Iterating (focused lane): the gate is posted PENDING -> YELLOW, holds the merge. NOT skipped (a
+#     skipped required check counts as PASS and would let a focused-only PR merge) and NOT red (nothing
+#     failed) -- just pending until the full lane runs.
+#   - Add a release:*/e2e:full label -> the FULL lane runs -> the gate is posted success/failure.
+#     ONLY a green FULL run makes the PR mergeable.
+#   - Docs-only / no-secret PRs: the gate is posted success without running (the gate skip path).
+#
+# >>> A PENDING "Full e2e (runs with label)" on a PR is NORMAL and intended -- it's the gate waiting for
+# >>> the full-run label, NOT a stuck/missing run. Add release:*/e2e:full to run the full suite.
+#
+# E2E:SKIP -- the "leave the hub alone" label. Adding `e2e:skip` CANCELS the in-flight e2e run on that
+# branch (it joins the per-branch cancel group below) and posts the required gate PENDING from the
+# cheap lane-gate job, WITHOUT running the e2e job -- so the PR cannot merge, and cannot book the hub.
+# While the label is on, every PR event (push / reopen / other labels) is the same: nothing runs, the
+# gate is re-posted pending on the new head. Removing it re-runs e2e in whatever lane the remaining
+# labels select. Two LIVE-label backstops in the e2e job cover what the frozen event payload can't:
+# the gate step bails out before booking the hub, and the gate-status step re-checks before posting,
+# so a manual re-run or an isolated-group run that outlives the label add can never post success over
+# the skip. Both are INLINE (not a script) because the e2e job checks out the PR HEAD, which may
+# predate this flow. workflow_dispatch ignores the label.
+# ===================================================================================
+
+on:
+  pull_request_target:
+    # The guide PR is stacked on this maintained fixes branch. Keep the trusted
+    # base allowlist explicit; its docs-only diff is skipped by the gate below.
+    branches: [main, pr/fixes-447-449-455-471]
+    # `labeled`/`unlabeled` are included so the lane-gate job can re-evaluate on a full-run-label
+    # (release:patch|minor|major|e2e:full) or e2e:skip toggle -- but e2e RE-RUNS only when the toggle
+    # FLIPS the lane (focused <-> full, skipped <-> live); a redundant toggle is a no-op. See the
+    # "TWO-LANE FLOW" and "E2E:SKIP" blocks above.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # Deliberately NO `paths:` filter. `e2e` is a REQUIRED status check, and a paths-filtered
+    # required check never reports on a PR that doesn't touch those paths -- it sits at
+    # "Expected -- waiting for status to be reported" forever, so a docs-only PR can never
+    # merge. Instead the workflow always triggers and the e2e job's `gate` step detects whether
+    # any hub-relevant file changed: none changed (docs-only / non-hub PR) -> report green
+    # WITHOUT running the suite; any changed -> run the real suite. The hub-relevant allowlist
+    # lives in that gate step and is the source of truth for "what must exercise e2e" -- do NOT
+    # reintroduce a workflow-level paths: filter here (it recreates the never-reports deadlock).
+  workflow_dispatch:
+    inputs:
+      watchdog_update:
+        description: 'MAINTENANCE ONLY: update the standing watchdog from this ref after all non-E2E CI passes, then verify Developer Mode bootstrap. Runs no E2E tests.'
+        required: false
+        default: 'false'
+      install_main:
+        description: 'MAINTENANCE ONLY: install main on the test hub through the watchdog (e2e leaves the last PR installed). Runs no E2E tests.'
+        required: false
+        default: 'false'
+      pr_number:
+        description: 'PR number to test (blank = current ref)'
+        required: false
+      tests:
+        description: 'ONE-OFF: comma-separated test name(s) to run instead of the full suite (e.g. test_set_rule_required_expression_multi_condition). Blank = full suite. Installs the PR head first, same as a normal run.'
+        required: false
+        default: ''
+      skip_install:
+        description: 'ONE-OFF: skip installing the PR head — run against whatever is already deployed (the last PR run, or main after install_main). For tests-only changes where the server code is unchanged. Keeps the lease; skips the watchdog prepare/install.'
+        required: false
+        default: 'false'
+      probe_only:
+        description: 'true = read-only hub inventory probe instead of the e2e suite (diagnose hub state)'
+        required: false
+        default: 'false'
+      reboot_first:
+        description: 'probe_only: true = reboot the test hub before probing (clears a stuck per-app load throttle / LimitExceededException)'
+        required: false
+        default: 'false'
+      disable_app_id:
+        description: 'probe_only: installed-app id to DISABLE (red-X, not delete) after the probe, via the watchdog hub_set_app_disabled'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  # statuses: write lets the "Post e2e gate status" step POST the required commit status
+  # "Full e2e (runs with label)" (pending while focused, success/failure when full). Without it
+  # the POST 403s ("Resource not accessible by integration") and the gate can never report.
+  statuses: write
+
+# New-commit-cancel, per branch: a fresh push / reopen / dispatch (and the FIRST full-run label, per
+# the group note below) on a branch cancels the older
+# in-flight run for that SAME branch, and its replacement re-queues at the BACK of the e2e job's
+# FIFO group. Per-branch (head-repo + head_ref) so two forks reusing a branch name don't cancel
+# each other, and an unapproved fork PR only ever holds ITS OWN branch's group -- never the shared
+# hub or another PR. Cross-PR FIFO serialization is the e2e job's SEPARATE `queue: max` group; the
+# two can't be one block (queue:max + cancel-in-progress:true is an invalid combination).
+# Cancelling mid-run is safe: a cancelled job releases its deployment hold, purges fixtures, and
+# still releases the lease. Every run leaves the hub on its PR's code (a hard kill possibly with a held
+# deployment) until the next run, whose prepare step releases the hold and whose install replaces the
+# code; the 30-min lease TTL frees the hub.
+# group + cancel-in-progress: a run that should SUPERSEDE another -- a commit/reopen/dispatch, the
+# FIRST full-run label promoting a live FOCUSED run to full, OR the e2e:skip label add (which must
+# cancel whatever is in flight and then posts the gate pending) -- shares the per-branch group, so
+# cancel-in-progress (true) cancels the older run. EVERY OTHER label event -- a redundant full label,
+# a non-lane label, a DEMOTE (the last full label removed), or the e2e:skip REMOVAL (nothing is in
+# flight while skipped) -- gets an ISOLATED per-run group so it can neither cancel nor EVICT another
+# run. That isolation is load-bearing: the per-branch group is
+# queue:single, so a no-op label run entering the SHARED group would EVICT a pending demote/flip run
+# (pending eviction happens regardless of cancel-in-progress), silently dropping a run that still owed
+# the gate a status. The "shares the group" test below is the FIRST-full-run-label condition (GitHub
+# has no arithmetic, so it's enumerated: the added label is full AND no OTHER full label is present)
+# OR the e2e:skip add; it is a strict SUBSET of lane_gate.js's non-noop decisions ('run' or 'skip'),
+# so a shared run never cancels a run and then does nothing. It MUST stay in lockstep with
+# lane_gate.js (same full-run-label set + skip label). DEMOTE: removing the
+# last full label re-runs focused in its OWN isolated group (never evicted); it does not cancel the
+# in-flight full run, just queues behind it in the e2e job's hub-e2e-serialized group and posts the
+# pending gate after it.
+# MANUAL RE-RUNS (github.run_attempt > 1) take the ISOLATED group too, for EVERY event type: a
+# re-run replays a FROZEN payload, so an old superseded commit run re-entering the shared per-branch
+# group would cancel the CURRENT head's in-flight run (cancel-in-progress) or evict a pending one
+# (queue:single) -- an obsolete run must never displace a live one. Isolated, the re-run cancels
+# nothing and just queues FIFO in the e2e job's hub-e2e-serialized group; lane-gate honors it via
+# the attempt>1 override in lane_gate.js. The attempt==1 guard only SHRINKS the shared set, so the
+# subset invariant above still holds. If run_attempt were ever stale at re-run time the expression
+# degrades to the old per-event grouping -- never a new hazard.
+concurrency:
+  group: >-
+    ${{ (github.run_attempt == 1
+    && (github.event_name != 'pull_request_target'
+    || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+    || (github.event.action == 'labeled' && (
+    github.event.label.name == 'e2e:skip'
+    || (github.event.label.name == 'release:patch' && !contains(github.event.pull_request.labels.*.name, 'release:minor') && !contains(github.event.pull_request.labels.*.name, 'release:major') && !contains(github.event.pull_request.labels.*.name, 'e2e:full'))
+    || (github.event.label.name == 'release:minor' && !contains(github.event.pull_request.labels.*.name, 'release:patch') && !contains(github.event.pull_request.labels.*.name, 'release:major') && !contains(github.event.pull_request.labels.*.name, 'e2e:full'))
+    || (github.event.label.name == 'release:major' && !contains(github.event.pull_request.labels.*.name, 'release:patch') && !contains(github.event.pull_request.labels.*.name, 'release:minor') && !contains(github.event.pull_request.labels.*.name, 'e2e:full'))
+    || (github.event.label.name == 'e2e:full' && !contains(github.event.pull_request.labels.*.name, 'release:patch') && !contains(github.event.pull_request.labels.*.name, 'release:minor') && !contains(github.event.pull_request.labels.*.name, 'release:major'))))))
+    && format('hub-e2e-{0}-{1}', github.event.pull_request.head.repo.full_name || github.repository, github.head_ref || github.ref_name)
+    || format('hub-e2e-{0}-{1}-isolated-{2}', github.event.pull_request.head.repo.full_name || github.repository, github.head_ref || github.ref_name, github.run_id) }}
+  cancel-in-progress: true
+
+jobs:
+  # The hub-less self-deploy recovery guard (issue #237) is NOT here: running untrusted
+  # PR code in this privileged pull_request_target workflow is a cache-poisoning vector,
+  # so it lives in the unprivileged self-deploy-recovery.yml (pull_request) instead --
+  # it needs no secret and no hub, and runs on every PR there in a safe context.
+
+  # Lane-change gate. A LABEL event (labeled/unlabeled) re-runs e2e ONLY when it actually flips the
+  # lane (focused <-> full). Adding a 2nd full-run label (release:patch|minor|major|e2e:full) when
+  # the PR is ALREADY full, or removing one while another remains, leaves the lane unchanged -- the
+  # prior run's result still stands, so this run skips (no redundant re-deploy). The FIRST full-run
+  # label (focused->full) and removing the LAST one (full->focused) DO re-run, as does every
+  # non-label event (opened/synchronize/reopened/dispatch). `approve` (and thus `e2e`) gate on this
+  # output (probe is dispatch-only, where lane-gate is always true, so it is never label-gated in
+  # practice). lane-gate ITSELF always runs; on a no-op every DOWNSTREAM job is skipped and posts
+  # nothing, so the prior posted gate status is untouched. The third verdict, e2e:skip on the PR,
+  # also runs no downstream job but posts the required gate PENDING right here (see E2E:SKIP at top).
+  lane-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      # Checkout is the BASE ref under pull_request_target (trusted) -- the lane decision gates the
+      # `approve` job, so it must run base's logic, never the PR's. The decision is a pure function in
+      # .github/scripts/lane_gate.js, unit-tested by tests/lane_gate_test.js (+ lane-gate-test.yml).
+      # It MUST stay in lockstep with the cancel-in-progress expression's first-full-label test above.
+      - uses: actions/checkout@v7
+      - id: decide
+        run: node .github/scripts/lane_gate.js
+      # e2e:skip: hold the merge without booking the hub. Posted from THIS job (no approve, no e2e,
+      # no hub-e2e-serialized queue wait) so the pending lands within seconds of the label add, on the
+      # head SHA this event carries. Same context string as the e2e job's post; a cancelled in-flight
+      # run never posts (its post step is !cancelled()), so this pending is the head's final word.
+      - name: Post e2e gate status (e2e:skip)
+        if: steps.decide.outputs.skip == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "E2E NOT RUN -- e2e:skip label is on the PR. Gate posted PENDING; remove the label to run e2e." >> "$GITHUB_STEP_SUMMARY"
+          DESC="e2e disabled by the e2e:skip label; remove it to run"
+          echo "Posting gate status 'Full e2e (runs with label)': pending -- $DESC"
+          # Same 5x retry as the e2e job's post: a transient API blip must not strand the gate.
+          for attempt in 1 2 3 4 5; do
+            if gh api -X POST "repos/${{ github.repository }}/statuses/$GATE_SHA" \
+                 -f state=pending -f context="Full e2e (runs with label)" -f description="$DESC" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::Gate status POST failed after 5 attempts."; exit 1
+            fi
+            echo "::warning::Gate status POST attempt ${attempt}/5 failed; retrying in 5s..."
+            sleep 5
+          done
+
+  # Pre-approval scan of what a FORK PR makes the e2e job execute (.github/scripts/, tests/, the
+  # pinned pip requirements). The approval click IS the security boundary -- the e2e job runs those
+  # files from the PR head with the hub credentials in scope -- so this posts the reviewer a short
+  # list of the added lines that touch the network, the environment, or an installed dependency.
+  # Holds NO secrets and never executes PR code: it reads the patch through the API from a base
+  # checkout. Advisory except for tests/sdk-conformance-requirements.txt, where it FAILS and so
+  # never requests approval (see fork_pr_scan.py). Same-repo PRs and dispatches skip it.
+  fork-scan:
+    needs: [lane-gate]
+    if: needs.lane-gate.outputs.run == 'true' && github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Scan fork PR files the e2e job executes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python .github/scripts/fork_pr_scan.py
+      # A blocking scan skips approve AND e2e, so the e2e job's own gate post never runs and the
+      # required status would sit at "Expected -- waiting for status to be reported": not pending,
+      # not red, and indistinguishable from a live run. Report the block here instead.
+      - name: Post e2e gate status (scan blocked)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          GATE_SHA: ${{ github.event.pull_request.head.sha }}
+          STATE: failure
+          DESC: 'fork pre-approval scan blocked e2e -- see the scan comment'
+        run: bash .github/scripts/post_e2e_gate.sh
+
+  # Approval gate. The environment NAME is chosen from the PR author's relationship to
+  # the repo:
+  #   - trusted (repo owner / org member / write-access collaborator, plus @level99 and
+  #     @kingpanther13 named explicitly, and any maintainer workflow_dispatch) -> the
+  #     `e2e-auto` environment, which has no protection rules, so this job passes
+  #     immediately and e2e runs automatically.
+  #   - everyone else -> the `e2e-approval` environment, whose required-reviewer rule
+  #     pauses the run behind GitHub's "Review pending deployments" button until the
+  #     maintainer approves. Permanent (every run, not just first-time), e2e-only.
+  # author_association is computed server-side and can't be spoofed, and the workflow
+  # file is taken from the base branch under pull_request_target, so a PR can't edit
+  # this gate to promote itself.
+  #
+  # SEPARATE job from `e2e` on purpose: it holds no hub lease and is NOT in the e2e job's cross-PR
+  # FIFO group (hub-e2e-serialized), so an outside PR sitting unapproved can't stall the shared test
+  # hub for trusted runs -- it's only in the workflow-level per-branch group, which is isolated per
+  # branch. e2e starts only once this job succeeds (`needs`).
+  #
+  # Gated on fork-scan so the reviewer never sees the approval prompt before the scan comment is
+  # posted, and a scan hard-failure (a changed requirements pin) is never approvable. fork-scan is
+  # SKIPPED for same-repo PRs and dispatches, so its result is checked explicitly.
+  approve:
+    needs: [lane-gate, fork-scan]
+    if: >-
+      !cancelled() && needs.lane-gate.outputs.run == 'true'
+      && (needs.fork-scan.result == 'success' || needs.fork-scan.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ (github.event_name == 'workflow_dispatch' || github.event.pull_request.author_association == 'OWNER' || github.event.pull_request.author_association == 'MEMBER' || github.event.pull_request.author_association == 'COLLABORATOR' || github.event.pull_request.user.login == 'level99' || github.event.pull_request.user.login == 'kingpanther13') && 'e2e-auto' || 'e2e-approval' }}
+    steps:
+      - name: Gate
+        run: echo "e2e approved to run against the shared test hub"
+
+  # Fork PRs have no bundle-artifacts entry (publish-bundle-artifact.yml only runs on pushes to THIS
+  # repo), so once `approve` clears, build the PR's apps (libraries inlined) and publish them here under
+  # shas/<head-sha>/ -- see publish_fork_bundle.sh for the trust model. Checkout is the BASE ref, so the
+  # script and builder are main's; only the PR's app sources and libraries/ are read, as data.
+  # Same-repo PRs skip it.
+  fork-bundle:
+    needs: [lane-gate, approve]
+    if: >-
+      inputs.probe_only != 'true' && inputs.watchdog_update != 'true' && inputs.install_main != 'true' && needs.lane-gate.outputs.run == 'true'
+      && ((github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository)
+      || (github.event_name == 'workflow_dispatch' && inputs.pr_number != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Publish fork PR release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_INPUT: ${{ inputs.pr_number }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/publish_fork_bundle.sh
+      # A failure here skips e2e, whose own gate post then never runs -- so the required status would
+      # never be reported at all (reads as "still going", not "broke"). The reachable triggers are
+      # ordinary: the CDN poll timing out on a fresh push, an API/fetch blip, or a deleted head repo.
+      - name: Post e2e gate status (artifact publish failed)
+        if: failure() && github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          GATE_SHA: ${{ github.event.pull_request.head.sha }}
+          STATE: failure
+          DESC: 'fork artifact publish failed; e2e did not run -- re-run this workflow'
+        run: bash .github/scripts/post_e2e_gate.sh
+
+  # Explicit maintenance only. Normal E2E calls the standing watchdog but never edits its code.
+  watchdog-maintenance:
+    needs: [approve]
+    if: >-
+      !cancelled() && needs.approve.result == 'success'
+      && github.event_name == 'workflow_dispatch' && inputs.watchdog_update == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: hub-e2e-serialized
+      queue: max
+      cancel-in-progress: false
+    env:
+      MCP_URL: ${{ secrets.LEVEL99_TEST_HUB_MCP_URL }}
+      WATCHDOG_URL: ${{ secrets.WATCHDOG31_MCP_URL }}
+      GH_TOKEN: ${{ github.token }}
+      LEASE_WAIT_TIMEOUT_S: '0'
+      BACKUP_ARTIFACT: watchdog-before-maintenance-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check maintenance inputs and exact-ref CI
+        env:
+          PR_INPUT: ${{ inputs.pr_number }}
+          PROBE_INPUT: ${{ inputs.probe_only }}
+        run: |
+          test -z "$PR_INPUT" && test "$PROBE_INPUT" != 'true' || {
+            echo '::error::Maintenance uses only the dispatched ref; do not combine with pr_number or probe_only.'
+            exit 1
+          }
+          bash .github/scripts/watchdog_maintenance_ci_gate.sh
+      - name: Mask hub tokens
+        run: |
+          for U in "$MCP_URL" "$WATCHDOG_URL"; do
+            TOKEN="$(printf '%s' "$U" | sed -nE 's|.*access_token=(.*)|\1|p')"
+            if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
+          done
+      - name: Acquire test hub lease
+        id: lease
+        run: bash .github/scripts/lease_acquire.sh "ci-run-${{ github.run_id }}"
+      - name: Prepare prior watchdog source
+        run: bash .github/scripts/watchdog_maintenance.sh prepare
+      - name: Preserve prior watchdog source
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BACKUP_ARTIFACT }}
+          path: |
+            ${{ runner.temp }}/watchdog-before.groovy
+            ${{ runner.temp }}/watchdog-before.json
+          if-no-files-found: error
+      - name: Download preserved source before deployment
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$BACKUP_ARTIFACT" --dir "$RUNNER_TEMP/watchdog-maintenance-verified"
+      - name: Update watchdog and verify Developer Mode bootstrap
+        run: bash .github/scripts/watchdog_maintenance.sh deploy
+      - name: Release test hub lease
+        if: always() && steps.lease.outcome == 'success'
+        run: bash .github/scripts/lease_release.sh "ci-run-${{ github.run_id }}"
+
+  # Explicit maintenance only: e2e leaves the last PR's package installed, so this is how the test hub
+  # gets main back (before a watchdog update, or after a PR left a broken server).
+  install-main:
+    needs: [approve]
+    if: >-
+      !cancelled() && needs.approve.result == 'success'
+      && github.event_name == 'workflow_dispatch' && inputs.install_main == 'true' && inputs.watchdog_update != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: hub-e2e-serialized
+      queue: max
+      cancel-in-progress: false
+    env:
+      MCP_URL: ${{ secrets.LEVEL99_TEST_HUB_MCP_URL }}
+      WATCHDOG_URL: ${{ secrets.WATCHDOG31_MCP_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Mask hub tokens
+        run: |
+          for U in "$MCP_URL" "$WATCHDOG_URL"; do
+            TOKEN="$(printf '%s' "$U" | sed -nE 's|.*access_token=(.*)|\1|p')"
+            if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
+          done
+      - name: Acquire test hub lease
+        id: lease
+        run: bash .github/scripts/lease_acquire.sh "ci-run-${{ github.run_id }}"
+      - name: Install main through the watchdog
+        run: python3 .github/scripts/watchdog_v3.py install-main
+      - name: Release test hub lease
+        if: always() && steps.lease.outcome == 'success'
+        run: bash .github/scripts/lease_release.sh "ci-run-${{ github.run_id }}"
+
+  # Read-only hub inventory dump (dispatch with probe_only=true). Diagnoses test-hub
+  # state -- devices, apps, rules, jobs, memory, watchdog state -- without deploying or
+  # mutating anything beyond one labeled command round-trip on the BAT scaffold switch.
+  # Shares the e2e job's hub-e2e-serialized concurrency group so it never overlaps a live e2e run.
+  probe:
+    needs: [approve]
+    if: inputs.probe_only == 'true' && inputs.watchdog_update != 'true' && inputs.install_main != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: hub-e2e-serialized
+      # queue:max (matching the e2e job) so a probe dispatch QUEUES behind a pending e2e run rather
+      # than evicting it -- the group's default queue:single would let a probe cancel a pending PR's
+      # e2e out of the FIFO line. queue:max + cancel-in-progress:false is valid (only queue:max +
+      # cancel-in-progress:true is rejected).
+      queue: max
+      cancel-in-progress: false
+    env:
+      MCP_URL: ${{ secrets.LEVEL99_TEST_HUB_MCP_URL }}
+      WATCHDOG_URL: ${{ secrets.WATCHDOG31_MCP_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mask access tokens
+        run: |
+          for U in "$MCP_URL" "$WATCHDOG_URL"; do
+            TOKEN="$(echo "$U" | sed -nE 's|.*access_token=(.*)|\1|p')"
+            if [ -n "$TOKEN" ]; then
+              echo "::add-mask::$TOKEN"
+            fi
+          done
+      - name: Reboot test hub first (reboot_first=true)
+        if: inputs.reboot_first == 'true'
+        # Clears the platform's sticky per-app load throttle (LimitExceededException "generates
+        # excessive hub load") -- community-confirmed to reset only on reboot. Fired through the
+        # normal destructive-ops gateway; the probe below then captures the post-reboot state.
+        run: |
+          set -euo pipefail
+          echo "Sending hub_reboot to the test hub..."
+          RESP=$(curl -sS --max-time 60 -X POST "$MCP_URL" -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"hub_manage_destructive_ops","arguments":{"tool":"hub_reboot","args":{"confirm":true}}}}' || true)
+          echo "reboot response head: $(printf '%s' "$RESP" | head -c 300 | tr '\n' ' ')"
+          if printf '%s' "$RESP" | grep -qiE "SAFETY CHECK|BACKUP REQUIRED|Write tools are disabled"; then
+            echo "::error::hub_reboot was REFUSED by the destructive-ops gate -- see response above."
+            exit 1
+          fi
+          echo "Waiting 60s for the hub to go down, then polling for recovery (up to ~8 min)..."
+          sleep 60
+          attempt=1
+          until curl -sS --fail --max-time 20 -X POST "$MCP_URL" -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"hub_get_info","arguments":{}}}' \
+              | jq -e '.result.content[0].text' >/dev/null 2>&1; do
+            if [ "$attempt" -ge 32 ]; then
+              echo "::error::Test hub did not come back within ~8 min of the reboot."
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 15
+          done
+          echo "Hub is back after reboot (poll attempt ${attempt})."
+      - name: Probe hub inventory
+        run: bash .github/scripts/mcp_probe_hub.sh
+      - name: Disable installed app (disable_app_id set)
+        if: inputs.disable_app_id != ''
+        # Parks an app via its disabled flag (the admin UI red-X) WITHOUT deleting it, through the
+        # watchdog's hub_set_app_disabled (POST /installedapp/disable + read-back verification).
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${{ inputs.disable_app_id }}" | grep -qE '^[0-9]+$'; then
+            echo "::error::disable_app_id must be numeric"; exit 1
+          fi
+          RPC=$(jq -nc --arg id "${{ inputs.disable_app_id }}" \
+            '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"hub_set_app_disabled",arguments:{appId:$id,disable:true,confirm:true}}}')
+          RESP=$(curl -sS --max-time 60 -X POST "$WATCHDOG_URL" -H "Content-Type: application/json" --data-binary "$RPC")
+          TEXT=$(printf '%s' "$RESP" | jq -r '.result.content[0].text // empty')
+          echo "disable result: $TEXT"
+          printf '%s' "$TEXT" | jq -e '.success == true' >/dev/null || {
+            echo "::error::hub_set_app_disabled did not verify the flip -- see result above."; exit 1; }
+
+  e2e:
+    # This job's OWN check is "e2e (run)" -- it shows the lane that actually ran (focused green/red while
+    # iterating, full when labeled; the run summary prints which lane). The REQUIRED merge gate is the
+    # SEPARATE posted commit status named "Full e2e (runs with label)" (see TWO-LANE FLOW at top + the
+    # "Post e2e gate status" step). Branch protection requires "Full e2e (runs with label)", NOT "e2e (run)".
+    name: e2e (run)
+    needs: [lane-gate, approve, fork-bundle]
+    # fork-bundle is SKIPPED for same-repo PRs; a skipped need would skip this job under the implicit
+    # success(), so the needs are checked explicitly.
+    if: >-
+      !cancelled() && inputs.probe_only != 'true' && inputs.watchdog_update != 'true' && inputs.install_main != 'true' && needs.lane-gate.outputs.run == 'true'
+      && needs.approve.result == 'success'
+      && (needs.fork-bundle.result == 'success' || needs.fork-bundle.result == 'skipped')
+    runs-on: ubuntu-latest
+    # Bounds the EXECUTING job. Cross-PR queueing happens BEFORE this clock starts (a run waits its
+    # turn in the hub-e2e-serialized concurrency group, and behind the approve gate, both in
+    # queued/waiting state -- neither counts against timeout-minutes). So this covers: up to a 4h
+    # wait for a HUMAN-held lease to free (LEASE_WAIT_TIMEOUT_S in lease_acquire.sh) + the ~30-min
+    # post-acquisition run window. The lease is claimed only AFTER that wait, so the run itself
+    # always stays within the 30-min lease TTL.
+    timeout-minutes: 270
+
+    # Serialization model: GitHub's NATIVE concurrency does the cross-PR FIFO QUEUE; the lease is
+    # the hub-side lock (and the only thing that can see a HUMAN holding the hub by hand).
+    #   * `queue: max` lets up to 100 e2e runs WAIT in this one global group and processes them ONE
+    #     AT A TIME in first-in-first-out order (by when each STARTED WAITING on the group). This
+    #     job is `needs: [approve]`, so it enters the group only AFTER the approve gate clears
+    #     (GitHub's observed behavior: a needs-gated job doesn't start waiting on its own group
+    #     until it's eligible to run) -- an approved outside-contributor PR therefore takes its
+    #     place at APPROVAL time (not its old creation order), and a release:*/e2e:full label spawns
+    #     a new run that enters at the BACK. Both lanes (focused/full) are this same job in this
+    #     same group, so they queue together.
+    #   * Cancelling a SUPERSEDED run (new commit on the same branch) is the WORKFLOW-level
+    #     per-branch group near the top of this file. It can't live here: `queue: max` and
+    #     `cancel-in-progress: true` cannot be combined in one concurrency block.
+    #   * lease_acquire.sh still claims/releases _TEST_HUB_LEASED_BY, but it NO LONGER orders the
+    #     queue (concurrency does). Its remaining job is to block when a HUMAN holds the lease by
+    #     hand to take the hub for manual use -- which GitHub concurrency can't see. Because only the
+    #     head-of-line run is in_progress, a head run waiting out a human-held lease blocks the whole
+    #     queue for that wait (bounded by timeout-minutes above; the human hold is the only thing it
+    #     ever waits on now).
+    concurrency:
+      group: hub-e2e-serialized
+      queue: max
+
+    env:
+      MCP_URL: ${{ secrets.LEVEL99_TEST_HUB_MCP_URL }}
+      # The standing watchdog is a SEPARATE on-hub app with its own cloud MCP endpoint (secret
+      # WATCHDOG31_MCP_URL). It drives the PR install and the fixture purge over THIS url,
+      # independent of the MCP server under test
+      # ($MCP_URL) -- so a deploy that bricks the server under test can still be replaced
+      # through the watchdog's own live endpoint.
+      WATCHDOG_URL: ${{ secrets.WATCHDOG31_MCP_URL }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.event.pull_request.head.sha || github.ref }}
+          # checkout v7 (#2454) blocks checking out a FORK PR head under pull_request_target by default;
+          # this job does exactly that on purpose (fork contributors run e2e against the shared test hub,
+          # gated by the `approve` environment), so opt back in. Without this the v6->v7 bump would break
+          # every fork-PR e2e run at the checkout step. The intentional-and-gated design is the mitigation.
+          allow-unsafe-pr-checkout: true
+
+      - name: Gate — secret availability + hub-relevant change detection
+        # Two independent reasons to report green WITHOUT running the hub suite. Both write a
+        # line to the run summary so a skip-green is never mistaken for a real pass.
+        #
+        # 1) Secrets absent. MCP_URL / WATCHDOG_URL are empty only when the secrets aren't
+        #    configured at all -- e.g. someone forked the project without the donated test hub,
+        #    or @level99 has not provisioned the watchdog endpoint. (Under pull_request_target on
+        #    the upstream repo the run is in trusted context, so the secrets ARE present for
+        #    trusted and approved fork PRs.) GitHub doesn't allow `secrets` in a job-level `if:`,
+        #    so the check happens here as a step output that gates every step below.
+        # 2) No hub-relevant file changed (docs-only / non-hub PR). The workflow-level `paths:`
+        #    filter was removed because `e2e` is a REQUIRED check and a paths-filtered required
+        #    check never reports on a docs-only PR (it hangs at "Expected -- waiting" and blocks
+        #    merge). So the workflow always triggers and relevance is detected HERE against the
+        #    same allowlist. A PR touching ANY allowlist path takes the real-run branch, so this
+        #    cannot green-wash a change e2e should test; detection fails SAFE (run on any doubt);
+        #    workflow_dispatch always runs the real suite.
+        id: gate
+        # explicit shell = -eo pipefail; the implicit default lacks pipefail and masks a failed gh in `gh | tr`
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTS_INPUT: ${{ inputs.tests }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [ -z "$MCP_URL" ]; then
+            echo "::notice::LEVEL99_TEST_HUB_MCP_URL secret not available — skipping E2E (expected on repos without the test hub configured)"
+            echo "E2E NOT RUN — test-hub secret (LEVEL99_TEST_HUB_MCP_URL) not configured." >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$WATCHDOG_URL" ]; then
+            echo "::notice::WATCHDOG31_MCP_URL secret not available — skipping E2E (the watchdog endpoint is not provisioned yet; expected until @level99 sets WATCHDOG31_MCP_URL)"
+            echo "E2E NOT RUN — watchdog secret (WATCHDOG31_MCP_URL) not configured." >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"   # manual dispatch always runs the real suite
+            if [ -n "$TESTS_INPUT" ]; then
+              # ONE-OFF lane: run only the named test(s) (still installs the PR head + holds the lease).
+              # Validate to test-name characters so the value can't inject into the runner command line.
+              if ! printf '%s' "$TESTS_INPUT" | grep -qE '^[A-Za-z0-9_,]+$'; then
+                echo "::error::tests input must be comma-separated test names ([A-Za-z0-9_,] only); got: $TESTS_INPUT"
+                exit 1
+              fi
+              echo "lane=oneoff" >> "$GITHUB_OUTPUT"
+              echo "tests=$TESTS_INPUT" >> "$GITHUB_OUTPUT"
+              echo "E2E LANE: one-off (--tests $TESTS_INPUT)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "lane=full" >> "$GITHUB_OUTPUT"      # dispatch with no tests = the FULL lane
+            fi
+            exit 0
+          fi
+          # Dependabot PRs skip EVERY e2e lane -- report the gate green WITHOUT running. Dependabot only
+          # bumps dependency versions and NONE reach the hub: the Gradle deps are test-harness only (the hub
+          # runs the raw .groovy; packageManifest.json ships only the two top-level files) and github-actions
+          # bumps touch CI YAML only, so e2e would redeploy unchanged main code for zero signal. The real
+          # validators (Spock, unit-tests, groovy24-parse, ruff) run as usual. available=false -> the
+          # "Post e2e gate status" step posts the required "Full e2e (runs with label)" status as SUCCESS.
+          # Dependabot is deliberately NOT auto-approved (absent from the `approve` job's e2e-auto list): a
+          # human still approves each run, because a CI-machinery bump can affect the e2e flow itself (e.g.
+          # actions/checkout v7 blocks the pull_request_target fork-PR checkout this job relies on) and must
+          # not be waved through. A maintainer can still force a real run via workflow_dispatch (handled
+          # above, before this gate). PR_AUTHOR comes from env (not inline) to keep the login out of the
+          # run-command string.
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+            echo "::notice::Dependabot PR — skipping all E2E lanes (force-green; a dependency bump reaches nothing on the hub, so e2e validates nothing here)."
+            echo "E2E NOT RUN — Dependabot PR (dependency bump; e2e validates nothing here). Skipped on purpose; the Spock / unit-tests / groovy24-parse / ruff checks cover it." >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # LIVE PR labels, fetched once: the e2e:skip backstop here, the lane pick further down. Retried
+          # 3x and then FAIL-CLOSED: a read failure is NOT an empty list -- it cannot rule out e2e:skip,
+          # so the hub stays off and the gate posts PENDING (cheap: no hub time spent; a re-run recovers).
+          # The `if` keeps `-eo pipefail` from aborting the step on a failed attempt.
+          labels=""; labels_ok=false
+          for attempt in 1 2 3; do
+            if labels="$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.labels[].name' 2>/dev/null | tr '\n' ' ')"; then
+              labels_ok=true; break
+            fi
+            echo "::warning::PR label read attempt ${attempt}/3 failed; retrying in 5s..."
+            sleep 5
+          done
+          if [ "$labels_ok" != "true" ]; then
+            echo "::warning::Could not read PR labels (3 attempts) — cannot rule out e2e:skip; keeping the hub off and the gate PENDING. Re-run once the API is back."
+            echo "E2E NOT RUN — PR label read failed, so e2e:skip could not be ruled out. Gate posted PENDING; re-run to retry." >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "lane=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # LIVE e2e:skip backstop (see E2E:SKIP at top): lane-gate already skipped on the frozen payload,
+          # so this only fires for a manual re-run of an older run or a run the label add couldn't
+          # cancel. lane=skipped makes the gate-status step post PENDING (never success) -- the label
+          # holds the merge, it does not green-wash it. available=false keeps every hub step off.
+          case " $labels " in *" e2e:skip "*)
+            echo "::notice::e2e:skip label is on the PR — skipping all E2E lanes; gate stays PENDING."
+            echo "E2E NOT RUN — e2e:skip label is on the PR. Gate posted PENDING; remove the label to run e2e." >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "lane=skipped" >> "$GITHUB_OUTPUT"
+            exit 0 ;;
+          esac
+          # Fetch the PR's changed-file list. Fail SAFE: if it can't be read, run the full suite
+          # rather than risk green-washing a code PR.
+          files="$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')" || {
+            echo "::warning::Could not list changed files — running the full E2E suite to be safe."
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "lane=full" >> "$GITHUB_OUTPUT"   # full suite runs here -> gate must post success/failure, not pending
+            exit 0
+          }
+          # Hub-relevant allowlist — the source of truth for "what must exercise e2e".
+          # (`case` patterns: `*` matches `/`, so `libraries/*` covers nested paths too.)
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              hubitat-mcp-server.groovy|hubitat-mcp-rule.groovy|e2e-deadman-watchdog-v3.groovy|e2e-deadman-watchdog-v3-1.groovy|tests/e2e_test.py|tests/sdk_conformance_test.py|tests/sdk_conformance_helpers.py|tests/sdk-conformance-requirements.txt|.github/workflows/hub-e2e.yml|.github/scripts/lease_acquire.sh|.github/scripts/lease_release.sh|.github/scripts/mcp_setup_env.sh|.github/scripts/mcp_validate_package_tool.sh|.github/scripts/mcp_watchdog_lib.sh|.github/scripts/mcp_watchdog_deploy.sh|.github/scripts/mcp_arm_watchdog.sh|.github/scripts/mcp_disarm_watchdog.sh|.github/scripts/watchdog_v3.py|.github/scripts/e2e_scope.py|packageManifest.json|tools/build-release-app.py|tools/strip_source.py|tools/groovy_lex.py|libraries/*)
+                relevant=true ;;
+            esac
+          done <<< "$files"
+          if [ "$relevant" = "true" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            # LANE: full if a release:*/e2e:full label is on the PR, else focused (see TWO-LANE FLOW at top).
+            # `$labels` is the live list fetched above (a read failure never reaches here).
+            lane=focused
+            for L in release:patch release:minor release:major e2e:full; do
+              case " $labels " in *" $L "*) lane=full ;; esac
+            done
+            # Old PR that predates this flow: e2e_scope.py + the runner's --groups support live in the PR's
+            # checked-out HEAD, not here, so the focused lane can't run. Fall back to the FULL lane (the old
+            # runner handles `python tests/e2e_test.py`) until the PR merges main. (See AGENTS.md "Two-lane e2e".)
+            if [ "$lane" = "focused" ] && [ ! -f .github/scripts/e2e_scope.py ]; then
+              echo "::notice::e2e_scope.py not in the PR head — focused lane unavailable; running FULL. Merge main into the PR to enable the focused lane."
+              lane=full
+            fi
+            echo "lane=$lane" >> "$GITHUB_OUTPUT"
+            echo "E2E LANE: $lane" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$lane" = "focused" ]; then
+              # Map changed files to affected @test groups, AND pull in the group of any test ADDED to
+              # tests/e2e_test.py (so a tests-only change / a boy-scout test runs its group, not just
+              # smoke). Greps the file's patch for added `def test_...` lines.
+              # The `{ ... || true; }` around grep is REQUIRED: under `-eo pipefail`, a PR that adds NO new
+              # test function (the COMMON focused case) makes grep exit 1 and aborts the whole gate. The
+              # guard turns "no match" into an empty list (file-group + smoke still run).
+              test_funcs="$( { gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --jq '.[] | select(.filename=="tests/e2e_test.py") | .patch // empty' 2>/dev/null || true; } | { grep -oE '^\+[[:space:]]*def test_[A-Za-z0-9_]+' || true; } | sed -E 's/^\+[[:space:]]*def //' | sort -u | tr '\n' ' ')"
+              CHANGED_FILES="$files" CHANGED_TEST_FUNCS="$test_funcs" python .github/scripts/e2e_scope.py
+            fi
+          else
+            echo "::notice::No hub-relevant files changed — reporting E2E green WITHOUT running the suite (docs-only / non-hub PR)."
+            echo "E2E NOT RUN — no hub-relevant files changed (docs-only / non-hub PR). Skipped on purpose; this green does NOT mean the e2e suite executed." >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v7
+        if: steps.gate.outputs.available == 'true'
+        with:
+          python-version: '3.x'
+
+      - name: Install Python dependencies
+        if: steps.gate.outputs.available == 'true'
+        # requests drives tests/e2e_test.py; the pin file is the conformance referee (its own
+        # header explains why it is pinned and why requests is not in it).
+        run: |
+          pip install requests
+          pip install -r tests/sdk-conformance-requirements.txt
+
+      - name: Mask access token in subsequent log lines
+        if: steps.gate.outputs.available == 'true'
+        # Secrets are auto-masked, but the URL parsing below can split the
+        # token out into a separate string that isn't recognized as the
+        # original secret value. Force-mask both endpoints' tokens.
+        run: |
+          for U in "$MCP_URL" "$WATCHDOG_URL"; do
+            TOKEN="$(echo "$U" | sed -nE 's|.*access_token=(.*)|\1|p')"
+            if [ -n "$TOKEN" ]; then
+              echo "::add-mask::$TOKEN"
+            fi
+          done
+
+      - name: Parse MCP_URL into HUBITAT_* env vars
+        if: steps.gate.outputs.available == 'true'
+        # tests/e2e_test.py expects these three env vars (see its docstring).
+        # MCP_URL format: https://cloud.hubitat.com/api/<UUID>/apps/<APPID>/mcp?access_token=<TOKEN>
+        run: |
+          # Note: regional cloud endpoints (e.g. eu.cloud.hubitat.com) are not yet supported —
+          # update the regex if Hubitat adds them.
+          if [[ ! "$MCP_URL" =~ ^https://cloud\.hubitat\.com/api/[^/]+/apps/[0-9]+/mcp\?access_token=.+$ ]]; then
+            echo "::error::MCP_URL does not match the expected cloud-endpoint shape — refusing to parse a malformed value into HUBITAT_* env vars."
+            exit 1
+          fi
+          BASE=$(echo "$MCP_URL"  | sed -E 's|(https://cloud\.hubitat\.com/api/[^/]+)/apps/([0-9]+)/mcp\?access_token=(.*)|\1|')
+          APPID=$(echo "$MCP_URL" | sed -E 's|(https://cloud\.hubitat\.com/api/[^/]+)/apps/([0-9]+)/mcp\?access_token=(.*)|\2|')
+          TOKEN=$(echo "$MCP_URL" | sed -E 's|(https://cloud\.hubitat\.com/api/[^/]+)/apps/([0-9]+)/mcp\?access_token=(.*)|\3|')
+          {
+            echo "HUBITAT_HUB_URL=$BASE"
+            echo "HUBITAT_APP_ID=$APPID"
+            echo "HUBITAT_ACCESS_TOKEN=$TOKEN"
+          } >> "$GITHUB_ENV"
+
+      - name: Watchdog health check (HALT if unreachable / not installed)
+        if: steps.gate.outputs.available == 'true'
+        # The watchdog is a STANDALONE on-hub app reachable on its own cloud MCP endpoint
+        # ($WATCHDOG_URL). Everything below (prepare, PR install, fixture purge) drives the hub
+        # THROUGH that endpoint, so if it is unreachable or the watchdog app isn't installed
+        # there is no way back and we must HALT before mutating the hub -- never deploy PR code
+        # we can't replace. NOT continue-on-error: a dead watchdog endpoint is a hard stop.
+        run: |
+          set -euo pipefail
+          echo "Probing the watchdog endpoint (tools/list)..."
+          LIST_RPC='{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+          RESP=$(curl -sS --max-time 60 -X POST "$WATCHDOG_URL" \
+            -H "Content-Type: application/json" \
+            --data-binary "$LIST_RPC" || true)
+          if ! printf '%s' "$RESP" | jq -e '.result.tools | type == "array"' >/dev/null 2>&1; then
+            echo "::error::Watchdog endpoint ($WATCHDOG_URL) did not return a tools/list result. The watchdog is unreachable or not installed on the test hub — HALTING before any hub mutation (nothing could replace a bad deploy). Body head: $(printf '%s' "$RESP" | head -c 300 | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "Confirming the watchdog responds to hub_get_info..."
+          INFO_RPC='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hub_get_info","arguments":{}}}'
+          INFO=$(curl -sS --max-time 60 -X POST "$WATCHDOG_URL" \
+            -H "Content-Type: application/json" \
+            --data-binary "$INFO_RPC" || true)
+          if ! printf '%s' "$INFO" | jq -e '.result.content[0].text // empty' >/dev/null 2>&1; then
+            echo "::error::Watchdog endpoint reachable but hub_get_info returned no result — the watchdog app may be mis-installed. HALTING. Body head: $(printf '%s' "$INFO" | head -c 300 | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "WATCHDOG_HEALTHY — endpoint reachable and hub_get_info OK"
+
+      - name: Acquire test hub lease
+        if: steps.gate.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}   # lets lease_acquire.sh reclaim a stranded lease whose holding ci-run has finished
+        run: bash .github/scripts/lease_acquire.sh "ci-run-${{ github.run_id }}"
+
+      - name: Compute PR source URL for importUrl deploy
+        if: steps.gate.outputs.available == 'true' && inputs.skip_install != 'true'
+        # The hub fetches the PR branch's raw source itself (importUrl mode), so the
+        # ~1.5MB blob never crosses the cloud gateway. Resolve head repo + SHA for the
+        # three trigger shapes (PR, dispatch-with-pr_number, plain dispatch).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_INPUT: ${{ inputs.pr_number }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_REPO: ${{ github.repository }}
+          DEFAULT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # pull_request_target carries the same pull_request payload (head repo + sha),
+          # so treat it identically to pull_request -- otherwise we'd fall through to the
+          # base repo/sha and deploy BASE source instead of the PR's.
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            REPO="$PR_HEAD_REPO"; SHA="$PR_HEAD_SHA"
+          elif [ -n "${PR_INPUT:-}" ]; then
+            # Validate the dispatch input before it reaches gh api.
+            if ! printf '%s' "$PR_INPUT" | grep -qE '^[0-9]+$'; then
+              echo "::error::pr_number must be numeric"; exit 1
+            fi
+            REPO=$(gh api "repos/$DEFAULT_REPO/pulls/$PR_INPUT" --jq '.head.repo.full_name')
+            SHA=$(gh api "repos/$DEFAULT_REPO/pulls/$PR_INPUT" --jq '.head.sha')
+          else
+            REPO="$DEFAULT_REPO"; SHA="$DEFAULT_SHA"
+          fi
+          # Defense-in-depth: only a 40-hex SHA and an owner/name repo may form the
+          # URL, so a malformed value can't inject into $GITHUB_ENV or the URL.
+          if ! printf '%s' "$SHA" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::unexpected head SHA shape"; exit 1
+          fi
+          if ! printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::unexpected head repo shape"; exit 1
+          fi
+          # Every raw fetch goes through THIS repo, fork PRs included: raw.githubusercontent.com serves
+          # any fork-network commit from the base repo, and the fork-bundle job published a fork PR's
+          # built apps under this repo's bundle-artifacts (the fork's own copy of that branch never gets one).
+          echo "::notice::PR head repo: $REPO"
+          URL="https://raw.githubusercontent.com/$DEFAULT_REPO/$SHA/hubitat-mcp-server.groovy"
+          echo "PR_SOURCE_URL=$URL" >> "$GITHUB_ENV"
+          # Same validated SHA, split into the (baseUrl, ref) form hub_update_package
+          # takes -- the dev-tool validation step below builds the identical URL on-hub.
+          echo "PR_RAW_BASE=https://raw.githubusercontent.com/$DEFAULT_REPO" >> "$GITHUB_ENV"
+          echo "PR_HEAD_SHA_RESOLVED=$SHA" >> "$GITHUB_ENV"
+          echo "::notice::importUrl deploy source: $URL"
+
+      # The watchdog is NOT deployed by e2e: e2e never writes to the watchdog app, it only drives the
+      # standing watchdog's endpoint. A PR that changes the watchdog source
+      # (e2e-deadman-watchdog-v3-1.groovy) is validated by its specs plus an explicit maintenance run.
+
+      # Watchdog v3 never restores on its own, so there is nothing to arm. This step confirms v3
+      # answers and releases any deployment hold an earlier run left behind (a cancelled or crashed
+      # run, or a hub restart mid-install). The script keeps its historical file name.
+      - name: Watchdog - prepare
+        if: steps.gate.outputs.available == 'true' && inputs.skip_install != 'true'
+        run: bash .github/scripts/mcp_arm_watchdog.sh
+
+      # Install THIS PR's package through watchdog v3: one background operation saves the built child
+      # and then the built parent (libraries inlined, one compile), and reports each stage. The script follows
+      # the status, verifies both endpoints, and releases the hold. Blocking: a failed PR install
+      # means the tests would run against stale/broken hub code.
+      - name: Watchdog - install PR
+        if: steps.gate.outputs.available == 'true' && inputs.skip_install != 'true'
+        env:
+          PR_RAW_BASE: ${{ env.PR_RAW_BASE }}
+          PR_HEAD_SHA_RESOLVED: ${{ env.PR_HEAD_SHA_RESOLVED }}
+        run: bash .github/scripts/mcp_watchdog_deploy.sh
+
+      # Both talk to the MCP app, so they run only once this run's own code is installed: the app a
+      # previous run left behind may be broken.
+      - name: Pre-run hub status probe
+        if: steps.gate.outputs.available == 'true'
+        # Standard since the 2026-06-11 LimitExceededException hunt: capture the hub's exact
+        # pre-run state (memory, jobs, error logs, devices, app instances, live command check)
+        # inside our lease window, so a degraded starting state is visible in every run's log.
+        # Diagnostic only -- must never fail the run.
+        continue-on-error: true
+        run: bash .github/scripts/mcp_probe_hub.sh
+
+      - name: Configure test environment (enable toggles)
+        if: steps.gate.outputs.available == 'true'
+        # Enables Developer Mode through the standing watchdog if needed, verifies it, then enables
+        # the legacy engine and gateway mode.
+        run: bash .github/scripts/mcp_setup_env.sh
+
+      - name: Run E2E tests
+        id: run_e2e
+        if: steps.gate.outputs.available == 'true'
+        env:
+          # Defer per-test native-rule fixture deletes to the teardown's watchdog purge (one hub-local
+          # sweep) instead of the test critical path.
+          E2E_DEFER_NATIVE_DELETES: '1'
+          # 0 = this limiter escalation NEVER reboots the test hub. Keep it that way. (The separate
+          # reboot_first dispatch input still reboots on explicit maintainer request.)
+          # This escalates a recurring platform load limiter to a hub REBOOT at every multiple of N
+          # app bounces (an app bounce only clears the app INSTANCE; the limiter lives on the
+          # platform's load counters, which only a reboot resets). It was set to '2' in #367 -- but
+          # the full lane ALWAYS trips the limiter more than twice, so '2' meant a reboot was the
+          # EXPECTED outcome of EVERY full lane, costing ~60s down plus recovery polling, and one
+          # observed run then re-ran its most expensive test whole on top of that. A routine reboot
+          # is not an acceptable price for the merge path.
+          # The trade-off, honestly: with reboots off, a limiter that outlives the bounce falls back
+          # to the SOFT-PASS path (reported under [SOFT-PASS] in the run summary) instead of being
+          # actively cleared -- which is the behaviour every run before #367 already had.
+          # To debug a limiter, change this value on a scratch branch and dispatch that branch --
+          # there is no workflow_dispatch input for it, so it cannot be overridden per-run.
+          E2E_LIMITER_REBOOT_AFTER: '0'
+          E2E_LANE: ${{ steps.gate.outputs.lane }}
+          E2E_GROUPS: ${{ steps.gate.outputs.groups }}
+          E2E_TESTS: ${{ steps.gate.outputs.tests }}
+        run: |
+          if [ "$E2E_LANE" = "oneoff" ]; then
+            # Maintainer one-off (workflow_dispatch tests=...): run only the named test(s). Gate already
+            # validated E2E_TESTS to [A-Za-z0-9_,]. The runner unions --tests into the selection.
+            echo "Running a ONE-OFF -- tests: $E2E_TESTS"
+            python tests/e2e_test.py --tests "$E2E_TESTS"
+          elif [ "$E2E_LANE" = "focused" ]; then
+            # The runner treats an EMPTY --groups as "no filter" = the FULL suite, so NEVER pass empty in
+            # focused mode (that would silently run everything). e2e_scope.py always emits >=smoke, so this
+            # only fires if the gate misbehaved -- fall back to the smoke core, not the whole suite.
+            groups="${E2E_GROUPS:-infrastructure,protocol,error_verification}"
+            echo "Running the FOCUSED lane -- groups: $groups"
+            python tests/e2e_test.py --groups "$groups"
+          else
+            echo "Running the FULL lane -- whole suite"
+            python tests/e2e_test.py
+          fi
+
+      # Conformance leg: the official MCP Python SDK's client + validators judge the deployed
+      # PR's pinned 2026-07-28 client path (sibling: McpWireSchemaConformanceSpec; docs/testing.md).
+      #
+      # Skipped under skip_install, like pkg_validate: the MRTR proof WRITES one uniquely named
+      # temporary Rule Machine fixture and deletes that exact fixture in a finally. More importantly,
+      # a skip_install dispatch would judge already-deployed code while its outcome fed the gate as
+      # the PR's verdict, so an excluded run can never count as protocol proof.
+      #
+      # Editing this STEP is a workflow-FILE change, and pull_request_target takes the workflow
+      # file from main -- so the PR's own auto run executes main's version of the step, not the
+      # PR's. Validate a step edit with `gh workflow run hub-e2e.yml --ref <branch>`; see
+      # AGENTS.md "e2e CI: pull_request_target trigger". Its outcome IS read by the required gate
+      # below -- a step left out of that condition fails the job while the gate posts success.
+      - name: SDK conformance (official MCP Python SDK client)
+        id: sdk_conformance
+        if: steps.gate.outputs.available == 'true' && inputs.skip_install != 'true'
+        run: python tests/sdk_conformance_test.py
+
+      # The install above landed THIS PR's app on the hub, so hub_update_package now
+      # exists there. Exercise its discovery path live (dryRun: fetch PR source ->
+      # parse #includes -> resolve self app-class) with ZERO writes. This is a REAL
+      # blocking gate -- e2e passing is what shows the tool works. It runs AFTER the
+      # e2e suite so a tool failure can't skip the suite; the purge step below
+      # uses `if: always()`, so fixtures are reaped regardless. The full
+      # write path (real library + #include + compile equivalence) is validated by the
+      # watchdog PR-install step above plus the hub_list_libraries (McpRoomsLib present)
+      # assertions in tests/e2e_test.py.
+      - name: Validate hub_update_package dev tool (dryRun)
+        id: pkg_validate
+        # Validates the PR's package tool against its installed source -- meaningless (and PR_RAW_BASE
+        # is unset) when skip_install ran the test against the already-deployed code.
+        if: steps.gate.outputs.available == 'true' && inputs.skip_install != 'true'
+        env:
+          PR_RAW_BASE: ${{ env.PR_RAW_BASE }}
+          PR_HEAD_SHA_RESOLVED: ${{ env.PR_HEAD_SHA_RESOLVED }}
+        run: bash .github/scripts/mcp_validate_package_tool.sh
+
+      # Post the REQUIRED gate "Full e2e (runs with label)" as a COMMIT STATUS (NOT this job's own check)
+      # so the focused lane can hold the merge PENDING without green-washing it (a skipped/green required
+      # check would let a focused-only PR merge -- see TWO-LANE FLOW at top). The job's check is "e2e (run)".
+      #   focused lane          -> pending (yellow): holds the merge until the full lane runs.
+      #   full lane passed       -> success;   full lane failed -> failure.
+      #   docs-only / no secret  -> success (the gate skip path; e2e not required to run).
+      #   e2e:skip on the PR     -> pending, whatever ran: checked LIVE right here, so a run that outlived
+      #                             the label add (isolated group / manual re-run) can't post over the
+      #                             lane-gate job's pending. A label read that fails 3x also posts
+      #                             PENDING (fail-closed: it can't rule the label out); the status POST
+      #                             below uses the same API, so it would most likely fail too.
+      - name: Post e2e gate status
+        # explicit shell = -eo pipefail; the implicit default lacks pipefail and masks a failed gh in `gh | tr`
+        shell: bash
+        # always() EXCEPT on cancel: a focused run cancelled by the FIRST-full-label promote shares the
+        # PR head SHA with the full run it spawned (a label add doesn't change the SHA, unlike a commit),
+        # so its PENDING post could land AFTER the full run's success/failure on the SAME status context
+        # and strand the required gate. !cancelled() makes a cancelled run skip the post, leaving the
+        # status to the run that supersedes it. (The teardown steps below stay always() to free the hub.)
+        if: always() && !cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA="${{ github.event.pull_request.head.sha }}"
+          [ -z "$SHA" ] && SHA="${{ github.sha }}"
+          AVAIL="${{ steps.gate.outputs.available }}"
+          LANE="${{ steps.gate.outputs.lane }}"
+          PR="${{ github.event.pull_request.number }}"
+          SKIPPED=false; LABELS_OK=true
+          if [ "$LANE" = "skipped" ]; then
+            SKIPPED=true
+          elif [ -n "$PR" ]; then   # dispatch has no PR -> the label can't apply
+            LABELS_OK=false
+            for attempt in 1 2 3; do
+              if live_labels="$(gh api "repos/${{ github.repository }}/pulls/$PR" --jq '.labels[].name' 2>/dev/null | tr '\n' ' ')"; then
+                LABELS_OK=true; break
+              fi
+              echo "::warning::PR label read attempt ${attempt}/3 failed; retrying in 5s..."
+              sleep 5
+            done
+            case " $live_labels " in *" e2e:skip "*) SKIPPED=true ;; esac
+          fi
+          if [ "$SKIPPED" = "true" ]; then
+            STATE=pending; DESC="e2e disabled by the e2e:skip label; remove it to run"
+          elif [ "$LABELS_OK" != "true" ]; then
+            echo "::warning::Could not read PR labels (3 attempts) — cannot rule out e2e:skip; posting the gate PENDING instead of the run result."
+            STATE=pending; DESC="e2e result withheld: PR label read failed (could not rule out e2e:skip); re-run"
+          elif [ "$AVAIL" != "true" ]; then
+            STATE=success; DESC="e2e skipped (no hub-relevant change / no test-hub secret); not required to run"
+          elif [ "$LANE" = "full" ]; then
+            # pkg_validate and sdk_conformance are both SKIPPED (not failed) under a skip_install
+            # one-off dispatch, and sdk_conformance is also skipped whenever an earlier step
+            # failed; only an actual failure should fail the gate, so a skip counts as a pass.
+            # sdk_conformance MUST be read here -- the gate is a posted commit status computed
+            # from named step outcomes, so a step left out of this condition can fail the JOB
+            # while the required gate still posts success.
+            if [ "${{ steps.run_e2e.outcome }}" = "success" ] \
+               && [ "${{ steps.pkg_validate.outcome }}" != "failure" ] \
+               && [ "${{ steps.sdk_conformance.outcome }}" != "failure" ]; then
+              STATE=success; DESC="full e2e passed"
+            else
+              STATE=failure; DESC="full e2e failed"
+            fi
+          else
+            STATE=pending; DESC="e2e pending; no label -- add release:* or e2e:full to run the full suite"
+          fi
+          echo "Posting gate status 'Full e2e (runs with label)': $STATE -- $DESC"
+          # Retry the status POST (like lease_acquire.sh's mcp_call): a transient GitHub API blip on
+          # this single call must not fail an otherwise-green run and force a ~20-min re-run just to
+          # re-post the required gate. A persistent failure (5 misses) still fails the job honestly.
+          for attempt in 1 2 3 4 5; do
+            if gh api -X POST "repos/${{ github.repository }}/statuses/$SHA" \
+                 -f state="$STATE" -f context="Full e2e (runs with label)" -f description="$DESC" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::Gate status POST failed after 5 attempts."; exit 1
+            fi
+            echo "::warning::Gate status POST attempt ${attempt}/5 failed; retrying in 5s..."
+            sleep 5
+          done
+
+      # Release the run's hold and purge every BAT_E2E_ fixture in one hub-local watchdog sweep. The PR's
+      # package stays installed: the next run installs over it, and install_main restores main on
+      # demand. Fails the job when the purge reports leftovers (the gate is already posted above).
+      - name: Watchdog - purge fixtures
+        if: always() && !cancelled() && steps.gate.outputs.available == 'true'
+        run: bash .github/scripts/mcp_disarm_watchdog.sh
+
+      # A cancelled job gets about five minutes before GitHub ends it, so this is best effort and
+      # bounded; the next run's prepare step releases anything left.
+      - name: Watchdog - purge fixtures (cancelled run)
+        if: cancelled() && steps.gate.outputs.available == 'true'
+        # The lease release below has to fit inside the same cancel window.
+        timeout-minutes: 3
+        run: bash .github/scripts/mcp_disarm_watchdog.sh --cancelled
+
+      - name: Post-run hub status probe
+        # Diagnostic-only forensics worth the ~22s ONLY on a red run -- on a green run nobody reads it,
+        # so skip it (gated on run_e2e failure) to keep the held-lease teardown short.
+        if: always() && steps.gate.outputs.available == 'true' && steps.run_e2e.outcome == 'failure'
+        # The pre-run probe's counterpart: capture what the run LEFT BEHIND (stranded artifacts,
+        # load-limiter trips in the error log, memory descent, watchdog state) while we still
+        # hold the lease. Diagnostic only -- must never fail the run.
+        continue-on-error: true
+        run: bash .github/scripts/mcp_probe_hub.sh
+
+      - name: Release test hub lease
+        if: always() && steps.gate.outputs.available == 'true'
+        run: bash .github/scripts/lease_release.sh "ci-run-${{ github.run_id }}"

@@ -1,0 +1,48 @@
+<!-- Prefix your PR title with the type that matches what you tick below.
+     Valid prefixes: feat: | fix: | chore: | refactor: | docs: | test: | ci:
+     Example: "feat: add device health polling tool"
+     Note: build: is reserved for Dependabot — contributors should not use it. -->
+
+## Summary
+
+<!-- 1-3 bullets describing what this PR does and why. -->
+
+## Type of change
+
+<!-- Tick exactly one. -->
+
+- [ ] `feat` — new feature or capability
+- [ ] `fix` — bug fix
+- [ ] `chore` — maintenance, dependency bump, or housekeeping
+- [ ] `refactor` — code restructure with no behaviour change
+- [ ] `docs` — documentation only
+- [ ] `test` — tests only
+- [ ] `ci` — CI/CD pipeline change
+
+## Changes
+
+<!-- Key changes. Reference issue numbers (Closes #N / Fixes #N / Part of #N). -->
+
+## Release Notes
+
+<!-- These bullets are what HPM users will see when prompted to update — write for end users, not developers.
+     Sub-bullets are supported (nest with 2-space indent).
+     If you skip this section, the release entry will fall back to just the PR title.
+     LEAVE COMPLETELY BLANK IF THERE ARE NO RELEASE NOTES — typing "None" in here will LITERALLY
+     give a release note that says "None". -->
+
+- 
+
+## Testing
+
+<!-- How you verified this works. -->
+
+## Checklist
+
+- [ ] **Unit tests added for any new MCP tools, regressions, or bug fixes** (required — see [docs/testing.md](docs/testing.md) for the harness + recipes)
+- [ ] **e2e tests added for new tools and/or regression tests added for any bug fix** (see `tests/e2e_test.py`)
+- [ ] Sandbox lint passes: `python tests/sandbox_lint.py`
+- [ ] `./gradlew test` passes locally (or CI confirms)
+- [ ] Relevant existing live-hub BAT scenarios run, with the tested revision and results recorded (or an explicit pending-execution note); scenarios added/updated only for missing coverage (see `tests/BAT-v2.md`)
+- [ ] Documentation updated if user-facing behaviour or tool surface changed
+- [ ] New/renamed MCP tools follow `AGENTS.md` Tool Design Rules (naming, annotations, schema)

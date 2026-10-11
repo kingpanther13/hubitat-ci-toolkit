@@ -1,0 +1,3590 @@
+package server
+
+import spock.lang.Shared
+import support.TestLocation
+import support.ToolSpecBase
+
+/**
+ * Spec for the hub_manage_variables gateway tools in hubitat-mcp-server.groovy:
+ *
+ * - toolListVariables    -> hub_list_variables
+ * - toolGetVariable      -> hub_get_variable
+ * - toolSetVariable      -> hub_set_variable
+ * - toolDeleteHubVariable -> hub_delete_variable
+ *
+ * Migrated to the modern Hub Variable API (issue #92): getAllGlobalVars /
+ * getGlobalVar / setGlobalVar see ALL hub variables, not just the
+ * connector-exposed subset that getAllGlobalConnectorVariables saw. The
+ * modern API also returns richer metadata: each entry is shaped like
+ * [name, type, value, deviceId, attribute] so callers can tell whether a
+ * connector exists (deviceId/attribute populated) and what type the var
+ * is (Number/Decimal/String/Boolean/DateTime).
+ *
+ * These APIs are dynamic — not on AppExecutor — so they're stubbed
+ * per-test via script.metaClass in given: blocks. See docs/testing.md
+ * "Which interception point to use" for the general pattern.
+ *
+ * hub_delete_variable is gated centrally on the Write master (executeTool) and by
+ * requireDestructiveConfirm (args.confirm + 24h backup window). Helper
+ * enableWrite() seeds the Write master + a recent backup.
+ */
+class ToolHubVariablesSpec extends ToolSpecBase {
+
+    @Shared private TestLocation sharedLocation = new TestLocation()
+
+    def setupSpec() {
+        appExecutor.getLocation() >> sharedLocation
+    }
+
+    def cleanup() {
+        sharedLocation.timeZone = TimeZone.getTimeZone('UTC')
+    }
+
+    private void enableWrite() {
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L  // matches HarnessSpec's fixed now()
+    }
+
+    // -------- initialize() lifecycle (issue #105 PR2a #6) --------
+
+    def "initialize unsubscribes BEFORE re-subscribing to hub variables (no duplicate subscription stacking)"() {
+        given: 'a clean initialize with the unrelated side-effects neutralised'
+        UNSUBSCRIBE_CALL_COUNT.set(0)
+        stateMap.accessToken = 'tok'                  // skip createAccessToken
+        script.metaClass.checkForUpdate = { -> }      // skip the GitHub HTTP check
+        // The first getAllGlobalVars call happens inside _subscribeToAllHubVariables (the
+        // re-subscribe phase), so capturing the unsubscribe count there proves ordering --
+        // a regression that moved unsubscribe() AFTER _subscribeToAllHubVariables() would see
+        // 0 here and wipe the freshly-established subscriptions.
+        def unsubCountAtResubscribe = -1
+        script.metaClass.getAllGlobalVars = { ->
+            if (unsubCountAtResubscribe < 0) unsubCountAtResubscribe = UNSUBSCRIBE_CALL_COUNT.get()
+            [:]
+        }
+
+        when:
+        script.initialize()
+
+        then: 'unsubscribe() fires (Hubitat does NOT implicitly unsubscribe between updated() calls, so without it every settings save stacks duplicate subscriptions)'
+        UNSUBSCRIBE_CALL_COUNT.get() == 1
+
+        and: 'and it fired BEFORE the re-subscribe phase'
+        unsubCountAtResubscribe == 1
+    }
+
+    // -------- toolListVariables --------
+
+    def "hub_list_variables returns both hub and rule-engine variables with correct total"() {
+        given: 'hub exposes two variables — one connector-backed, one not'
+        script.metaClass.getAllGlobalVars = { ->
+            [
+                'temp_setpoint': [name: 'temp_setpoint', type: 'Number',  value: 72,    deviceId: 305, attribute: 'variable'],
+                'vacation_mode': [name: 'vacation_mode', type: 'Boolean', value: false, deviceId: null, attribute: null]
+            ]
+        }
+
+        and: 'the rule engine has one variable stored in state'
+        stateMap.ruleVariables = [last_motion: '2026-04-21T10:00:00']
+
+        when:
+        def result = script.toolListVariables()
+
+        then: 'hub variables come back with the modern shape including connector linkage'
+        result.hubVariables.size() == 2
+        def temp = result.hubVariables.find { it.name == 'temp_setpoint' }
+        temp.value == 72
+        temp.type == 'Number'
+        temp.source == 'hub'
+        temp.deviceId == 305
+        temp.attribute == 'variable'
+        def vac = result.hubVariables.find { it.name == 'vacation_mode' }
+        vac.deviceId == null
+        vac.attribute == null
+
+        and: 'rule-engine variables come back unchanged'
+        result.ruleVariables.size() == 1
+        result.ruleVariables[0].name == 'last_motion'
+        result.ruleVariables[0].source == 'rule_engine'
+        result.total == 3
+    }
+
+    def "hub_list_variables falls back to rule variables when the hub API throws"() {
+        given:
+        script.metaClass.getAllGlobalVars = { ->
+            throw new RuntimeException('Hub variable API not available')
+        }
+        stateMap.ruleVariables = [counter: 5]
+
+        when:
+        def result = script.toolListVariables()
+
+        then:
+        result.hubVariables == []
+        result.ruleVariables.size() == 1
+        result.total == 1
+    }
+
+    def "hub_list_variables returns empty collections when no variables are defined"() {
+        given:
+        script.metaClass.getAllGlobalVars = { -> [:] }
+
+        when:
+        def result = script.toolListVariables()
+
+        then:
+        result.hubVariables == []
+        result.ruleVariables == []
+        result.total == 0
+        // unconditional per-list totals so a caller can distinguish "no hub vars"
+        // from "no rule vars" without cursor context
+        result.totalHubVariables == 0
+        result.totalRuleVariables == 0
+    }
+
+    def "hub_list_variables cursor pages hubVariables while ruleVariables stays in full (#174)"() {
+        given: '150 hub vars + 5 rule vars'
+        def allVars = (0..<150).collectEntries { i -> ["var_${String.format('%03d', i)}".toString(), [name: "var_${i}".toString(), type: 'Number', value: i, deviceId: null, attribute: null]] }
+        script.metaClass.getAllGlobalVars = { -> allVars }
+        stateMap.ruleVariables = [a: 1, b: 2, c: 3, d: 4, e: 5]
+
+        when: 'first page (cursor="")'
+        def page1 = script.toolListVariables([cursor: ''])
+
+        then:
+        page1.hubVariables.size() == 100
+        page1.ruleVariables.size() == 5   // ruleVariables stays in full
+        page1.totalHubVariables == 150
+        page1.totalRuleVariables == 5
+        page1.total == 155                 // legacy combined total
+        page1.nextCursor == '100'
+
+        when: 'last page'
+        def page2 = script.toolListVariables([cursor: '100'])
+
+        then:
+        page2.hubVariables.size() == 50
+        page2.ruleVariables.size() == 5
+        !page2.containsKey('nextCursor')
+    }
+
+    def "hub_list_variables surfaces a hubVariablesError field when getAllGlobalVars throws (not silent)"() {
+        // Pre-fix this exception was only logged at debug level; a caller couldn't
+        // distinguish "no hub variables" from "hub API broke".
+        given:
+        script.metaClass.getAllGlobalVars = { -> throw new RuntimeException('sandbox tightened: getAllGlobalVars not available') }
+
+        when:
+        def result = script.toolListVariables()
+
+        then:
+        result.hubVariables == []
+        result.hubVariablesError != null
+        result.hubVariablesError.contains('sandbox tightened')
+        result.totalHubVariables == 0
+    }
+
+    // -------- toolGetVariable --------
+
+    def "a hub variable lookup that throws is recorded in the MCP log at debug level"() {
+        given:
+        settingsMap.mcpLogLevel = 'debug'
+        script.log.messages.clear()
+        script.metaClass.getGlobalVar = { String name -> throw new RuntimeException('platform lookup failed') }
+
+        when:
+        script.toolGetVariable('outdoor_temp')
+
+        then: 'the lookup failure falls through to not-found'
+        thrown(IllegalArgumentException)
+
+        and: 'its diagnostic reaches the MCP history under hub-vars'
+        script.log.messages.any {
+            it.contains('[MCP1] ') && it.contains('"component":"hub-vars"') &&
+                it.contains("Hub variable 'outdoor_temp' lookup threw RuntimeException: platform lookup failed")
+        }
+    }
+
+    def "hub_get_variable returns the modern shape with type and connector linkage"() {
+        given:
+        script.metaClass.getGlobalVar = { String name ->
+            if (name != 'outdoor_temp') return null
+            [name: 'outdoor_temp', type: 'Decimal', value: 68.4, deviceId: 312, attribute: 'variable']
+        }
+
+        when:
+        def result = script.toolGetVariable('outdoor_temp')
+
+        then:
+        result.name == 'outdoor_temp'
+        result.value == 68.4
+        result.type == 'Decimal'
+        result.deviceId == 312
+        result.attribute == 'variable'
+        result.source == 'hub'
+    }
+
+    def "hub_get_variable returns hub var without connector linkage when no connector exists"() {
+        given: 'a Boolean var without a connector — deviceId/attribute null'
+        script.metaClass.getGlobalVar = { String name ->
+            [name: 'vacation_mode', type: 'Boolean', value: true, deviceId: null, attribute: null]
+        }
+
+        when:
+        def result = script.toolGetVariable('vacation_mode')
+
+        then:
+        result.name == 'vacation_mode'
+        result.value == true
+        result.type == 'Boolean'
+        result.deviceId == null
+        result.attribute == null
+        result.source == 'hub'
+    }
+
+    def "hub_get_variable falls back to rule-engine value when hub API throws"() {
+        given:
+        script.metaClass.getGlobalVar = { String name ->
+            throw new RuntimeException('Not supported')
+        }
+        stateMap.ruleVariables = [porch_light_pref: 'bright']
+
+        when:
+        def result = script.toolGetVariable('porch_light_pref')
+
+        then:
+        result.name == 'porch_light_pref'
+        result.value == 'bright'
+        result.source == 'rule_engine'
+    }
+
+    def "hub_get_variable throws when variable exists in neither source"() {
+        given:
+        script.metaClass.getGlobalVar = { String name -> null }
+        stateMap.ruleVariables = [:]
+
+        when:
+        script.toolGetVariable('nonexistent')
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('Variable not found')
+        ex.message.contains('nonexistent')
+    }
+
+    // -------- toolSetVariable --------
+
+    def "rule-engine variables preserve data keys and false zero null values on both write paths"() {
+        given:
+        script.metaClass.setGlobalVar = { String name, Object value -> false }
+        script.metaClass.getGlobalVar = { String name -> null }
+        stateMap.ruleVariables = [untouched: 'keep']
+        def values = [fields: false, class: 0, metaClass: null, Fields: [false, 0, null], getClass: 'data']
+
+        expect:
+        values.every { key, value ->
+            def result = script.toolSetVariable([name: key, value: value])
+            result.success && result.source == 'rule_engine' &&
+                stateMap.ruleVariables.containsKey(key) && script.getVariableValue(key) == value
+        }
+        values.every { key, value ->
+            script.setRuleVariable(key, 'old') == 'old' &&
+                script.setRuleVariable(key, value) == value &&
+                stateMap.ruleVariables.containsKey(key) && script.getVariableValue(key) == value
+        }
+        stateMap.ruleVariables.untouched == 'keep'
+    }
+
+    def "hub_set_variable writes via setGlobalVar and reports source 'hub' on success"() {
+        given:
+        def captured = [:]
+        script.metaClass.setGlobalVar = { String name, Object value ->
+            captured[name] = value
+            return true
+        }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacation_mode', value: true])
+
+        then:
+        captured == [vacation_mode: true]
+        result.success == true
+        result.name == 'vacation_mode'
+        result.value == true
+        result.source == 'hub'
+    }
+
+    def "hub_set_variable falls back to rule engine when setGlobalVar returns false (var not found)"() {
+        given: 'setGlobalVar returns false when the hub var does not exist'
+        script.metaClass.setGlobalVar = { String name, Object value -> false }
+
+        when:
+        def result = script.toolSetVariable([name: 'new_rule_var', value: 42])
+
+        then: 'rule-engine state was updated'
+        stateMap.ruleVariables == [new_rule_var: 42]
+
+        and: 'result reports rule_engine source'
+        result.success == true
+        result.source == 'rule_engine'
+        result.value == 42
+    }
+
+    def "hub_set_variable falls back to rule engine when setGlobalVar throws"() {
+        given:
+        script.metaClass.setGlobalVar = { String name, Object value ->
+            throw new RuntimeException('Hub variable API unavailable')
+        }
+
+        when:
+        def result = script.toolSetVariable([name: 'weather_state', value: 'sunny'])
+
+        then:
+        stateMap.ruleVariables == [weather_state: 'sunny']
+        result.success == true
+        result.value == 'sunny'
+        result.source == 'rule_engine'
+    }
+
+    def "hub_set_variable passes string values through to setGlobalVar unchanged"() {
+        given:
+        def captured = [:]
+        script.metaClass.setGlobalVar = { String name, Object value ->
+            captured[name] = value
+            return true
+        }
+
+        when:
+        def result = script.toolSetVariable([name: 'weather_state', value: 'sunny'])
+
+        then:
+        captured == [weather_state: 'sunny']
+        result.value == 'sunny'
+        result.source == 'hub'
+    }
+
+    // -------- toolSetVariable Hub Mesh sharing --------
+
+    def "hub_set_variable shares a hub variable into the mesh (mesh_shared=true) and confirms via read-back"() {
+        given: 'the name is a hub variable, and the mesh share + read-back succeed'
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            '{"sharedHubVariables":[{"name":"vacationMode","type":"Boolean"}]}'
+        }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', mesh_shared: true])
+
+        then: 'the share endpoint was hit and the read-back confirmed it'
+        hubGet.calls.any { it.key == '/hub2/addVarToMesh/vacationMode' }
+        result.success == true
+        result.meshShared == true
+        result.meshShareConfirmed == true
+        !result.containsKey('value')   // mesh-only path did not touch the value leg
+    }
+
+    def "hub_set_variable unshares a hub variable (mesh_shared=false)"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/removeVarFromMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"sharedHubVariables":[]}' }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', mesh_shared: false])
+
+        then:
+        hubGet.calls.any { it.key == '/hub2/removeVarFromMesh/vacationMode' }
+        result.success == true
+        result.meshShared == false
+        result.meshShareConfirmed == true   // absent from sharedHubVariables == unshared
+
+        and: 'unshare carries the stale-copy / unlink-first caution'
+        result.note != null
+        result.note.contains('unlink the copy on those hubs first')
+        result.note.contains('STALE local copy')
+    }
+
+    def "hub_set_variable share (mesh_shared=true) does NOT carry the unshare caution; unshare does"() {
+        given: 'the mesh read-back reflects the applied state (so both legs confirm rather than fail)'
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        boolean shared = false
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> shared = true; '' }
+        hubGet.register('/hub2/removeVarFromMesh/vacationMode') { params -> shared = false; '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([sharedHubVariables: shared ? [[name: 'vacationMode']] : []])
+        }
+
+        when: 'share'
+        def sharedResult = script.toolSetVariable([name: 'vacationMode', mesh_shared: true])
+
+        then: 'no unshare caution on the share path'
+        sharedResult.meshShareConfirmed == true
+        !(sharedResult.note?.contains('unlink the copy on those hubs first'))
+
+        when: 'unshare (read-back now confirms absent)'
+        def unshared = script.toolSetVariable([name: 'vacationMode', mesh_shared: false])
+
+        then: 'the unshare succeeds and appends the stale-copy caution'
+        unshared.success == true
+        unshared.meshShareConfirmed == true
+        unshared.note.contains('unlink the copy on those hubs first')
+    }
+
+    // Item: a readable sharedHubVariables that DISAGREES with the request is this hub's OWN state, so a
+    // confirmed mismatch is a real FAILURE (not a propagation-lag soft success).
+    def "hub_set_variable share FAILS when the read-back confirms the var is still not shared"() {
+        given: 'the share endpoint returns 200 but the read-back never shows the var shared'
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"sharedHubVariables":[]}' }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', mesh_shared: true])
+
+        then:
+        result.success == false
+        result.isError == true
+        result.meshShareConfirmed == false
+        result.error.contains('did not take')
+        result.note.contains("this hub's own state")
+    }
+
+    def "hub_set_variable unshare FAILS when the read-back confirms the var is still shared"() {
+        given: 'the unshare endpoint returns 200 but the read-back still shows the var shared'
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/removeVarFromMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"sharedHubVariables":[{"name":"vacationMode"}]}' }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', mesh_shared: false])
+
+        then:
+        result.success == false
+        result.isError == true
+        result.meshShareConfirmed == false
+        result.error.contains('did not take')
+    }
+
+    def "hub_set_variable applies BOTH a value write and a mesh share in one call"() {
+        given:
+        def captured = [:]
+        script.metaClass.setGlobalVar = { String n, Object v -> captured[n] = v; return true }
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: false] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"sharedHubVariables":[{"name":"vacationMode"}]}' }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', value: true, mesh_shared: true])
+
+        then:
+        captured == [vacationMode: true]
+        result.success == true
+        result.value == true
+        result.source == 'hub'
+        result.meshShared == true
+        result.meshShareConfirmed == true
+    }
+
+    // Item: value leg falls back to rule_engine when setGlobalVar returns false, WHILE the mesh share is
+    // still processed (the mesh_shared pre-check passed because getGlobalVar sees it as a hub variable).
+    def "hub_set_variable value+mesh: setGlobalVar false falls the value to rule_engine AND still processes the mesh share"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: false] }
+        script.metaClass.setGlobalVar = { String n, Object v -> false }   // hub write does not persist
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"sharedHubVariables":[{"name":"vacationMode"}]}' }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', value: true, mesh_shared: true])
+
+        then: 'value fell back to rule_engine'
+        result.success == true
+        result.source == 'rule_engine'
+        result.value == true
+
+        and: 'the mesh share was still processed and confirmed'
+        result.meshShared == true
+        result.meshShareConfirmed == true
+    }
+
+    // Item: a THROW from getGlobalVar in the mesh_shared pre-check is transient/unknown, NOT proof the
+    // name is not a hub variable -- it must not emit the "is not a hub variable" message.
+    def "hub_set_variable mesh_shared: a getGlobalVar throw surfaces an unable-to-verify message, not 'not a hub variable'"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> throw new RuntimeException('transient lookup error') }
+
+        when:
+        script.toolSetVariable([name: 'vacationMode', mesh_shared: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('Unable to verify')
+        !ex.message.contains('is not a hub variable')
+    }
+
+    def "hub_set_variable rejects mesh_shared on a rule-only variable (validation before any write)"() {
+        given: 'the name is not a hub variable'
+        script.metaClass.getGlobalVar = { String n -> null }
+        def wrote = false
+        script.metaClass.setGlobalVar = { String n, Object v -> wrote = true; false }
+
+        when:
+        script.toolSetVariable([name: 'ruleOnly', mesh_shared: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('mesh_shared applies only to hub variables')
+        !wrote   // rejected before the value/mesh legs
+    }
+
+    def "hub_set_variable requires at least one of value or mesh_shared"() {
+        when:
+        script.toolSetVariable([name: 'vacationMode'])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('Provide value, mesh_shared, or both')
+    }
+
+    def "hub_set_variable rejects a non-boolean mesh_shared"() {
+        when:
+        script.toolSetVariable([name: 'vacationMode', mesh_shared: 'yes'])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('mesh_shared must be a boolean')
+    }
+
+    def "hub_set_variable mesh share returns success with meshShareConfirmed null when the read-back is unreadable (warn-not-fail)"() {
+        given: 'the share endpoint succeeds but hubMeshJson is unreadable'
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> throw new RuntimeException('mesh JSON unreachable') }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', mesh_shared: true])
+
+        then: 'the share leg is not failed just because the read-back could not confirm'
+        result.success == true
+        result.meshShared == true
+        result.meshShareConfirmed == null
+    }
+
+    def "hub_set_variable mesh share reports an UNKNOWN outcome (may-have-applied) when the endpoint throws and the read-back is unreadable"() {
+        given: 'the share endpoint throws AND the read-back cannot confirm either way'
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> throw new RuntimeException('Hub API 500') }
+        hubGet.register('/hub2/hubMeshJson') { params -> throw new RuntimeException('mesh JSON unreachable') }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', mesh_shared: true])
+
+        then: 'a throw is not a definite failure: say it MAY have applied and steer to verification'
+        result.success == false
+        result.isError == true
+        result.meshShareConfirmed == null
+        result.error.contains('errored')
+        result.note.contains('MAY have applied')
+        result.note.contains('hub_get_hub_mesh')
+        !result.note.contains('did not happen')
+    }
+
+    // Item: value commits, then the mesh call throws with an unreadable read-back -> valueApplied still
+    // reflects the committed value and the note is the unknown/verify wording (not "did not happen").
+    def "hub_set_variable value+mesh: value commits then the mesh throw is reported as unknown, not failed-to-happen"() {
+        given:
+        def captured = [:]
+        script.metaClass.setGlobalVar = { String n, Object v -> captured[n] = v; return true }
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: false] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> throw new RuntimeException('read timeout') }
+        hubGet.register('/hub2/hubMeshJson') { params -> throw new RuntimeException('mesh JSON unreachable') }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', value: true, mesh_shared: true])
+
+        then: 'the value leg committed'
+        captured == [vacationMode: true]
+
+        and: 'the mesh throw is UNKNOWN, and valueApplied reflects the committed value'
+        result.success == false
+        result.valueApplied == true
+        result.note.contains('committed')
+        result.note.contains('MAY have applied')
+        !result.note.contains('did not happen')
+    }
+
+    def "hub_set_variable mesh share reports a definite failure when the endpoint throws but the read-back proves it did not apply"() {
+        given: 'the share endpoint throws AND the read-back confirms the var is still not shared'
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> throw new RuntimeException('Hub API 500') }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"sharedHubVariables":[]}' }
+
+        when:
+        def result = script.toolSetVariable([name: 'vacationMode', mesh_shared: true])
+
+        then:
+        result.success == false
+        result.isError == true
+        result.meshShareConfirmed == false
+        result.error.contains('Failed to share')
+        result.note.contains('did not take')
+    }
+
+    @spock.lang.Unroll
+    def "via dispatch: hub_set_variable(mesh_shared) passes args through the Map signature (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        settingsMap.enableWrite = true
+        script.metaClass.getGlobalVar = { String n -> [type: 'Boolean', value: true] }
+        hubGet.register('/hub2/addVarToMesh/vacationMode') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"sharedHubVariables":[{"name":"vacationMode"}]}' }
+
+        when:
+        def response = mcpDriver.callTool('hub_set_variable', [name: 'vacationMode', mesh_shared: true])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.meshShared == true
+
+        where:
+        useGateways << [true, false]
+    }
+
+    // -------- toolDeleteHubVariable --------
+
+    def "hub_delete_variable removes an existing rule_engine variable and reports the previous value"() {
+        given:
+        enableWrite()
+        stateMap.ruleVariables = [scratch_var: 'to-be-removed', keep_me: 42]
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'scratch_var', confirm: true])
+
+        then:
+        result.success == true
+        result.name == 'scratch_var'
+        result.deleted == true
+        result.source == 'rule_engine'
+        result.previousValue == 'to-be-removed'
+
+        and: 'only the targeted variable is gone — siblings preserved'
+        stateMap.ruleVariables == [keep_me: 42]
+    }
+
+    def "hub_delete_variable throws when confirm is not provided"() {
+        given:
+        enableWrite()
+        stateMap.ruleVariables = [scratch_var: 'value']
+
+        when:
+        script.toolDeleteHubVariable([name: 'scratch_var'])
+
+        then:
+        thrown(IllegalArgumentException)
+        // Variable should NOT be deleted when the gate refuses
+        stateMap.ruleVariables == [scratch_var: 'value']
+    }
+
+    def "hub_delete_variable throws when no recent backup exists (requireDestructiveConfirm 24h gate)"() {
+        given: 'the Write master is on but no lastBackupTimestamp seeded'
+        settingsMap.enableWrite = true
+        stateMap.ruleVariables = [scratch_var: 'value']
+
+        when:
+        script.toolDeleteHubVariable([name: 'scratch_var', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('BACKUP REQUIRED')
+        stateMap.ruleVariables == [scratch_var: 'value']
+    }
+
+    def "hub_delete_variable throws when Write tools are disabled"() {
+        given:
+        settingsMap.enableWrite = false  // central Write master gate refuses on dispatch
+        stateMap.ruleVariables = [scratch_var: 'value']
+
+        when:
+        script.executeTool('hub_delete_variable', [name: 'scratch_var', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('Write tools are disabled')
+        stateMap.ruleVariables == [scratch_var: 'value']
+    }
+
+    def "hub_delete_variable throws when name is missing"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolDeleteHubVariable([confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('name is required')
+    }
+
+    def "hub_delete_variable throws when variable exists in neither hub nor rule_engine namespace"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> null }
+        stateMap.ruleVariables = [:]
+
+        when:
+        script.toolDeleteHubVariable([name: 'nonexistent', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains("'nonexistent'")
+        ex.message.contains('hub-variables namespace')
+        ex.message.contains('rule_engine namespace')
+    }
+
+    def "hub_delete_variable throws when ruleVariables map is null and var is not a hub var"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> null }
+        // stateMap.ruleVariables not seeded at all — null check path
+
+        when:
+        script.toolDeleteHubVariable([name: 'never_set', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains("'never_set'")
+    }
+
+    def "hub_delete_variable replaces state.ruleVariables with a filtered copy preserving siblings"() {
+        // Pin the filtered-copy implementation; map identity does not establish
+        // whether Hubitat persists state at the end of an execution.
+        given:
+        enableWrite()
+        stateMap.ruleVariables = [target_var: 'will-go', sibling: 'stays']
+        def originalMapRef = stateMap.ruleVariables
+
+        when:
+        script.toolDeleteHubVariable([name: 'target_var', confirm: true])
+
+        then: 'sibling is preserved'
+        stateMap.ruleVariables == [sibling: 'stays']
+
+        and: 'state.ruleVariables points to the filtered replacement map'
+        !stateMap.ruleVariables.is(originalMapRef)
+    }
+
+    // -------- Reference-scan safety (hub_delete_variable refuses to silently break consumers) --------
+
+    def "hub_delete_variable refuses when a child rule app references the variable (no force)"() {
+        // A child rule's serialized triggers/conditions/actions contains the variable
+        // name. Without force=true, deletion would null-out the consumer's lookup and
+        // silently break the rule. The tool must surface the breakage and require opt-in.
+        given:
+        enableWrite()
+        stateMap.ruleVariables = [shared_var: 'in-use']
+
+        and: 'a child rule that references shared_var in a condition'
+        def consumer = new support.TestChildApp(id: 99L, label: 'Rule Using Shared Var')
+        consumer.ruleData = [
+            triggers: [],
+            conditions: [[type: 'variable', name: 'shared_var', operator: '=', value: 'on']],
+            actions: []
+        ]
+        childAppsList << consumer
+
+        when:
+        script.toolDeleteHubVariable([name: 'shared_var', confirm: true])
+
+        then: 'refused with consumer details so the caller knows what would break'
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains("'shared_var'")
+        // Count-aware singular/plural: 1 consumer renders as "1 rule" (no parenthetical).
+        ex.message.contains('1 rule:')
+        ex.message.contains('Rule Using Shared Var')
+        ex.message.contains('id=99')
+        ex.message.contains('force=true')
+
+        and: 'the variable is still present — refusal must not partially mutate state'
+        stateMap.ruleVariables == [shared_var: 'in-use']
+    }
+
+    // W-spec-hub_delete_variable-plural: the singular spec above only pins "1 rule:"; the
+    // count-aware ternary must also be exercised on the plural side or a regression
+    // that drops the discrimination (always emits "rule:") would pass on 1 consumer
+    // and silently break the 2+ case.
+    // Both-ways pending (orchestrator).
+    def "hub_delete_variable refuses when 2 child rule apps reference the variable (plural)"() {
+        given:
+        enableWrite()
+        stateMap.ruleVariables = [shared_var: 'in-use']
+
+        and: 'two child rules each referencing shared_var'
+        def c1 = new support.TestChildApp(id: 101L, label: 'Rule One')
+        c1.ruleData = [
+            triggers: [],
+            conditions: [[type: 'variable', name: 'shared_var', operator: '=', value: 'on']],
+            actions: []
+        ]
+        def c2 = new support.TestChildApp(id: 102L, label: 'Rule Two')
+        c2.ruleData = [
+            triggers: [[type: 'variable_change', variable: 'shared_var']],
+            conditions: [],
+            actions: []
+        ]
+        childAppsList << c1
+        childAppsList << c2
+
+        when:
+        script.toolDeleteHubVariable([name: 'shared_var', confirm: true])
+
+        then: 'refused with the plural form ("2 rules:") and both consumer IDs surfaced'
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains("'shared_var'")
+        ex.message.contains('2 rules:')
+        !ex.message.contains('2 rule:')
+        ex.message.contains('id=101')
+        ex.message.contains('id=102')
+        // And the count-aware "those rules" phrase on the breakage hint too.
+        ex.message.contains('those rules')
+    }
+
+    def "hub_delete_variable proceeds with force=true and reports brokenConsumers"() {
+        given:
+        enableWrite()
+        stateMap.ruleVariables = [shared_var: 'in-use']
+        def consumer = new support.TestChildApp(id: 42L, label: 'Acknowledged Breakage')
+        consumer.ruleData = [
+            triggers: [[type: 'variable_change', variable: 'shared_var']],
+            conditions: [],
+            actions: []
+        ]
+        childAppsList << consumer
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'shared_var', confirm: true, force: true])
+
+        then: 'deletion proceeds'
+        result.success == true
+        result.deleted == true
+        stateMap.ruleVariables == [:]
+
+        and: 'response surfaces the consumers that are now broken'
+        result.brokenConsumers?.size() == 1
+        result.brokenConsumers[0].id == 42L
+        result.brokenConsumers[0].label == 'Acknowledged Breakage'
+    }
+
+    def "hub_delete_variable proceeds normally when no child rules reference the variable"() {
+        given: 'a child rule that does NOT mention the variable being deleted'
+        enableWrite()
+        stateMap.ruleVariables = [orphan_var: 'safe-to-delete']
+        def unrelated = new support.TestChildApp(id: 7L, label: 'Unrelated Rule')
+        unrelated.ruleData = [
+            triggers: [[type: 'device_event', deviceId: '1', attribute: 'switch']],
+            conditions: [],
+            actions: []
+        ]
+        childAppsList << unrelated
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'orphan_var', confirm: true])
+
+        then: 'no force needed, no consumers reported'
+        result.success == true
+        result.deleted == true
+        result.brokenConsumers == null
+    }
+
+    // -------- toolCreateVariable validation (issue #92) --------
+
+    def "hub_create_variable rejects forbidden characters in name"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolCreateVariable([name: 'has[brackets]', type: 'String', value: 'x', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('forbidden character')
+    }
+
+    def "hub_create_variable with present-but-null mesh keys takes the create path, not the link form"() {
+        given: 'null mesh keys alongside a normal single create -- must NOT divert to link nor throw "not both"'
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> null }   // not an existing var
+
+        when: 'the create path may fail downstream in the (unstubbed) wizard -- fine; the assertion is which branch it chose'
+        def ex = null
+        try {
+            script.toolCreateVariable([name: 'vacationMode', type: 'String', value: 'off',
+                mesh_source_hub_id: null, mesh_source_name: null, confirm: true])
+        } catch (Exception e) { ex = e }
+
+        then: 'it chose the normal create path: no link GET, and no mutually-exclusive "not both" rejection'
+        !hubGet.calls.any { it.key?.toString()?.startsWith('/hub2/createLinkedHubVar/') }
+        !(ex instanceof IllegalArgumentException && ex.message?.toLowerCase()?.contains('not both'))
+        // Positive proof it proceeded PAST the link-vs-create gate into the real create path: it threw
+        // downstream on an unstubbed hub call (the create wizard was deliberately not mocked), rather
+        // than returning at the gate or diverting to the link GET.
+        ex != null
+    }
+
+    def "hub_create_variable rejects unknown type"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolCreateVariable([name: 'goodName', type: 'NotAType', value: 'x', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('NotAType')
+        ex.message.contains('Number, Decimal, String, Boolean, DateTime')
+    }
+
+    def "hub_create_variable rejects null/missing initial value"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolCreateVariable([name: 'goodName', type: 'String', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('Initial value is required')
+    }
+
+    def "hub_create_variable rejects an empty-string value for a String variable"() {
+        // A String variable created with an empty value reports success but never
+        // persists (getGlobalVar stays null -- deterministic). Reject up front.
+        given:
+        enableWrite()
+
+        when:
+        script.toolCreateVariable([name: 'emptyStr', type: 'String', value: '', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('non-empty initial value')
+    }
+
+    def "hub_create_variable refuses to overwrite an existing hub variable"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n ->
+            n == 'taken' ? [name: 'taken', type: 'String', value: 'already here', deviceId: null, attribute: null] : null
+        }
+
+        when:
+        script.toolCreateVariable([name: 'taken', type: 'String', value: 'new', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains("already exists")
+        ex.message.contains('set_variable')
+    }
+
+    def "hub_create_variable requires confirm"() {
+        when:
+        script.toolCreateVariable([name: 'goodName', type: 'String', value: 'x'])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    // -------- toolCreateConnector / toolRemoveConnector validation --------
+
+    def "hub_create_connector throws when the variable does not exist"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> null }
+
+        when:
+        script.toolCreateConnector([name: 'missing', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('does not exist')
+    }
+
+    def "hub_create_connector is a no-op when a connector already exists"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n ->
+            [name: 'has_conn', type: 'Boolean', value: true, deviceId: 305, attribute: 'switch']
+        }
+
+        when:
+        def result = script.toolCreateConnector([name: 'has_conn', confirm: true])
+
+        then:
+        result.success == true
+        result.alreadyExists == true
+        result.deviceId == 305
+    }
+
+    def "hub_delete_connector throws when the variable does not exist"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> null }
+
+        when:
+        script.toolRemoveConnector([name: 'missing', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('does not exist')
+    }
+
+    def "hub_delete_connector removes the connector device and the verify loop confirms the cleared linkage"() {
+        given: 'a variable WITH a connector; post-delete reads see the linkage cleared'
+        enableWrite()
+        int reads = 0
+        script.metaClass.getGlobalVar = { String n ->
+            reads++
+            reads == 1 ? [name: 'with_conn', type: 'String', value: 'x', deviceId: 305, attribute: 'variable']
+                       : [name: 'with_conn', type: 'String', value: 'x', deviceId: null, attribute: null]
+        }
+        def deleted = []
+        script.metaClass.toolDeleteDevice = { a -> deleted << a.deviceId; [success: true] }
+
+        when:
+        def result = script.toolRemoveConnector([name: 'with_conn', confirm: true])
+
+        then: 'the connector device was deleted and the check-first verify saw deviceId cleared'
+        deleted == ['305']
+        result.success == true
+        result.alreadyRemoved == null
+    }
+
+    def "hub_delete_connector is a no-op when no connector exists"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n ->
+            [name: 'no_conn', type: 'String', value: 'x', deviceId: null, attribute: null]
+        }
+
+        when:
+        def result = script.toolRemoveConnector([name: 'no_conn', confirm: true])
+
+        then:
+        result.success == true
+        result.alreadyRemoved == true
+    }
+
+    // -------- Wizard-sequencing coverage (issue #92) --------
+    //
+    // The create/delete/connector tools drive the system Hub Variables app's UI
+    // by chaining `_rmClickAppButton` and `_rmWriteSettingOnPage` calls. Both
+    // are app-defined private methods (class 1 on the dispatch cheat sheet —
+    // not declared on AppExecutor / BaseExecutor / HubitatAppScript), so per-
+    // instance `script.metaClass` overrides win the dispatch and we can record
+    // the call args without hitting the network. `_findHubVariablesAppId` is
+    // also stubbed so we don't need to fake the /hub2/appsList tree.
+    //
+    // `getGlobalVar` is dynamic (also class 1) and we use a counter so the
+    // *first* call in each tool (the pre-flight existence check) sees one
+    // state of the world, and the *post-wizard verification* call sees the
+    // post-write state — this is what the production code expects when the
+    // wizard auto-commits on the final setting write / button click.
+
+    def "hub_create_variable wizard sequence: one button click then three settings in order"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar: null pre-flight, populated after wizard commits'
+        def callCount = 0
+        script.metaClass.getGlobalVar = { String n ->
+            callCount++
+            return callCount == 1 ? null : [name: 'newVar', type: 'String', value: 'hi', deviceId: null, attribute: null]
+        }
+
+        and: 'wizard primitives recorded instead of hitting the hub'
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << [appId: appId, btn: btnName, stateAttr: stateAttr, pageName: pageName]
+            return [status: 200]
+        }
+        def settingWrites = []
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            settingWrites << [appId: appId, pageName: pageName, key: key, value: value, typeHint: typeHint]
+            if (applied != null) applied << key
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        // backupItemSource is called as a wizard-priming side effect on this firmware (see
+        // toolDeleteHubVariable / toolCreateConnector comments in hubitat-mcp-server.groovy).
+        // Stub to no-op so it doesn't try to fetch /app/ajax/code in tests.
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when:
+        def result = script.toolCreateVariable([name: 'newVar', type: 'String', value: 'hi', confirm: true])
+
+        then: 'exactly one button click — opens the create form on the hubVar page'
+        buttonClicks.size() == 1
+        buttonClicks[0] == [appId: 1424, btn: 'moreVar', stateAttr: 'moreVar', pageName: 'hubVar']
+
+        and: 'three setting writes in order: name, type, value'
+        settingWrites.size() == 3
+        settingWrites[0] == [appId: 1424, pageName: 'hubVar', key: 'hbVar',    value: 'newVar', typeHint: 'text']
+        settingWrites[1] == [appId: 1424, pageName: 'hubVar', key: 'varType',  value: 'String', typeHint: 'enum']
+        settingWrites[2] == [appId: 1424, pageName: 'hubVar', key: 'varValue', value: 'hi',     typeHint: 'textarea']
+
+        and: 'tool reports success with hub source'
+        result.success == true
+        result.source == 'hub'
+        result.name == 'newVar'
+        result.type == 'String'
+        result.value == 'hi'
+    }
+
+    // Live: Hub Variables clicks land asynchronously, and the date/time POST sometimes commits by
+    // itself and sometimes waits for the form's Done button.
+    private Map stubDateTimeCreate(Map opts) {
+        def rec = [clicks: [], posts: [], sets: [], stored: opts.committedValue, getCalls: 0]
+        script.metaClass.getGlobalVar = { String n ->
+            rec.getCalls++
+            if (rec.getCalls == 1) return null   // pre-flight: the name is free
+            return rec.stored == null ? null : [name: n, type: 'DateTime', value: rec.stored]
+        }
+        script.metaClass.setGlobalVar = { String n, v -> rec.sets << v; if (opts.setterWorks != false) rec.stored = v; true }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            rec.clicks << btnName
+            if (btnName == 'dateTimeDone' && opts.doneCommits) rec.stored = opts.doneCommits
+            return [status: 200]
+        }
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            if (applied != null) applied << key
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarsFormFields = { Integer appId ->
+            if (opts.formNeverOpens) return ['filter'] as Set
+            if (rec.clicks == ['moreVar'] && !rec.posts) return ['hbVar', 'cancelGV'] as Set
+            if (rec.posts && opts.waitsForDone && !rec.clicks.contains('dateTimeDone')) return ['hbVar', 'varDate', 'varTime', 'dateTimeDone'] as Set
+            return ['filter'] as Set
+        }
+        script.metaClass.hubInternalGet = { String path, Map query = null, Integer timeout = 30 ->
+            groovy.json.JsonOutput.toJson([app: [id: 1424, version: 7], configPage: [sections: [[input: [
+                [name: 'varDate', type: 'date'], [name: 'varTime', type: 'time']]]]]])
+        }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            rec.posts << body
+            if (opts.postCommits) rec.stored = opts.postCommits
+            return [status: 200]
+        }
+        return rec
+    }
+
+    def "hub_create_variable DateTime sends date and time in one POST and needs no Done when that commits"() {
+        given:
+        enableWrite()
+        def rec = stubDateTimeCreate(postCommits: '2026-01-01T12:30:00.000-0500')
+
+        when:
+        def result = script.toolCreateVariable([name: 'dtVar', type: 'DateTime', value: '2026-01-01T12:30:00.000-0500', confirm: true])
+
+        then:
+        rec.clicks == ['moreVar']
+        rec.posts.size() == 1
+        rec.posts[0]['settings[varDate]'] == '2026-01-01'
+        rec.posts[0]['settings[varTime]'] == '12:30'
+        rec.sets.isEmpty()
+        result.success == true
+        result.value == '2026-01-01T12:30:00.000-0500'
+    }
+
+    def "hub_create_variable DateTime clicks Done when the form waits for it"() {
+        given:
+        enableWrite()
+        def rec = stubDateTimeCreate(waitsForDone: true, doneCommits: '2026-01-01T12:30:00.000-0500')
+
+        when:
+        def result = script.toolCreateVariable([name: 'dtVar', type: 'DateTime', value: '2026-01-01 12:30', confirm: true])
+
+        then:
+        rec.clicks == ['moreVar', 'dateTimeDone']
+        rec.sets.isEmpty()
+        result.success == true
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable DateTime sets the full hub-local value when the commit dropped the time (#input)"() {
+        given:
+        enableWrite()
+        def rec = stubDateTimeCreate(postCommits: '2026-01-01T99:99:99.999-9999')
+
+        when:
+        def result = script.toolCreateVariable([name: 'dtVar', type: 'DateTime', value: input, confirm: true])
+
+        then:
+        rec.sets.size() == 1
+        rec.sets[0] ==~ /2026-01-01T12:30:00\.000[+-]\d{4}/
+        result.value == rec.sets[0]
+
+        where:
+        input << ['2026-01-01T12:30', [date: '2026-01-01', time: '12:30']]
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable DateTime refuses invalid date or time #input before the wizard opens"() {
+        given:
+        enableWrite()
+        def rec = stubDateTimeCreate([:])
+
+        when:
+        script.toolCreateVariable([name: 'dtVar', type: 'DateTime', value: input, confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('requires a valid date and time')
+        rec.clicks.isEmpty()
+        rec.posts.isEmpty()
+        rec.sets.isEmpty()
+
+        where:
+        input << ['2026-13-45T12:30', '2026-01-01T12:30garbage', '2026-01-01T12:30:99',
+                  '2026-01-01T24:30', '2026-01-01T12:60', '2026-01-01T12:30:00+25:00',
+                  '2026-01-01T12:30:00.123Zjunk', [date: '2026-01-01', time: '12:30garbage']]
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable DateTime correction uses hub zone #zoneId for #input"() {
+        given:
+        enableWrite()
+        sharedLocation.timeZone = TimeZone.getTimeZone(zoneId)
+        def originalZone = TimeZone.default
+        TimeZone.setDefault(TimeZone.getTimeZone('UTC'))
+        def rec = stubDateTimeCreate(postCommits: '2026-01-01T99:99:99.999-9999')
+
+        when:
+        def result = script.toolCreateVariable([name: 'dtVar', type: 'DateTime', value: input, confirm: true])
+
+        then:
+        result.success == true
+        rec.sets == [expected]
+        result.value == expected
+
+        cleanup:
+        TimeZone.setDefault(originalZone)
+
+        where:
+        zoneId             | input                                  | expected
+        'America/New_York' | '2026-01-01T12:30:45.123Z'              | '2026-01-01T12:30:00.000-0500'
+        'America/New_York' | '2026-07-04 18:05:00+02:00'            | '2026-07-04T18:05:00.000-0400'
+        'Asia/Kathmandu'   | [date: '2026-01-01', time: '12:30']     | '2026-01-01T12:30:00.000+0545'
+        'America/New_York' | '2026-01-01T12:30:00-0500'             | '2026-01-01T12:30:00.000-0500'
+    }
+
+    def "hub_create_variable DateTime reports a created variable whose time could not be set"() {
+        given:
+        enableWrite()
+        stubDateTimeCreate(postCommits: '2026-01-01T99:99:99.999-9999', setterWorks: false)
+
+        when:
+        script.toolCreateVariable([name: 'dtVar', type: 'DateTime', value: '2026-01-01T12:30', confirm: true])
+
+        then:
+        def ex = thrown(IllegalStateException)
+        ex.message.contains("'dtVar' was created, but its time could not be set")
+    }
+
+    def "hub_create_variable stops when the create form never opens"() {
+        given:
+        enableWrite()
+        def rec = stubDateTimeCreate(formNeverOpens: true)
+        script.metaClass._primeHubVarsWizard = { Integer appId, String context -> }
+
+        when:
+        script.toolCreateVariable([name: 'dtVar', type: 'DateTime', value: '2026-01-01T12:30', confirm: true])
+
+        then:
+        def ex = thrown(IllegalStateException)
+        ex.message.contains('create form did not open')
+        rec.clicks == ['moreVar', 'moreVar']
+        rec.posts.isEmpty()
+    }
+
+    def "hub_create_variable post-wizard verification fails when getGlobalVar still returns null"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar returns null both pre-flight AND after the wizard supposedly committed'
+        script.metaClass.getGlobalVar = { String n -> null }
+
+        and: 'wizard primitives recorded but no real effect'
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            if (applied != null) applied << key
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when:
+        script.toolCreateVariable([name: 'ghostVar', type: 'String', value: 'x', confirm: true])
+
+        then: 'IllegalStateException — wizard ran but the var is not visible'
+        def ex = thrown(IllegalStateException)
+        ex.message.contains('wizard completed but')
+        ex.message.contains('ghostVar')
+    }
+
+    def "hub_create_variable bulk form creates every item and reports per-item success"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar echoes the requested name so each item round-trips its OWN name/type/value (not item-0 for all)'
+        def seen = [:]
+        def postWrite = [:]   // populated by the varValue write, keyed by name
+        script.metaClass.getGlobalVar = { String n ->
+            // First lookup per name = pre-flight (null); subsequent = post-write.
+            if (!seen[n]) { seen[n] = true; return null }
+            return [name: n, type: postWrite[n]?.type ?: 'Number', value: postWrite[n]?.value, deviceId: null, attribute: null]
+        }
+
+        and: 'wizard primitives recorded -- capture the per-item name/type/value the wizard actually wrote'
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << [appId: appId, btn: btnName]
+            return [status: 200]
+        }
+        def pending = [:]
+        def settingWrites = []
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            settingWrites << [key: key, value: value]
+            // hbVar -> varType -> varValue write order per item; stash so the post-write
+            // getGlobalVar can echo the value that THIS item just wrote.
+            if (key == 'hbVar')   pending.name  = value
+            if (key == 'varType') pending.type  = value
+            if (key == 'varValue') { postWrite[pending.name] = [type: pending.type, value: value]; pending.clear() }
+            if (applied != null) applied << key
+        }
+        def appIdLookups = 0
+        script.metaClass._findHubVariablesAppId = { -> appIdLookups++; 1424 }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when:
+        def result = script.toolCreateVariable([confirm: true, variables: [
+            [name: 'bulkA', type: 'Number', value: 1],
+            [name: 'bulkB', type: 'String', value: 'two']
+        ]])
+
+        then: 'overall success with both items created'
+        result.success == true
+        result.createdCount == 2
+        result.failedCount == 0
+        result.results.size() == 2
+
+        and: 'each result carries ITS OWN name/type/value -- a regression that wrote item-0 for every entry would fail here'
+        result.results[0].name == 'bulkA'
+        result.results[0].success == true
+        result.results[0].type == 'Number'
+        result.results[0].value == 1
+        result.results[1].name == 'bulkB'
+        result.results[1].success == true
+        result.results[1].type == 'String'
+        result.results[1].value == 'two'
+
+        and: 'and the wizard received each item distinct name/type/value (not item-0 twice)'
+        settingWrites.findAll { it.key == 'hbVar' }*.value == ['bulkA', 'bulkB']
+        settingWrites.findAll { it.key == 'varType' }*.value == ['Number', 'String']
+        settingWrites.findAll { it.key == 'varValue' }*.value == [1, 'two']
+
+        and: 'the Hub Variables app id was resolved ONCE and reused across the batch'
+        appIdLookups == 1
+    }
+
+    def "hub_create_variable bulk form: one bad item fails while the others still create"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar: null pre-flight, populated after commit (good names only)'
+        def seen = [:]
+        script.metaClass.getGlobalVar = { String n ->
+            if (!seen[n]) { seen[n] = true; return null }
+            return [name: n, type: 'Number', value: 1, deviceId: null, attribute: null]
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            if (applied != null) applied << key
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when: 'the middle item has a forbidden character in its name'
+        def result = script.toolCreateVariable([confirm: true, variables: [
+            [name: 'goodOne', type: 'Number', value: 1],
+            [name: 'bad[name]', type: 'Number', value: 2],
+            [name: 'goodTwo', type: 'Number', value: 3]
+        ]])
+
+        then: 'overall failure, but the two good items still created'
+        result.success == false
+        result.createdCount == 2
+        result.failedCount == 1
+        result.results.size() == 3
+        result.results[0].success == true
+        result.results[1].name == 'bad[name]'
+        result.results[1].success == false
+        result.results[1].error.contains('forbidden character')
+        result.results[2].success == true
+    }
+
+    def "hub_create_variable bulk form: a non-Map item fails only itself while the others still create"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar: null pre-flight, populated after commit (good names only)'
+        def seen = [:]
+        script.metaClass.getGlobalVar = { String n ->
+            if (!seen[n]) { seen[n] = true; return null }
+            return [name: n, type: 'Number', value: 1, deviceId: null, attribute: null]
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            if (applied != null) applied << key
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when: 'the middle item is a bare integer, not a {name,type,value} object'
+        def result = script.toolCreateVariable([confirm: true, variables: [
+            [name: 'goodOne', type: 'Number', value: 1],
+            42,
+            [name: 'goodTwo', type: 'Number', value: 3]
+        ]])
+
+        then: 'the malformed item is isolated to its own entry -- both good items still create (a top-level throw would have lost them)'
+        result.success == false
+        result.createdCount == 2
+        result.failedCount == 1
+        result.results.size() == 3
+        result.results[0].name == 'goodOne'
+        result.results[0].success == true
+        result.results[1].success == false
+        result.results[1].name == 'variables[1]'
+        result.results[1].error.contains('must be an object')
+        result.results[2].name == 'goodTwo'
+        result.results[2].success == true
+    }
+
+    def "hub_create_variable bulk form: an empty variables array is a batch-level rejection"() {
+        given:
+        enableWrite()
+
+        when: 'variables is present but empty -- nothing to create'
+        script.toolCreateVariable([confirm: true, variables: []])
+
+        then: 'rejected at the batch level (a non-empty List is a genuine precondition, not a per-item failure)'
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('non-empty')
+    }
+
+    def "hub_create_variable bulk form: a per-item verify timeout is isolated, others still create"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar drives the REAL _createOneVariable verify-backoff: null pre-flight for all, then visible for the good names AFTER their wizard but null PERSISTENTLY for timesOut (the verify-backoff exhausts and throws for that one item only)'
+        // Models the genuine mid-wizard runtime failure (verify timeout) that validation
+        // never catches -- exercising the REAL _createOneVariable, not a private-method
+        // stub (a private call dispatches in-class and bypasses a metaClass override).
+        def committed = [:]   // name -> visible, flipped on this item's varValue write
+        script.metaClass.getGlobalVar = { String n ->
+            // timesOut never becomes visible; the others appear once their wizard committed.
+            if (n == 'timesOut') return null
+            return committed[n] ? [name: n, type: 'Number', value: 1, deviceId: null, attribute: null] : null
+        }
+
+        and: 'wizard primitives stubbed; the varValue write marks the (good) item visible to the verify-read'
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        def pendingName = null
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            if (key == 'hbVar') pendingName = value
+            if (key == 'varValue' && pendingName != 'timesOut') committed[pendingName] = true
+            if (applied != null) applied << key
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+        // Keep the verify-backoff loop instant (real code sleeps 500ms/attempt).
+        script.metaClass.pauseExecution = { long ms -> }
+
+        when: 'three valid-shaped items but the middle one never becomes visible (wizard runtime failure, not validation)'
+        def result = script.toolCreateVariable([confirm: true, variables: [
+            [name: 'createsA', type: 'Number', value: 1],
+            [name: 'timesOut', type: 'Number', value: 2],
+            [name: 'createsB', type: 'Number', value: 3]
+        ]])
+
+        then: 'the verify timeout is isolated to its own entry -- the other two still create'
+        result.success == false
+        result.createdCount == 2
+        result.failedCount == 1
+        result.results.size() == 3
+        result.results[0].name == 'createsA'
+        result.results[0].success == true
+        result.results[1].name == 'timesOut'
+        result.results[1].success == false
+        result.results[1].error.contains('not visible via getGlobalVar')
+        result.results[2].name == 'createsB'
+        result.results[2].success == true
+    }
+
+    def "hub_create_variable rejects supplying both the single form and the bulk array"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolCreateVariable([name: 'single', type: 'Number', value: 1, confirm: true,
+                                   variables: [[name: 'bulk', type: 'Number', value: 2]]])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('not both')
+    }
+
+    // -------- toolCreateVariable Hub Mesh linking --------
+
+    def "hub_create_variable links a mesh variable and confirms via the localLinkedHubVariables read-back"() {
+        given:
+        enableWrite()
+        def linked = []
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> linked << 'porchTemp'; '' }
+        // Real localLinkedHubVariables rows carry a DECORATED display name plus the bare sourceVarName
+        // and sourceHubId; the read-back must match the latter two, not `name`.
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([localLinkedHubVariables: linked.collect {
+                [name: "${it} on Peer", sourceVarName: it, sourceHubId: 'HUB-A', type: 'string'] }])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then: 'name is the DECORATED local name (feed-able to hub_get/delete_variable); the bare source name is sourceName'
+        hubGet.calls.any { it.key == '/hub2/createLinkedHubVar/HUB-A/porchTemp' }
+        result.success == true
+        result.name == 'porchTemp on Peer'
+        result.sourceName == 'porchTemp'
+        result.sourceHubId == 'HUB-A'
+        result.linked == true
+        result.warnings == null
+    }
+
+    def "hub_create_variable mesh link passes the name segment LITERALLY (not pre-encoded -- the platform layer encodes the path)"() {
+        given: 'a non-ASCII name, a FRESH link (offered before, mirror appears after): the path segment reaches the HTTP layer literal, since pre-encoding double-encodes'
+        enableWrite()
+        def done = false
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/café') { params -> done = true; '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            done ? '{"localLinkedHubVariables":[{"name":"café on Peer","sourceVarName":"café","sourceHubId":"HUB-A"}],"availableLinkedHubVariables":[]}'
+                 : '{"localLinkedHubVariables":[],"availableLinkedHubVariables":[{"hubId":"HUB-A","name":"café","linkedLocally":false}]}'
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'café', confirm: true])
+
+        then:
+        hubGet.calls.any { it.key == '/hub2/createLinkedHubVar/HUB-A/café' }
+        result.success == true
+    }
+
+    // Item: linking an already-linked source must NOT issue a fresh GET nor claim a fresh success --
+    // it returns alreadyLinked:true with the existing local mirror name resolved.
+    def "hub_create_variable mesh link short-circuits with alreadyLinked when the source is already linked (no GET)"() {
+        given: 'the available row is already flagged linkedLocally:true and a local mirror exists'
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                availableLinkedHubVariables: [[hubId: 'HUB-A', name: 'porchTemp', hubName: 'Peer', linkedLocally: true]],
+                localLinkedHubVariables: [[name: 'porchTemp on Peer', sourceVarName: 'porchTemp', sourceHubId: 'HUB-A']]
+            ])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then: 'reports already linked, resolves the decorated mirror name, and never re-issues the link GET'
+        result.success == true
+        result.alreadyLinked == true
+        result.name == 'porchTemp on Peer'
+        result.sourceName == 'porchTemp'
+        result.linked == true
+        !hubGet.calls.any { it.key == '/hub2/createLinkedHubVar/HUB-A/porchTemp' }
+    }
+
+    def "hub_create_variable mesh link reports alreadyLinked (not 'not offered') when the source left availableLinkedHubVariables but a local mirror exists"() {
+        given: 'a linked source LEAVES availableLinkedHubVariables; the local mirror is the only evidence'
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                availableLinkedHubVariables: [],
+                localLinkedHubVariables: [[name: 'porchTemp on Peer', sourceVarName: 'porchTemp', sourceHubId: 'HUB-A']]
+            ])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then: 'recognized as already linked via the local mirror, not rejected as unoffered; no fresh GET'
+        result.success == true
+        result.alreadyLinked == true
+        result.name == 'porchTemp on Peer'
+        result.sourceName == 'porchTemp'
+        !hubGet.calls.any { it.key == '/hub2/createLinkedHubVar/HUB-A/porchTemp' }
+    }
+
+    def "hub_create_variable mesh link alreadyLinked warns when the local mirror name cannot be resolved"() {
+        given: 'the available row shows linkedLocally:true but no local row surfaces'
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                availableLinkedHubVariables: [[hubId: 'HUB-A', name: 'porchTemp', hubName: 'Peer', linkedLocally: true]],
+                localLinkedHubVariables: []
+            ])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then:
+        result.success == true
+        result.alreadyLinked == true
+        result.name == 'porchTemp'
+        result.warnings != null
+        !hubGet.calls.any { it.key == '/hub2/createLinkedHubVar/HUB-A/porchTemp' }
+    }
+
+    // Outcome 1 (linked) via the availableLinkedHubVariables row flag, even when the name has not yet
+    // surfaced in localLinkedHubVariables.
+    def "hub_create_variable mesh link confirms via the availableLinkedHubVariables linkedLocally flag (outcome: linked)"() {
+        given:
+        enableWrite()
+        def done = false
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> done = true; '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                localLinkedHubVariables: [],
+                availableLinkedHubVariables: [[hubId: 'HUB-A', name: 'porchTemp', hubName: 'Peer', linkedLocally: done]]
+            ])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then: 'linked via the linkedLocally flag, but no local row resolved -> name falls back to the source name WITH a caution that it may not identify the mirror'
+        result.success == true
+        result.name == 'porchTemp'
+        result.sourceName == 'porchTemp'
+        result.sourceHubId == 'HUB-A'
+        result.linked == true
+        result.warnings != null
+        result.warnings.any { it.toLowerCase().contains('mirror name') }
+    }
+
+    def "hub_create_variable mesh link warns when the source row disappears but no local mirror resolves"() {
+        given: 'the source is offered pre-call, then leaves availableLinkedHubVariables after the link, with no local row surfacing'
+        enableWrite()
+        def done = false
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> done = true; '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                localLinkedHubVariables: [],
+                availableLinkedHubVariables: done ? [] : [[hubId: 'HUB-A', name: 'porchTemp', hubName: 'Peer', linkedLocally: false]]
+            ])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then: 'row-disappeared (offered pre-call) proves the link, but the bare source name comes back with a mirror-name caution'
+        result.success == true
+        result.linked == true
+        result.name == 'porchTemp'
+        result.sourceName == 'porchTemp'
+        result.warnings != null
+        result.warnings.any { it.toLowerCase().contains('mirror name') }
+    }
+
+    // Outcome 2 (silent no-op): 200 from the GET but the source stays in availableLinkedHubVariables
+    // with linkedLocally:false and the name never surfaces locally -> FAILURE, not a warning.
+    def "hub_create_variable mesh link FAILS on a silent no-op (source stays unlinked)"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                localLinkedHubVariables: [],
+                availableLinkedHubVariables: [[hubId: 'HUB-A', name: 'porchTemp', hubName: 'Peer', linkedLocally: false]]
+            ])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then:
+        result.success == false
+        result.isError == true
+        result.error.contains('did not take')
+        and: 'the note leads with the transient re-establish/retry guidance, with the peer-token store as the persistent-cause fallback'
+        result.note.toLowerCase().contains('retry')
+        result.note.toLowerCase().contains('re-establish')
+        result.note.contains('mesh token')
+        result.note.contains('hub_update_hub_mesh(peer_hub_id, peer_token)')
+    }
+
+    // Outcome 3 (unresolvable): the link GET is accepted but the mesh list is unreadable -- we can
+    // prove neither linked nor not-linked -> warn, don't fail.
+    def "hub_create_variable mesh link warns (not fails) when the mesh list is unreadable"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> throw new RuntimeException('mesh JSON unreachable') }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then:
+        result.success == true
+        result.warnings != null
+        result.warnings.any { it.contains('could not confirm') }
+    }
+
+    // A throw with an unreadable read-back is an UNKNOWN outcome, not a definite failure: it MAY have
+    // applied, so the note steers to verification rather than claiming it did not happen.
+    def "hub_create_variable mesh link reports an unknown (may-have-applied) outcome when the GET throws and the mesh list is unreadable"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> throw new RuntimeException('Hub API 500') }
+        hubGet.register('/hub2/hubMeshJson') { params -> throw new RuntimeException('mesh JSON unreachable') }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then:
+        result.success == false
+        result.isError == true
+        result.error.contains('linking the shared variable')
+        result.note.contains('MAY have applied')
+        result.note.contains('hub_get_hub_mesh')
+    }
+
+    def "hub_create_variable mesh link FAILS definitively when the GET throws but the read-back proves it did not link"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> throw new RuntimeException('Hub API 500') }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                localLinkedHubVariables: [],
+                availableLinkedHubVariables: [[hubId: 'HUB-A', name: 'porchTemp', hubName: 'Peer', linkedLocally: false]]
+            ])
+        }
+
+        when:
+        def result = script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then:
+        result.success == false
+        result.isError == true
+        result.error.contains('did not take')
+    }
+
+    def "hub_create_variable mesh link rejects mixing with a create field"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', name: 'x', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('not both')
+    }
+
+    def "hub_create_variable mesh link requires BOTH hub id and name"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('BOTH mesh_source_hub_id and mesh_source_name')
+    }
+
+    // A readable availableLinkedHubVariables list that does NOT offer the pair (typo/stale/peer stopped
+    // sharing) must throw BEFORE the createLinkedHubVar GET -- validation-before-side-effect -- rather
+    // than let the absent source row read as a false success.
+    def "hub_create_variable mesh link throws (no GET) when the pair is not offered in a readable available list"() {
+        given: 'the available list is readable but offers a DIFFERENT variable, not HUB-A/porchTemp'
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([
+                localLinkedHubVariables: [],
+                availableLinkedHubVariables: [[hubId: 'HUB-A', name: 'otherVar', hubName: 'Peer', linkedLocally: false]]
+            ])
+        }
+
+        when:
+        script.toolCreateVariable([mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then: 'rejected as a validation error and the createLinkedHubVar GET was never called'
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('availableLinkedHubVariables')
+        !hubGet.calls.any { it.key == '/hub2/createLinkedHubVar/HUB-A/porchTemp' }
+    }
+
+    @spock.lang.Unroll
+    def "via dispatch: hub_create_variable mesh link passes through (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        hubGet.register('/hub2/createLinkedHubVar/HUB-A/porchTemp') { params -> '' }
+        hubGet.register('/hub2/hubMeshJson') { params -> '{"localLinkedHubVariables":[{"name":"porchTemp on Peer","sourceVarName":"porchTemp","sourceHubId":"HUB-A"}]}' }
+
+        when:
+        def response = mcpDriver.callTool('hub_create_variable',
+            [mesh_source_hub_id: 'HUB-A', mesh_source_name: 'porchTemp', confirm: true])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.name == 'porchTemp on Peer'
+        inner.sourceName == 'porchTemp'
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "hub_delete_variable renders the page after the confirm, so the armed delete runs once and nothing stays pending"() {
+        given: 'the hub deletes the variable only when the page renders after the confirm click'
+        enableWrite()
+        boolean armed = false
+        boolean deleted = false
+        script.metaClass.getGlobalVar = { String n -> deleted ? null : [name: 'condemned', type: 'String', value: 'bye', deviceId: null, attribute: null] }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            if (btnName == 'delConfirm') armed = true
+            return [status: 200]
+        }
+        hubGet.register('/installedapp/configure/json/1424/hubVar') { params -> if (armed) { deleted = true; armed = false }; '{}' }
+        script.metaClass._primeHubVarsWizard = { Integer appId, String ctx -> }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> false }
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'condemned', confirm: true])
+
+        then: 'one click sequence, and no delete left armed for a later same-named variable'
+        result.success == true
+        buttonClicks == ['condemned', 'delConfirm']
+        !armed
+    }
+
+    def "hub_delete_variable hub-namespace wizard sequence: deleteGV then delConfirm"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar: returns hub var pre-flight, null after delete commits'
+        def callCount = 0
+        script.metaClass.getGlobalVar = { String n ->
+            callCount++
+            return callCount == 1 ? [name: 'condemned', type: 'String', value: 'bye', deviceId: null, attribute: null] : null
+        }
+
+        and: 'wizard primitives recorded'
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << [appId: appId, btn: btnName, stateAttr: stateAttr, pageName: pageName]
+            return [status: 200]
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> false }
+        // backupItemSource is called between clicks as wizard priming on this firmware.
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+        def logs = []
+        script.metaClass.mcpLog = { String level, String component, String msg -> logs << msg }
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'condemned', confirm: true])
+
+        then: 'two clicks: open the delete prompt, then commit it'
+        buttonClicks.size() == 2
+        buttonClicks[0] == [appId: 1424, btn: 'condemned',  stateAttr: 'deleteGV',   pageName: 'hubVar']
+        buttonClicks[1] == [appId: 1424, btn: 'delConfirm', stateAttr: null,         pageName: 'hubVar']
+
+        and: 'response reports hub-namespace deletion'
+        result.success == true
+        result.source == 'hub'
+        result.deleted == true
+        result.name == 'condemned'
+        result.platformInUse == false
+        result.coverageNote.contains('webCoRE')
+
+        and: "an unforced delete of an unused variable carries no forced note"
+        logs.any { it.contains("removed hub var 'condemned'") && !it.contains("forced") }
+    }
+
+    @spock.lang.Unroll
+    def "hub_delete_variable hub-namespace: registry #state without force refuses before any click"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> [name: 'shared', type: 'Number', value: 5, deviceId: null, attribute: null] }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            [status: 200]
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> registry }
+
+        when:
+        script.toolDeleteHubVariable([name: 'shared', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains("'shared'")
+        ex.message.contains(phrase)
+        ex.message.contains('force=true')
+        buttonClicks.isEmpty()
+
+        where:
+        state          | registry | phrase
+        "in use"       | true     | "registered as in use"
+        "unreadable"   | null     | "is unknown"
+    }
+
+    @spock.lang.Unroll
+    def "hub_delete_variable hub-namespace: force=true deletes when the registry is #note and says so"() {
+        given:
+        enableWrite()
+        def calls = 0
+        script.metaClass.getGlobalVar = { String n ->
+            calls++
+            calls == 1 ? [name: 'shared', type: 'Number', value: 5, deviceId: null, attribute: null] : null
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> registry }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+        def logs = []
+        script.metaClass.mcpLog = { String level, String component, String msg -> logs << msg }
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'shared', confirm: true, force: true])
+
+        then:
+        result.success == true
+        result.deleted == true
+        result.platformInUse == registry
+
+        and: "the audit line says the delete was forced past the registry"
+        logs.any { it.contains("removed hub var 'shared'") && it.contains("(forced; hub in-use registry: ${note})") }
+
+        where:
+        registry | note
+        true     | "true"
+        null     | "unreadable"
+    }
+
+    // -------- toolDeleteHubVariable Hub Mesh linked-mirror unlink --------
+    // A linked mirror is a normal local hub var whose DECORATED name ("<src> on <peer>") is what the
+    // caller passes. The hub's generic in-use registry ALWAYS marks a mirror in-use (the mesh link
+    // itself), so unlink keys on the mesh row's inUseByApps, not the registry. Mesh rows come from
+    // /hub2/hubMeshJson localLinkedHubVariables[].
+
+    def "hub_delete_variable unlinks a Hub Mesh mirror (inUseByApps=false) without force, bypassing the generic in-use guard"() {
+        given:
+        enableWrite()
+
+        and: 'the mirror exists pre-flight, gone after the wizard commits'
+        def calls = 0
+        script.metaClass.getGlobalVar = { String n ->
+            calls++
+            calls == 1 ? [name: 'porchTemp on Peer', type: 'Number', value: 21, deviceId: null, attribute: null] : null
+        }
+
+        and: 'the platform in-use registry says the mirror IS in use (the mesh link registration)'
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> true }
+
+        and: 'the mesh row reports NO real consuming app'
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([localLinkedHubVariables: [
+                [name: 'porchTemp on Peer', sourceVarName: 'porchTemp', sourceHubId: 'HUB-A', sourceHubName: 'Peer', inUseByApps: false, type: 'Number']
+            ]])
+        }
+
+        and: 'wizard primitives recorded'
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            [status: 200]
+        }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'porchTemp on Peer', confirm: true])
+
+        then: 'the delete actually happened (wizard ran) despite the registry marking it in-use and no force'
+        buttonClicks == ['porchTemp on Peer', 'delConfirm']
+        result.success == true
+        result.deleted == true
+        result.unlinked == true
+        result.source == 'hub'
+
+        and: 'the message frames it as an unlink: local copy removed, peer untouched'
+        result.note.contains("Unlinked the Hub Mesh variable 'porchTemp on Peer'")
+        result.note.contains("removed this hub's local copy")
+        result.note.contains('untouched')
+    }
+
+    def "hub_delete_variable refuses to unlink a Hub Mesh mirror in real use (inUseByApps=true) without force, and names both facts"() {
+        given:
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> [name: 'porchTemp on Peer', type: 'Number', value: 21, deviceId: null, attribute: null] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> true }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([localLinkedHubVariables: [
+                [name: 'porchTemp on Peer', sourceVarName: 'porchTemp', sourceHubId: 'HUB-A', sourceHubName: 'Peer', inUseByApps: true, type: 'Number']
+            ]])
+        }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            [status: 200]
+        }
+
+        when:
+        script.toolDeleteHubVariable([name: 'porchTemp on Peer', confirm: true])
+
+        then: 'refused before any wizard click'
+        def ex = thrown(IllegalArgumentException)
+        buttonClicks.isEmpty()
+
+        and: 'the message names the linked-mirror nature AND that real apps break'
+        ex.message.contains('linked mirror')
+        ex.message.contains('untouched')
+        ex.message.contains('real app')
+        ex.message.contains('force=true')
+    }
+
+    def "hub_delete_variable refuses to unlink a Hub Mesh mirror with UNKNOWN inUseByApps without force (unknown = cautious)"() {
+        given: 'a mirror row missing the inUseByApps flag -- usage cannot be confirmed'
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> [name: 'porchTemp on Peer', type: 'Number', value: 21, deviceId: null, attribute: null] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> true }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([localLinkedHubVariables: [
+                [name: 'porchTemp on Peer', sourceVarName: 'porchTemp', sourceHubId: 'HUB-A', sourceHubName: 'Peer', type: 'Number']
+            ]])
+        }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            [status: 200]
+        }
+
+        when:
+        script.toolDeleteHubVariable([name: 'porchTemp on Peer', confirm: true])
+
+        then: 'refused before any wizard click; message names the mirror nature and the could-not-confirm reason'
+        def ex = thrown(IllegalArgumentException)
+        buttonClicks.isEmpty()
+        ex.message.contains('linked mirror')
+        ex.message.contains('could not confirm')
+        ex.message.contains('force=true')
+    }
+
+    def "hub_delete_variable force=true unlinks a Hub Mesh mirror even when a real app uses it (inUseByApps=true)"() {
+        given:
+        enableWrite()
+        def calls = 0
+        script.metaClass.getGlobalVar = { String n ->
+            calls++
+            calls == 1 ? [name: 'porchTemp on Peer', type: 'Number', value: 21, deviceId: null, attribute: null] : null
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> true }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([localLinkedHubVariables: [
+                [name: 'porchTemp on Peer', sourceVarName: 'porchTemp', sourceHubId: 'HUB-A', sourceHubName: 'Peer', inUseByApps: true, type: 'Number']
+            ]])
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when:
+        def result = script.toolDeleteHubVariable([name: 'porchTemp on Peer', confirm: true, force: true])
+
+        then:
+        result.success == true
+        result.deleted == true
+        result.unlinked == true
+    }
+
+    def "hub_delete_variable does NOT relax the in-use guard for an ordinary (non-mirror) hub var"() {
+        given: 'an ordinary hub var the registry marks in-use, and a mesh list with no matching mirror'
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> [name: 'shared', type: 'Number', value: 5, deviceId: null, attribute: null] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> true }
+        hubGet.register('/hub2/hubMeshJson') { params ->
+            groovy.json.JsonOutput.toJson([localLinkedHubVariables: [
+                [name: 'porchTemp on Peer', sourceVarName: 'porchTemp', sourceHubId: 'HUB-A', sourceHubName: 'Peer', inUseByApps: false, type: 'Number']
+            ]])
+        }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            [status: 200]
+        }
+
+        when:
+        script.toolDeleteHubVariable([name: 'shared', confirm: true])
+
+        then: 'unchanged behaviour: refuses on the generic registry guard, no clicks'
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('registered as in use')
+        ex.message.contains('force=true')
+        buttonClicks.isEmpty()
+    }
+
+    def "hub_delete_variable falls back to the generic guard when the mesh JSON is unreadable"() {
+        given: 'an in-use hub var whose mesh JSON cannot be read (so mirror status is unknown)'
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> [name: 'shared', type: 'Number', value: 5, deviceId: null, attribute: null] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> true }
+        hubGet.register('/hub2/hubMeshJson') { params -> throw new RuntimeException('mesh JSON unreachable') }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            [status: 200]
+        }
+
+        when:
+        script.toolDeleteHubVariable([name: 'shared', confirm: true])
+
+        then: 'existing in-use guard applies (safe default), no clicks'
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('registered as in use')
+        buttonClicks.isEmpty()
+    }
+
+    @spock.lang.Unroll
+    def "_hubVarPlatformInUse reads the Hub Variables page: '#name' -> #expected"() {
+        given:
+        def row = { String n, boolean used ->
+            used ? "<tr style='color:black'><td><div><a href='#' data-stateAttribute='inUse' aria-label='Show In Use Apps for ${n}' style='color:orange'>${n}</a></div></td><td>Number</td></tr>" :
+                   "<tr style='color:black'><td>${n}</td><td>Number</td></tr>"
+        }
+        def page = groovy.json.JsonOutput.toJson([configPage: [sections: [[body: [[type: 'paragraph',
+            description: "<table>${row('GT1', true)}${row('Idle', false)}${row('Tom &amp; Jerry', true)}</table>".toString()]]]]]])
+        hubGet.register('/installedapp/configure/json/1424') { params -> page }
+
+        expect:
+        script._hubVarPlatformInUse(1424, name) == expected
+
+        where:
+        name          | expected
+        'GT1'         | true
+        'Idle'        | false
+        'Tom & Jerry' | true
+        'GT'          | null
+        'Missing'     | null
+    }
+
+    def "_hubVarPlatformInUse is unknown when the page cannot be read"() {
+        given:
+        hubGet.register('/installedapp/configure/json/1424') { params -> throw new RuntimeException('401') }
+
+        expect:
+        script._hubVarPlatformInUse(1424, 'GT1') == null
+        script._hubVarPlatformInUse(null, 'GT1') == null
+    }
+
+    @spock.lang.Unroll
+    def "_hubVarPlatformInUseStatus distinguishes unreadable from not-listed: '#name' -> #expected"() {
+        given:
+        def row = { String n, boolean used ->
+            used ? "<tr style='color:black'><td><div><a href='#' data-stateAttribute='inUse' aria-label='Show In Use Apps for ${n}' style='color:orange'>${n}</a></div></td><td>Number</td></tr>" :
+                   "<tr style='color:black'><td>${n}</td><td>Number</td></tr>"
+        }
+        def page = groovy.json.JsonOutput.toJson([configPage: [sections: [[body: [[type: 'paragraph',
+            description: "<table>${row('GT1', true)}${row('Idle', false)}</table>".toString()]]]]]])
+        hubGet.register('/installedapp/configure/json/1424') { params -> page }
+
+        expect:
+        script._hubVarPlatformInUseStatus(1424, name) == expected
+
+        where:
+        name      | expected
+        'GT1'     | 'inUse'      // Show-In-Use marker present
+        'Idle'    | 'notInUse'   // plain row present
+        'Missing' | 'notListed'  // page read fine, variable absent
+        null      | 'unreadable' // no var name
+    }
+
+    def "_hubVarPlatformInUseStatus is unreadable when the page GET throws, and the Boolean wrapper collapses both unknowns to null"() {
+        given:
+        hubGet.register('/installedapp/configure/json/1424') { params -> throw new RuntimeException('401') }
+
+        expect: 'the throwing GET is unreadable'
+        script._hubVarPlatformInUseStatus(1424, 'GT1') == 'unreadable'
+
+        and: 'the Boolean wrapper maps unreadable AND notListed both to null (delete-variable path unchanged)'
+        script._hubVarPlatformInUse(1424, 'GT1') == null
+    }
+
+    // ---- hub_get_variable includeDependents ----
+    // The reveal fixture mirrors the live capture off firmware 2.5.1.183: the per-variable reveal link
+    // (title='Show In Use Apps for <name>'), the revealed-panel marker (<b><name></b> is in use by these
+    // apps) and the consumer anchors (<a href='/installedapp/configure/<id>' title='Open <label>'>...).
+    // App labels render RAW (not entity-escaped), so the parse reads the label from the title attribute.
+    // The hub serves the page as configPage JSON with the HTML embedded in a body description, so the
+    // fixture wraps it that way too -- also exercising the decode-before-scan (JSON escapes must not leak).
+
+    private String wrapCfg(String html) {
+        return groovy.json.JsonOutput.toJson([configPage: [sections: [[body: [[type: 'paragraph', description: html]]]]]])
+    }
+
+    private String hubVarInUsePage(String escapedName, List apps) {
+        def anchors = apps.collect {
+            "\t<a href='/installedapp/configure/${it.id}' target='_blank' title='Open ${it.label}'>${it.label}</a>\n"
+        }.join('')
+        def html = "<table><tr><td><div class='submitOnChange app-button-link' data-stateAttribute='inUse' " +
+                   "title='Show In Use Apps for ${escapedName}'>${escapedName}</div></td><td>Boolean</td></tr></table>" +
+                   "<b>${escapedName}</b> is in use by these apps:${anchors}"
+        return wrapCfg(html)
+    }
+
+    def "hub_get_variable includeDependents reveals and parses the consuming apps"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            hubVarInUsePage('zzProbe', [[id: '21', label: 'zzVarDepProbeRule'], [id: '34', label: 'Kitchen Lights']])
+        }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << [btn: btnName, stateAttr: stateAttr, pageName: pageName]
+            [status: 200]
+        }
+
+        when:
+        def result = script.toolGetVariable([name: 'zzProbe', includeDependents: true])
+
+        then: 'the base variable read is unchanged'
+        result.name == 'zzProbe'
+        result.source == 'hub'
+
+        and: 'the reveal is clicked on hubVar, then dismissed with cancelDel'
+        buttonClicks*.btn == ['zzProbe', 'cancelDel']
+        buttonClicks[0] == [btn: 'zzProbe', stateAttr: 'inUse', pageName: 'hubVar']
+
+        and: 'both consumers parsed as {id,label}'
+        result.count == 2
+        result.appsUsing == [[id: '21', label: 'zzVarDepProbeRule'], [id: '34', label: 'Kitchen Lights']]
+        result.coverageNote.contains('webCoRE')
+    }
+
+    def "hub_get_variable omits dependents unless includeDependents=true"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> buttonClicks << btnName; [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'zzProbe'])
+
+        then: 'no reveal click, no appsUsing'
+        !result.containsKey('appsUsing')
+        !result.containsKey('coverageNote')
+        buttonClicks.isEmpty()
+    }
+
+    def "hub_get_variable includeDependents returns an empty list when the variable is registered but not in use"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params -> wrapCfg("<table><tr><td>Idle</td><td>Boolean</td></tr></table>") }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> buttonClicks << btnName; [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'Idle', includeDependents: true])
+
+        then: 'not-in-use short-circuits with no reveal click'
+        result.appsUsing == []
+        result.count == 0
+        buttonClicks.isEmpty()
+    }
+
+    def "hub_get_variable includeDependents still throws for an unknown variable, before any side effect"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> null }
+        stateMap.ruleVariables = [:]
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> buttonClicks << btnName; [status: 200] }
+
+        when:
+        script.toolGetVariable([name: 'nope', includeDependents: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('Variable not found')
+        buttonClicks.isEmpty()
+    }
+
+    def "hub_get_variable includeDependents is ignored for a rule-engine variable (no dependents fields, no reveal click)"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> null }
+        stateMap.ruleVariables = [onlyRule: 'x']
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> buttonClicks << btnName; [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'onlyRule', includeDependents: true])
+
+        then: 'the in-use registry is hub-variable-only, so a rule-engine var gets no dependents fields'
+        result.source == 'rule_engine'
+        !result.containsKey('appsUsing')
+        !result.containsKey('coverageNote')
+        !result.containsKey('dependentsError')
+        buttonClicks.isEmpty()
+    }
+
+    def "hub_get_variable includeDependents reports a distinct 'page unreadable' dependentsError when the Hub Variables page cannot be read"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params -> throw new RuntimeException('401') }
+
+        when:
+        def result = script.toolGetVariable([name: 'zzProbe', includeDependents: true])
+
+        then: 'the base read still succeeds; the dependents failure names the unreadable page specifically'
+        result.source == 'hub'
+        !result.containsKey('appsUsing')
+        result.dependentsError.contains('in-use registry')
+        result.dependentsError.contains('the Hub Variables page was unreadable')
+        !result.dependentsError.contains('not listed')
+    }
+
+    def "hub_get_variable includeDependents reports a distinct 'not listed' dependentsError when the page reads but omits the variable"() {
+        given: 'the page reads fine, but names neither the in-use marker nor a plain row for this variable'
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            wrapCfg("<table><tr><td>someOtherVar</td><td>Number</td></tr></table>")
+        }
+
+        when:
+        def result = script.toolGetVariable([name: 'zzProbe', includeDependents: true])
+
+        then: 'the not-listed case is a DISTINCT dependentsError text, not the page-unreadable one'
+        result.source == 'hub'
+        !result.containsKey('appsUsing')
+        result.dependentsError.contains('in-use registry')
+        result.dependentsError.contains('the variable is not listed on the Hub Variables page')
+        !result.dependentsError.contains('unreadable')
+    }
+
+    def "hub_get_variable includeDependents treats a reveal that did not load as UNKNOWN, not empty"() {
+        given: 'the variable is marked in-use (reveal link present) but the reveal panel never renders'
+        def logs = []
+        script.metaClass.mcpLog = { String level, String component, String msg, String ruleId = null, Map extra = null -> logs << [level: level, component: component, msg: msg] }
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        // Page carries the "Show In Use Apps for probe" marker (so platformInUse=true) but NO revealed
+        // anchors and NO "is in use by these apps" panel -- i.e. the reveal click no-op'd.
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            wrapCfg("<table><tr><td><div data-stateAttribute='inUse' title='Show In Use Apps for probe'>probe</div></td><td>Boolean</td></tr></table>")
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'probe', includeDependents: true])
+
+        then: 'zero anchors with no loaded panel is UNKNOWN -> dependentsError, NOT appsUsing:[]'
+        !result.containsKey('appsUsing')
+        result.dependentsError.contains('in-use registry')
+
+        and: 'the never-rendered reveal is logged as a warning'
+        logs.any { it.level == 'warn' && it.component == 'variables' && it.msg.contains('never rendered') }
+    }
+
+    def "hub_get_variable includeDependents returns UNKNOWN when in-use but the panel lists no parseable consumers"() {
+        given: 'platformInUse=true and the panel for THIS variable renders, but with zero consumer anchors'
+        def logs = []
+        script.metaClass.mcpLog = { String level, String component, String msg, String ruleId = null, Map extra = null -> logs << [level: level, component: component, msg: msg] }
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._primeHubVarsWizard = { Integer appId, String context -> }
+        // Marker present (in-use + the panel renders for 'probe') but NO <a ...configure...> anchors.
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            wrapCfg("<table><tr><td><div data-stateAttribute='inUse' title='Show In Use Apps for probe'>probe</div></td><td>Boolean</td></tr></table>" +
+                    "<b>probe</b> is in use by these apps:")
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'probe', includeDependents: true])
+
+        then: 'a rendered-but-empty panel is a contradiction -> UNKNOWN, NOT appsUsing:[]'
+        !result.containsKey('appsUsing')
+        result.dependentsError.contains('in-use registry')
+
+        and: 'the empty-panel contradiction is logged as a warning'
+        logs.any { it.level == 'warn' && it.component == 'variables' && it.msg.contains('no consumer anchors parsed') }
+    }
+
+    def "hub_get_variable includeDependents ignores a reveal panel that names a different variable (parallel-call safety)"() {
+        given: "'probe' is in use, but the shared reveal shows ANOTHER variable's panel (a racing parallel call)"
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._primeHubVarsWizard = { Integer appId, String context -> }
+        // platformInUse=true for 'probe', but the revealed panel + anchor belong to 'other'.
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            wrapCfg("<table><tr><td><div data-stateAttribute='inUse' title='Show In Use Apps for probe'>probe</div></td><td>Boolean</td></tr></table>" +
+                    "<b>other</b> is in use by these apps:\t<a href='/installedapp/configure/77' target='_blank' title='Open OtherRule'>OtherRule</a>\n")
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'probe', includeDependents: true])
+
+        then: "another variable's panel is never read as ours -> UNKNOWN, not OtherRule"
+        !result.containsKey('appsUsing')
+        result.dependentsError.contains('in-use registry')
+    }
+
+    def "hub_get_variable includeDependents still dismisses the reveal (cancelDel) when the reveal click throws"() {
+        given: 'the reveal click fails (e.g. a 4xx), so the parse never runs'
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._primeHubVarsWizard = { Integer appId, String context -> }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            wrapCfg("<table><tr><td><div data-stateAttribute='inUse' title='Show In Use Apps for probe'>probe</div></td><td>Boolean</td></tr></table>")
+        }
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << btnName
+            if (btnName == 'probe') throw new RuntimeException('403')
+            [status: 200]
+        }
+
+        when:
+        def result = script.toolGetVariable([name: 'probe', includeDependents: true])
+
+        then: 'the finally still dismisses the reveal, and the failure is reported as UNKNOWN'
+        buttonClicks == ['probe', 'cancelDel']
+        !result.containsKey('appsUsing')
+        result.dependentsError.contains('in-use registry')
+    }
+
+    def "hub_get_variable includeDependents polls until the async reveal loads (first fetch unrevealed, later fetch revealed)"() {
+        given: 'the variable is in-use, but the revealed panel only renders on a later fetch (async click)'
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        // Stub the prime so its own configure/json GET is not miscounted as a reveal poll, and count only
+        // the GETs AFTER the reveal click -- so the test fails if the poll is reverted to a single fetch.
+        script.metaClass._primeHubVarsWizard = { Integer appId, String context -> }
+        String unrevealed = wrapCfg("<table><tr><td><div data-stateAttribute='inUse' title='Show In Use Apps for probe'>probe</div></td><td>Boolean</td></tr></table>")
+        boolean clicked = false
+        int getsAfterClick = 0
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            if (!clicked) return unrevealed   // platformInUse check: in-use marker, no revealed panel
+            getsAfterClick++
+            // First poll after the click -> still unrevealed; the second -> the panel with the anchor.
+            getsAfterClick <= 1 ? unrevealed : hubVarInUsePage('probe', [[id: '21', label: 'ProbeRule']])
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            if (btnName == 'probe') clicked = true
+            [status: 200]
+        }
+
+        when:
+        def result = script.toolGetVariable([name: 'probe', includeDependents: true])
+
+        then: 'the poll waited for the reveal and parsed the consumer -- not a false dependentsError'
+        !result.containsKey('dependentsError')
+        result.appsUsing == [[id: '21', label: 'ProbeRule']]
+
+        and: 'the reveal was polled more than once after the click'
+        getsAfterClick >= 2
+    }
+
+    def "hub_get_variable includeDependents matches an entity-escaped variable name and reads the raw app label"() {
+        given: 'the variable NAME is entity-escaped in the page; the app LABEL renders RAW (with a raw &)'
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            hubVarInUsePage('Tom &amp; Jerry', [[id: '9', label: 'Heat & Cool']])
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'Tom & Jerry', includeDependents: true])
+
+        then:
+        result.count == 1
+        result.appsUsing == [[id: '9', label: 'Heat & Cool']]
+    }
+
+    def "hub_get_variable includeDependents reads a raw app label containing < > & and '"() {
+        given: 'the hub renders consumer labels RAW, so the label carries literal < > & and a quote'
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            hubVarInUsePage('zzProbe', [[id: '2598', label: "X A&B <rule> it's"]])
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'zzProbe', includeDependents: true])
+
+        then: 'the label is read verbatim from the title attribute, tags and entities left intact'
+        result.count == 1
+        result.appsUsing == [[id: '2598', label: "X A&B <rule> it's"]]
+    }
+
+    def "hub_get_variable includeDependents decodes JSON-embedded HTML so escapes do not leak into labels"() {
+        given: 'a label carrying a double-quote the configPage JSON escapes on the wire'
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            hubVarInUsePage('zzProbe', [[id: '7', label: 'Say "Hi" Rule']])
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+
+        when:
+        def result = script.toolGetVariable([name: 'zzProbe', includeDependents: true])
+
+        then: 'the label is the clean HTML text, with no leaked JSON backslash-escapes'
+        result.appsUsing == [[id: '7', label: 'Say "Hi" Rule']]
+        !result.appsUsing[0].label.contains('\\')
+    }
+
+    def "hub_get_variable includeDependents via dispatch routes through the read gateway"() {
+        given:
+        script.metaClass.getGlobalVar = { String n -> [name: n, type: 'Boolean', value: false] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            hubVarInUsePage('zzProbe', [[id: '21', label: 'zzVarDepProbeRule']])
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+
+        when:
+        def response = mcpDriver.callTool('hub_get_variable', [name: 'zzProbe', includeDependents: true])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.name == 'zzProbe'
+        inner.count == 1
+        inner.appsUsing == [[id: '21', label: 'zzVarDepProbeRule']]
+    }
+
+    def "hub_delete_variable refuses when a child rule uses the variable only as a %name% substitution"() {
+        given:
+        enableWrite()
+        stateMap.ruleVariables = [Temp: 20]
+        def consumer = new support.TestChildApp(id: 7L, label: 'Announces Temp')
+        consumer.ruleData = [triggers: [], conditions: [],
+                             actions: [[type: 'log', message: 'Temperature is %Temp%']]]
+        childAppsList << consumer
+
+        when:
+        script.toolDeleteHubVariable([name: 'Temp', confirm: true])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('id=7')
+        stateMap.ruleVariables == [Temp: 20]
+    }
+
+    def "hub_delete_variable hub-namespace post-wizard verification fails when var still exists"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar always returns the var — delete wizard ran but did not commit'
+        script.metaClass.getGlobalVar = { String n ->
+            [name: 'stuck', type: 'String', value: 'still here', deviceId: null, attribute: null]
+        }
+
+        and: 'wizard primitives recorded but no real effect'
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._hubVarPlatformInUse = { Integer a, String n -> false }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when:
+        script.toolDeleteHubVariable([name: 'stuck', confirm: true])
+
+        then: 'IllegalStateException — wizard claimed success but the var is still there'
+        def ex = thrown(IllegalStateException)
+        ex.message.contains('wizard completed but')
+        ex.message.contains('stuck')
+    }
+
+    def "hub_create_connector wizard sequence: createCon click + capab commit via _rmWriteSettingOnPage"() {
+        given:
+        enableWrite()
+
+        and: 'getGlobalVar: deviceId=null pre-flight, deviceId=305 after wizard commits'
+        def callCount = 0
+        script.metaClass.getGlobalVar = { String n ->
+            callCount++
+            return callCount == 1 ?
+                [name: 'foo', type: 'Boolean', value: true, deviceId: null, attribute: null] :
+                [name: 'foo', type: 'Boolean', value: true, deviceId: 305,  attribute: 'switch']
+        }
+
+        and: 'wizard primitives recorded'
+        def buttonClicks = []
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName ->
+            buttonClicks << [appId: appId, btn: btnName, stateAttr: stateAttr, pageName: pageName]
+            return [status: 200]
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass._primeHubVarsWizard = { Integer appId, String context -> /* no-op */ }
+        def settingWrites = []
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String settingName, val, List applied, String fieldType, List skipped ->
+            settingWrites << [appId: appId, pageName: pageName, name: settingName, value: val, fieldType: fieldType]
+        }
+
+        when:
+        def result = script.toolCreateConnector([name: 'foo', confirm: true])
+
+        then: 'one createCon click on the row'
+        buttonClicks.size() == 1
+        buttonClicks[0] == [appId: 1424, btn: 'foo', stateAttr: 'createCon', pageName: 'hubVar']
+
+        and: 'chooser capab commit via _rmWriteSettingOnPage (no-op for Boolean vars but called unconditionally)'
+        settingWrites.size() == 1
+        settingWrites[0].appId == 1424
+        settingWrites[0].pageName == 'hubVar'
+        settingWrites[0].name == 'capab'
+        settingWrites[0].value == 'Variable'  // default when no connectorType arg
+        settingWrites[0].fieldType == 'enum'
+
+        and: 'response surfaces the new connector deviceId'
+        result.success == true
+        result.deviceId == 305
+        result.attribute == 'switch'
+        result.name == 'foo'
+    }
+
+    // -------- handleHubVariableEvent + toolGetVariableHistory --------
+
+    def "handleHubVariableEvent strips the 'variable:' prefix and appends to atomicState.variableHistory"() {
+        given:
+        atomicStateMap.variableHistory = []
+        def evt = [name: 'variable:porch_light_pref', value: 'bright', descriptionText: 'changed by user']
+
+        when:
+        script.handleHubVariableEvent(evt)
+
+        then:
+        atomicStateMap.variableHistory.size() == 1
+        atomicStateMap.variableHistory[0].name == 'porch_light_pref'
+        atomicStateMap.variableHistory[0].value == 'bright'
+        atomicStateMap.variableHistory[0].timestamp == 1234567890000L  // HarnessSpec's fixed now()
+        atomicStateMap.variableHistory[0].descriptionText == 'changed by user'
+    }
+
+    def "handleHubVariableEvent caps the buffer at 200 entries — oldest dropped"() {
+        given: 'history pre-loaded with 200 entries'
+        atomicStateMap.variableHistory = (1..200).collect { i -> [name: 'var', value: i, timestamp: i] }
+        def evt = [name: 'variable:var', value: 999]
+
+        when:
+        script.handleHubVariableEvent(evt)
+
+        then: 'still 200 entries; the oldest (value=1) is gone, newest is at the tail'
+        atomicStateMap.variableHistory.size() == 200
+        atomicStateMap.variableHistory[0].value == 2
+        atomicStateMap.variableHistory[-1].value == 999
+    }
+
+    def "handleHubVariableEvent ignores null events and missing names"() {
+        given:
+        atomicStateMap.variableHistory = []
+
+        when:
+        script.handleHubVariableEvent(null)
+        script.handleHubVariableEvent([name: null, value: 'x'])
+
+        then:
+        atomicStateMap.variableHistory == []
+    }
+
+    def "hub_list_variable_changes returns most-recent-first capped at limit"() {
+        given:
+        atomicStateMap.variableHistory = (1..10).collect { i -> [name: 'v', value: i, timestamp: i] }
+
+        when:
+        def result = script.toolGetVariableHistory([limit: 3])
+
+        then: 'newest three, reverse-chronological'
+        result.entries.size() == 3
+        result.entries[0].value == 10
+        result.entries[1].value == 9
+        result.entries[2].value == 8
+        result.bufferSize == 10
+        result.bufferCap == 200
+    }
+
+    def "hub_list_variable_changes filters by name when provided"() {
+        given:
+        atomicStateMap.variableHistory = [
+            [name: 'foo', value: 1, timestamp: 1],
+            [name: 'bar', value: 2, timestamp: 2],
+            [name: 'foo', value: 3, timestamp: 3]
+        ]
+
+        when:
+        def result = script.toolGetVariableHistory([name: 'foo'])
+
+        then:
+        result.entries.size() == 2
+        result.entries.every { it.name == 'foo' }
+        result.entries[0].value == 3  // newest first
+    }
+
+    def "hub_list_variable_changes filters by sinceMs when provided"() {
+        given:
+        atomicStateMap.variableHistory = [
+            [name: 'v', value: 1, timestamp: 100],
+            [name: 'v', value: 2, timestamp: 200],
+            [name: 'v', value: 3, timestamp: 300]
+        ]
+
+        when:
+        def result = script.toolGetVariableHistory([sinceMs: 200])
+
+        then: 'only entries with timestamp >= 200'
+        result.entries.size() == 2
+        result.entries[0].timestamp == 300
+        result.entries[1].timestamp == 200
+    }
+
+    def "hub_list_variable_changes returns empty entries when buffer is empty"() {
+        given:
+        atomicStateMap.variableHistory = []
+
+        when:
+        def result = script.toolGetVariableHistory([:])
+
+        then:
+        result.entries == []
+        result.bufferSize == 0
+    }
+
+    // -------- renameVariable callback --------
+
+    def "renameVariable rewrites matching history entries to the new name"() {
+        given:
+        atomicStateMap.variableHistory = [
+            [name: 'old', value: 'a', timestamp: 1],
+            [name: 'unrelated', value: 'x', timestamp: 2],
+            [name: 'old', value: 'b', timestamp: 3]
+        ]
+        // subscribe is on AppExecutor — already stubbed in HarnessSpec
+
+        when:
+        script.renameVariable('old', 'new')
+
+        then: 'old -> new for matching entries; others untouched'
+        atomicStateMap.variableHistory[0].name == 'new'
+        atomicStateMap.variableHistory[1].name == 'unrelated'
+        atomicStateMap.variableHistory[2].name == 'new'
+        // Values preserved
+        atomicStateMap.variableHistory[0].value == 'a'
+        atomicStateMap.variableHistory[2].value == 'b'
+    }
+
+    def "renameVariable is a no-op on history when no entries match"() {
+        given:
+        atomicStateMap.variableHistory = [[name: 'untouched', value: 'x', timestamp: 1]]
+
+        when:
+        script.renameVariable('absent', 'replacement')
+
+        then: 'history unchanged'
+        atomicStateMap.variableHistory[0].name == 'untouched'
+    }
+
+    // -------- _refreshHubVarInUseRegistrations (issue #96 gap 1) --------
+
+    def "in-use refresh registers vars referenced by child rules"() {
+        given: 'two hub vars on the hub'
+        script.metaClass.getAllGlobalVars = { ->
+            [shared_var: [name: 'shared_var', type: 'String', value: 'x'],
+             unused_var: [name: 'unused_var', type: 'String', value: 'y']]
+        }
+        and: 'a child rule that references shared_var'
+        def consumer = new support.TestChildApp(id: 11L, label: 'Uses shared_var')
+        consumer.ruleData = [
+            triggers: [],
+            conditions: [[type: 'variable', name: 'shared_var']],
+            actions: []
+        ]
+        childAppsList << consumer
+
+        and: 'recorders for the in-use API calls'
+        def added = []
+        def removed = []
+        script.metaClass.addInUseGlobalVar    = { String n -> added    << n; true }
+        script.metaClass.removeInUseGlobalVar = { String n -> removed  << n; true }
+
+        when:
+        script._refreshHubVarInUseRegistrations()
+
+        then: 'only the referenced var was registered; the unreferenced one was not'
+        added == ['shared_var']
+        removed == []
+        atomicStateMap.inUseHubVars == ['shared_var']
+    }
+
+    def "in-use refresh removes registrations for vars no longer referenced"() {
+        given: 'previous run registered two vars'
+        atomicStateMap.inUseHubVars = ['old_a', 'old_b']
+        script.metaClass.getAllGlobalVars = { ->
+            [old_a: [name: 'old_a'], old_b: [name: 'old_b'], still_used: [name: 'still_used']]
+        }
+        and: 'a child rule that now only references still_used'
+        def consumer = new support.TestChildApp(id: 22L, label: 'Migrated')
+        consumer.ruleData = [conditions: [[type: 'variable', name: 'still_used']]]
+        childAppsList << consumer
+
+        def added = []
+        def removed = []
+        script.metaClass.addInUseGlobalVar    = { String n -> added   << n; true }
+        script.metaClass.removeInUseGlobalVar = { String n -> removed << n; true }
+
+        when:
+        script._refreshHubVarInUseRegistrations()
+
+        then: 'still_used is newly registered; old_a + old_b are unregistered'
+        added == ['still_used']
+        removed.toSet() == ['old_a', 'old_b'] as Set
+        atomicStateMap.inUseHubVars == ['still_used']
+    }
+
+    def "in-use refresh clears all registrations when there are no hub vars at all"() {
+        given:
+        atomicStateMap.inUseHubVars = ['stale']
+        script.metaClass.getAllGlobalVars = { -> [:] }
+
+        def removed = []
+        script.metaClass.removeInUseGlobalVar = { String n -> removed << n; true }
+
+        when:
+        script._refreshHubVarInUseRegistrations()
+
+        then:
+        removed == ['stale']
+        atomicStateMap.inUseHubVars == []
+    }
+
+    def "in-use refresh tolerates getAllGlobalVars throwing — does not mutate state"() {
+        given:
+        atomicStateMap.inUseHubVars = ['existing']
+        script.metaClass.getAllGlobalVars = { -> throw new RuntimeException('hub api down') }
+
+        when:
+        script._refreshHubVarInUseRegistrations()
+
+        then: 'state unchanged — better to keep stale registration than wipe it on a transient error'
+        atomicStateMap.inUseHubVars == ['existing']
+        noExceptionThrown()
+    }
+
+    // -------- Dispatch-envelope counterparts (#187, #121) --------
+    // Parallel coverage exercising callTool() so the JSON-RPC envelope, gateway
+    // routing toggles, and error mapping (IAE -> isError validation result, generic -> isError) are
+    // verified end-to-end alongside the direct-call golden paths above. Tools
+    // live in the hub_manage_variables gateway; dispatched directly by snake-
+    // case name through executeTool() in hubitat-mcp-server.groovy.
+
+    @spock.lang.Unroll
+    def "hub_list_variables via dispatch returns hub + rule vars (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        script.metaClass.getAllGlobalVars = { ->
+            ['temp_setpoint': [name: 'temp_setpoint', type: 'Number', value: 72, deviceId: 305, attribute: 'variable']]
+        }
+        stateMap.ruleVariables = [last_motion: '2026-04-21T10:00:00']
+
+        when:
+        def response = mcpDriver.callTool('hub_list_variables', [:])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.hubVariables.size() == 1
+        inner.hubVariables[0].name == 'temp_setpoint'
+        inner.ruleVariables.size() == 1
+        inner.total == 2
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_list_variables via dispatch returns empty collections when no vars (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        script.metaClass.getAllGlobalVars = { -> [:] }
+
+        when:
+        def response = mcpDriver.callTool('hub_list_variables', [:])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.hubVariables == []
+        inner.ruleVariables == []
+        inner.total == 0
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_get_variable via dispatch returns hub var (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        script.metaClass.getGlobalVar = { String name ->
+            [name: 'outdoor_temp', type: 'Decimal', value: 68.4, deviceId: 312, attribute: 'variable']
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_get_variable', [name: 'outdoor_temp'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.name == 'outdoor_temp'
+        inner.value == 68.4
+        inner.type == 'Decimal'
+        inner.source == 'hub'
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_get_variable via dispatch maps unknown to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        script.metaClass.getGlobalVar = { String n -> null }
+        stateMap.ruleVariables = [:]
+
+        when:
+        def response = mcpDriver.callTool('hub_get_variable', [name: 'nonexistent'])
+
+        then:
+        response.result?.isError == true
+        mcpDriver.parseInner(response).error.contains('Variable not found')
+        mcpDriver.parseInner(response).error.contains('nonexistent')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_set_variable via dispatch writes hub var (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        def captured = [:]
+        script.metaClass.setGlobalVar = { String name, Object value ->
+            captured[name] = value
+            return true
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_set_variable', [name: 'vacation_mode', value: true])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.name == 'vacation_mode'
+        inner.value == true
+        inner.source == 'hub'
+        captured == [vacation_mode: true]
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_set_variable via dispatch falls back to rule_engine when hub var missing (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        script.metaClass.setGlobalVar = { String name, Object value -> false }
+
+        when:
+        def response = mcpDriver.callTool('hub_set_variable', [name: 'new_rule_var', value: 42])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.source == 'rule_engine'
+        inner.value == 42
+        stateMap.ruleVariables == [new_rule_var: 42]
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_delete_variable via dispatch removes rule var (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        stateMap.ruleVariables = [scratch_var: 'to-be-removed', keep_me: 42]
+
+        when:
+        def response = mcpDriver.callTool('hub_delete_variable', [name: 'scratch_var', confirm: true])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.deleted == true
+        inner.source == 'rule_engine'
+        inner.previousValue == 'to-be-removed'
+        stateMap.ruleVariables == [keep_me: 42]
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_delete_variable via dispatch maps missing-confirm to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        stateMap.ruleVariables = [scratch_var: 'value']
+
+        when:
+        def response = mcpDriver.callTool('hub_delete_variable', [name: 'scratch_var'])
+
+        then:
+        response.result?.isError == true
+        stateMap.ruleVariables == [scratch_var: 'value']
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_delete_variable via dispatch maps missing-name to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+
+        when:
+        def response = mcpDriver.callTool('hub_delete_variable', [confirm: true])
+
+        then:
+        response.result?.isError == true
+        mcpDriver.parseInner(response).error.contains('name is required')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_delete_variable via dispatch maps unknown var to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n -> null }
+        stateMap.ruleVariables = [:]
+
+        when:
+        def response = mcpDriver.callTool('hub_delete_variable', [name: 'nonexistent', confirm: true])
+
+        then:
+        response.result?.isError == true
+        mcpDriver.parseInner(response).error.contains("'nonexistent'")
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_delete_variable via dispatch refuses on consumer ref without force (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        stateMap.ruleVariables = [shared_var: 'in-use']
+        def consumer = new support.TestChildApp(id: 99L, label: 'Rule Using Shared Var')
+        consumer.ruleData = [
+            triggers: [],
+            conditions: [[type: 'variable', name: 'shared_var', operator: '=', value: 'on']],
+            actions: []
+        ]
+        childAppsList << consumer
+
+        when:
+        def response = mcpDriver.callTool('hub_delete_variable', [name: 'shared_var', confirm: true])
+
+        then:
+        response.result?.isError == true
+        mcpDriver.parseInner(response).error.contains("'shared_var'")
+        mcpDriver.parseInner(response).error.contains('force=true')
+        stateMap.ruleVariables == [shared_var: 'in-use']
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable via dispatch maps forbidden-character to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+
+        when:
+        def response = mcpDriver.callTool('hub_create_variable', [name: 'has[brackets]', type: 'String', value: 'x', confirm: true])
+
+        then:
+        response.result?.isError == true
+        mcpDriver.parseInner(response).error.contains('forbidden character')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable via dispatch maps unknown-type to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+
+        when:
+        def response = mcpDriver.callTool('hub_create_variable', [name: 'goodName', type: 'NotAType', value: 'x', confirm: true])
+
+        then:
+        response.result?.isError == true
+        mcpDriver.parseInner(response).error.contains('NotAType')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable via dispatch maps missing-confirm to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = mcpDriver.callTool('hub_create_variable', [name: 'goodName', type: 'String', value: 'x'])
+
+        then:
+        response.result?.isError == true
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable via dispatch maps existing hub var to isError validation result (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        enableWrite()
+        script.metaClass.getGlobalVar = { String n ->
+            n == 'taken' ? [name: 'taken', type: 'String', value: 'already here', deviceId: null, attribute: null] : null
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_create_variable', [name: 'taken', type: 'String', value: 'new', confirm: true])
+
+        then:
+        response.result?.isError == true
+        mcpDriver.parseInner(response).error.contains('already exists')
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_create_variable via dispatch creates the bulk array and reports per-item status (useGateways=#useGateways)"() {
+        given: 'the gateway must route the variables arg + the relaxed required:["confirm"]'
+        settingsMap.useGateways = useGateways
+        enableWrite()
+
+        and: 'getGlobalVar: null pre-flight per name, populated after each wizard commits'
+        def seen = [:]
+        script.metaClass.getGlobalVar = { String n ->
+            if (!seen[n]) { seen[n] = true; return null }
+            return [name: n, type: 'Number', value: 1, deviceId: null, attribute: null]
+        }
+        script.metaClass._rmClickAppButton = { Integer appId, String btnName, String stateAttr, String pageName -> [status: 200] }
+        script.metaClass._rmWriteSettingOnPage = { Integer appId, String pageName, String key, Object value, List applied, String typeHint = null, List skipped = null ->
+            if (applied != null) applied << key
+        }
+        script.metaClass._findHubVariablesAppId = { -> 1424 }
+        script.metaClass.backupItemSource = { String type, String id -> [:] }
+
+        when:
+        def response = mcpDriver.callTool('hub_create_variable', [confirm: true, variables: [
+            [name: 'dispBulkA', type: 'Number', value: 1],
+            [name: 'dispBulkB', type: 'Number', value: 2]
+        ]])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.success == true
+        inner.createdCount == 2
+        inner.failedCount == 0
+        inner.results.size() == 2
+        inner.results[0].name == 'dispBulkA'
+        inner.results[0].success == true
+        inner.results[1].name == 'dispBulkB'
+        inner.results[1].success == true
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_list_variable_changes via dispatch caps at limit (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        atomicStateMap.variableHistory = (1..10).collect { i -> [name: 'v', value: i, timestamp: i] }
+
+        when:
+        def response = mcpDriver.callTool('hub_list_variable_changes', [limit: 3])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.entries.size() == 3
+        inner.entries[0].value == 10
+        inner.bufferSize == 10
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_list_variable_changes via dispatch filters by name (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        atomicStateMap.variableHistory = [
+            [name: 'foo', value: 1, timestamp: 1],
+            [name: 'bar', value: 2, timestamp: 2],
+            [name: 'foo', value: 3, timestamp: 3]
+        ]
+
+        when:
+        def response = mcpDriver.callTool('hub_list_variable_changes', [name: 'foo'])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.entries.size() == 2
+        inner.entries.every { it.name == 'foo' }
+
+        where:
+        useGateways << [true, false]
+    }
+
+    @spock.lang.Unroll
+    def "hub_list_variable_changes via dispatch returns empty when buffer is empty (useGateways=#useGateways)"() {
+        given:
+        settingsMap.useGateways = useGateways
+        atomicStateMap.variableHistory = []
+
+        when:
+        def response = mcpDriver.callTool('hub_list_variable_changes', [:])
+
+        then:
+        response.error == null
+        !response.result.isError
+        def inner = mcpDriver.parseInner(response)
+        inner.entries == []
+        inner.bufferSize == 0
+
+        where:
+        useGateways << [true, false]
+    }
+
+    // -------- _resolveDirectAppId (name-addressed app-id resolution) --------
+    //
+    // The /installedapp/direct/<alias> chain is two 302 hops:
+    //   direct/<alias> -> create/<typeId> -> configure/<instanceId>.
+    // hubInternalGetRaw is non-private, so a per-test metaClass stub
+    // intercepts the helper's internal calls (class 1 on the dispatch cheat
+    // sheet); the helper itself is invoked directly — Groovy doesn't enforce
+    // `private` for direct calls from specs.
+
+    def "_resolveDirectAppId follows the two-hop redirect chain to the configure instance id"() {
+        given: 'the hub answers both hops with relative 302 Locations'
+        def gets = []
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            gets << path
+            switch (path) {
+                case '/installedapp/direct/hubVariables': return [status: 302, location: '/installedapp/create/32', data: null]
+                case '/installedapp/create/32':           return [status: 302, location: '/installedapp/configure/1424', data: null]
+                default: throw new IllegalStateException("unexpected GET ${path}")
+            }
+        }
+
+        when:
+        def id = script._resolveDirectAppId('hubVariables')
+
+        then: 'the configure instance id comes back'
+        id == 1424
+
+        and: 'exactly two hops — the configure page itself is never fetched'
+        gets == ['/installedapp/direct/hubVariables', '/installedapp/create/32']
+    }
+
+    def "_resolveDirectAppId tolerates an absolute Location on the final hop"() {
+        given: 'hop 2 redirects with a scheme://host-qualified Location'
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            path == '/installedapp/direct/swapDevice' ?
+                [status: 302, location: '/installedapp/create/38', data: null] :
+                [status: 302, location: 'http://127.0.0.1:8080/installedapp/configure/1802', data: null]
+        }
+
+        expect:
+        script._resolveDirectAppId('swapDevice') == 1802
+    }
+
+    def "_resolveDirectAppId returns null on a non-redirect response"() {
+        given: 'the platform client auto-followed an absolute Location and handed back 200 HTML with no Location (hubInternalGetRaw caveat)'
+        def gets = []
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            gets << path
+            [status: 200, location: null, data: '<html>configure page</html>']
+        }
+        def logged = []
+        script.metaClass.mcpLog = { String level, String component, String msg ->
+            logged << [level: level, component: component, msg: msg]
+        }
+
+        when:
+        def id = script._resolveDirectAppId('hubVariables')
+
+        then:
+        id == null
+
+        and: 'it gave up on the first hop instead of guessing from the HTML body'
+        gets.size() == 1
+
+        and: 'a hub-admin warn summarizes the cause (incl. the absolute-Location auto-follow caveat) without needing debug logging'
+        logged.any { it.level == 'warn' && it.component == 'hub-admin' && it.msg.contains('hubVariables') && it.msg.contains('auto-followed') }
+    }
+
+    def "_resolveDirectAppId returns null on a garbage Location"() {
+        given: 'a 302 pointing somewhere outside the direct chain'
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            [status: 302, location: '/hub/error', data: null]
+        }
+
+        expect:
+        script._resolveDirectAppId('hubVariables') == null
+    }
+
+    def "_resolveDirectAppId returns null when hop 2 redirects to create/ again"() {
+        given: 'the create hop bounces to ANOTHER create/ instead of configure/ — a create match is only legal on hop 1'
+        def logged = []
+        script.metaClass.mcpLog = { String level, String component, String msg ->
+            logged << [level: level, component: component, msg: msg]
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            path == '/installedapp/direct/hubVariables' ?
+                [status: 302, location: '/installedapp/create/32', data: null] :
+                [status: 302, location: '/installedapp/create/99', data: null]
+        }
+
+        expect:
+        script._resolveDirectAppId('hubVariables') == null
+
+        and: 'the unexpected-Location warn fired at hub-admin'
+        logged.any { it.level == 'warn' && it.component == 'hub-admin' && it.msg.contains('unexpected Location') }
+    }
+
+    def "_resolveDirectAppId returns null when the request throws"() {
+        given:
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            throw new RuntimeException('connection refused')
+        }
+
+        expect:
+        script._resolveDirectAppId('hubVariables') == null
+    }
+
+    // -------- _findHubVariablesAppId resolution order (cache -> direct -> appsList) --------
+    //
+    // The old per-id endpoint scan (1..3000 GETs of configure/json) is gone;
+    // the "throws when both miss" spec pins its absence via hubGet.calls.
+
+    def "_findHubVariablesAppId returns the cached id without any HTTP"() {
+        given:
+        atomicStateMap.hubVarsAppId = 777
+        def rawGets = []
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            rawGets << path
+            [status: 200, location: null, data: null]
+        }
+
+        when:
+        def id = script._findHubVariablesAppId()
+
+        then:
+        id == 777
+        rawGets.empty
+        hubGet.calls.empty
+    }
+
+    def "_findHubVariablesAppId resolves via the direct alias first and caches the result"() {
+        given: 'no cache; the direct chain resolves'
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            path == '/installedapp/direct/hubVariables' ?
+                [status: 302, location: '/installedapp/create/32', data: null] :
+                [status: 302, location: '/installedapp/configure/1424', data: null]
+        }
+
+        when:
+        def id = script._findHubVariablesAppId()
+
+        then:
+        id == 1424
+        atomicStateMap.hubVarsAppId == 1424
+
+        and: 'the appsList walk never ran'
+        hubGet.calls.empty
+    }
+
+    def "_findHubVariablesAppId falls back to the appsList walk when the direct alias fails"() {
+        given: 'the direct chain dead-ends (non-redirect)'
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            [status: 200, location: null, data: null]
+        }
+
+        and: 'appsList carries the Hub Variables node; configure/json confirms it'
+        hubGet.register('/hub2/appsList') { params ->
+            groovy.json.JsonOutput.toJson([apps: [[data: [id: 9, type: 'Other App'], children: [[data: [id: 1424, type: 'Hub Variables'], children: []]]]]])
+        }
+        hubGet.register('/installedapp/configure/json/1424') { params ->
+            groovy.json.JsonOutput.toJson([app: [appType: [name: 'Hub Variables']]])
+        }
+
+        when:
+        def id = script._findHubVariablesAppId()
+
+        then:
+        id == 1424
+        atomicStateMap.hubVarsAppId == 1424
+    }
+
+    def "_findHubVariablesAppId rejects an appsList candidate whose configure/json name mismatches"() {
+        given:
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            [status: 200, location: null, data: null]
+        }
+        hubGet.register('/hub2/appsList') { params ->
+            groovy.json.JsonOutput.toJson([apps: [[data: [id: 50, type: 'Hub Variables'], children: []]]])
+        }
+        hubGet.register('/installedapp/configure/json/50') { params ->
+            groovy.json.JsonOutput.toJson([app: [appType: [name: 'Definitely Not Hub Variables']]])
+        }
+
+        when:
+        script._findHubVariablesAppId()
+
+        then: 'the mismatched id is neither returned nor cached — a wrong cached id would break every wizard tool'
+        thrown(IllegalStateException)
+        atomicStateMap.hubVarsAppId == null
+    }
+
+    def "_findHubVariablesAppId keeps an appsList match when the verify fetch errors (best-effort verify)"() {
+        given:
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            [status: 200, location: null, data: null]
+        }
+
+        and: 'configure/json left unregistered — the mock throws, simulating transient HTTP failure'
+        hubGet.register('/hub2/appsList') { params ->
+            groovy.json.JsonOutput.toJson([apps: [[data: [id: 60, type: 'Hub Variables'], children: []]]])
+        }
+
+        when:
+        def id = script._findHubVariablesAppId()
+
+        then: 'the name-keyed appsList match survives a flaky verify'
+        id == 60
+        atomicStateMap.hubVarsAppId == 60
+    }
+
+    def "_findHubVariablesAppId throws (no id scan) when both direct alias and appsList miss"() {
+        given: 'the direct chain dead-ends and appsList has no Hub Variables node'
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            [status: 200, location: null, data: null]
+        }
+        hubGet.register('/hub2/appsList') { params ->
+            groovy.json.JsonOutput.toJson([apps: [[data: [id: 9, type: 'Other App'], children: []]]])
+        }
+
+        when:
+        script._findHubVariablesAppId()
+
+        then:
+        def ex = thrown(IllegalStateException)
+        ex.message.contains('/installedapp/direct/hubVariables')
+        ex.message.contains('/hub2/appsList')
+
+        and: 'no per-id endpoint scan happened — the only classic GET was the appsList walk'
+        hubGet.calls*.path == ['/hub2/appsList']
+    }
+
+    def "_findHubVariablesAppId rediscovers when the cached id is garbage"() {
+        given: 'a non-numeric cache value left behind by an older version'
+        atomicStateMap.hubVarsAppId = 'not-a-number'
+        script.metaClass.hubInternalGetRaw = { String path, Map q = null, int t = 30, boolean r = false ->
+            path == '/installedapp/direct/hubVariables' ?
+                [status: 302, location: '/installedapp/create/32', data: null] :
+                [status: 302, location: '/installedapp/configure/1424', data: null]
+        }
+
+        when:
+        def id = script._findHubVariablesAppId()
+
+        then:
+        id == 1424
+        atomicStateMap.hubVarsAppId == 1424
+    }
+}

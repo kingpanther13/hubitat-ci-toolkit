@@ -1,0 +1,158 @@
+plugins {
+    id 'groovy'
+}
+
+repositories {
+    mavenCentral()
+    // eighty20results/hubitat_ci — actively-maintained Groovy 3.0 fork of
+    // the original biocomp/hubitat_ci (dormant on Maven since 2019).
+    // Consumed via JitPack by release tag — no auth, reproducible, free-tier.
+    //
+    // Why this fork:
+    // - Groovy 3.0 is module-aware, so the JDK-module `--add-opens` block
+    //   from PR #83 (Groovy 2.5-era workaround) is no longer needed.
+    // - Active commits focused on matching Hubitat runtime behaviour:
+    //   case-insensitive enum matching, locale-safe toLowerCase,
+    //   negative-enum test restoration, integration harness regression fixes.
+    // - Cuts release tags (v0.28.6, v0.28.5, …) — pinnable by version.
+    //
+    // Note on helper-class resolution: eighty20results maps
+    // `hubitat.helper.{RMUtils, ColorUtils, HexUtils, ZigbeeUtils}` to its
+    // own `common_api.*` namespace in SandboxClassLoader, but that alone
+    // doesn't resolve sandbox-loaded production-code references — the JVM
+    // §5.3.5 name-equality check rejects the remapped class when
+    // bytecode has a constant-pool entry for the literal
+    // `hubitat.helper.RMUtils`. We carry `support.PassThroughSandboxClassLoader`
+    // + main-source-set stubs (`src/main/groovy/hubitat/helper/`) to
+    // bypass the remap for those specific names; see that class's
+    // Javadoc for the call chain.
+    //
+    // Migration cost paid in this PR: 3 specs reworked for eighty20results'
+    // child-app registry API and `childAppResolver` closure requirement;
+    // PassThrough scaffold ported from the earlier PR #99 work.
+    maven {
+        url = 'https://jitpack.io'
+        content {
+            includeGroup 'com.github.eighty20results'
+        }
+        // Force Gradle to resolve eighty20results dependencies via the POM
+        // only. JitPack republishes Gradle Module Metadata (.module files)
+        // with an empty apiElements dependency list, which would otherwise
+        // strip the transitive classpath entirely. mavenPom() makes Gradle
+        // read the full <dependencies> block.
+        //
+        // Note: eighty20results' POM marks every dep as <scope>runtime</scope>,
+        // which keeps them off the compile classpath even under mavenPom.
+        // Compile-time references from HubitatCI's public bytecode (e.g. the
+        // `groovyx.net.http.HttpResponseDecorator` parameter in BaseExecutor,
+        // reached via the AppExecutor @Delegate chain that HubitatAppScript
+        // exposes) must be mirrored explicitly as testImplementation — see
+        // the deps block below.
+        metadataSources {
+            mavenPom()
+        }
+    }
+}
+
+dependencies {
+    // eighty20results is compiled against Groovy 3.0.21; using current
+    // 3.0 line (3.0.25) for consumer compatibility. Hubitat's runtime is
+    // Groovy 2.4 but 3.0 is largely backward-compatible for the imperative
+    // script patterns our MCP server uses; the fork actively tests against
+    // Hubitat behaviour and fixes divergence.
+    //
+    // Uses `implementation` (not `testImplementation`) because
+    // `src/main/groovy/hubitat/helper/{RMUtils,NetworkUtils}.groovy` — the
+    // literal-name stubs that `PassThroughSandboxClassLoader` resolves to
+    // — live in the main source-set and need Groovy at compile time. The
+    // stubs never deploy (packageManifest.json ships only the two
+    // top-level server/rule files), so the main-source-set Groovy dep
+    // stays local to the build.
+    implementation 'org.codehaus.groovy:groovy-all:3.0.25'
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-3.0'
+    // eighty20results/hubitat_ci pinned by release tag. Bumped by tracking
+    // issues from .github/workflows/hubitat-ci-version-check.yml.
+    testImplementation 'com.github.eighty20results:hubitat_ci:v0.28.6'
+    // eighty20results' POM declares all of its deps as <scope>runtime</scope>,
+    // which keeps them off our compile classpath. Mirror the ones we need
+    // for `compileTestGroovy` to resolve type references carried in
+    // HubitatCI's bytecode. The versions here match the POM exactly so we
+    // don't silently drift from what the fork compiled against.
+    testImplementation 'org.codehaus.groovy.modules.http-builder:http-builder:0.7.1'
+    testImplementation 'org.quartz-scheduler:quartz:2.5.2'
+    // Pinned to 0.11.1 — 0.11.3's POM declares jackson with a
+    // Maven-style *discontinuous* version range
+    // `[2.9.1,2.9.99],[2.10.1,2.10.99]`. Gradle's resolver reads the
+    // whole string as a single literal constraint and fails with
+    // "Could not find ... jackson-annotations:[2.9.1,2.9.99],[2.10.1,2.10.99]".
+    // 0.11.1 uses a single continuous range that Gradle handles. Dep
+    // is only on our classpath to satisfy eighty20results' bytecode
+    // reference to `common_api.ChromeCast` — we don't consume the
+    // API directly, so staying on the older version is harmless.
+    // Pinned in .github/dependabot.yml to suppress the weekly bump.
+    testImplementation 'su.litvak.chromecast:api-v2:0.11.1'
+    // Required by Spock to Mock/Spy non-interface types (TestDevice, TestChildApp).
+    // Spock 2.x can use either byte-buddy or cglib-nodep as its class-gen
+    // backend; neither is a transitive dep of spock-core.
+    testImplementation 'net.bytebuddy:byte-buddy:1.18.14'
+
+    // JSON Schema validator — the referee for McpWireSchemaConformanceSpec (see
+    // src/test/resources/mcp-schema/README.md). Every standard meta-schema ships
+    // inside the jar, so validation never touches the network.
+    //
+    // MAJORS are pinned out in .github/dependabot.yml: 3.x targets Java 17 and this
+    // project's test toolchain is JDK 11 (see the java{} block below), so a 3.x bump
+    // fails to compile. Minor/patch bumps inside 2.x are fine.
+    // It pulls jackson-databind and slf4j-api above the Maven-style ranges
+    // su.litvak.chromecast:api-v2 declares — a plain upgrade under Gradle's
+    // rich-version rules, not a conflict, and nothing here consumes that jackson.
+    testImplementation 'com.networknt:json-schema-validator:2.0.7'
+
+    // Security pin: commons-collections 3.2.x carries the InvokeTransformer
+    // deserialization RCE (CVE-2015-7501, CVE-2015-6420). 3.2.2 is a drop-in
+    // patch on the same 3.2.x release line — adds FunctorUtils serialization
+    // guards, no API change.
+    // Reaches the test classpath transitively only
+    // (hubitat_ci -> http-builder -> json-lib -> commons-collections) and is
+    // never shipped — packageManifest.json deploys only the two .groovy files.
+    constraints {
+        testImplementation('commons-collections:commons-collections:3.2.2') {
+            because 'CVE-2015-7501/-6420 — drop-in security patch on a test-only transitive'
+        }
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(11)
+    }
+}
+
+test {
+    useJUnitPlatform()
+    // Keep specs single-threaded. RMUtilsMock and NetworkUtilsMock inject static
+    // metaclass methods on hubitat.helper.RMUtils / .NetworkUtils — concurrent
+    // specs installing and uninstalling these at the same time would race.
+    maxParallelForks = 1
+    // Each spec parses the inlined server plus every library (over 3 MB of Groovy); Gradle's 512m
+    // default runs out of heap in the parser.
+    maxHeapSize = '1g'
+    // Forward harness-debug flags into the forked test JVM. Off by default;
+    // enable via `./gradlew test -PharnessStrictMetaClass=true` when chasing
+    // a metaClass-leak regression — turns the post-wipe check in
+    // HarnessSpec.setup() / RuleHarnessSpec.setup() into a loud failure that
+    // pinpoints the surviving expando entry. See `checkMetaClassClean()`.
+    if (project.hasProperty('harnessStrictMetaClass')) {
+        systemProperty 'harnessStrictMetaClass', project.harnessStrictMetaClass
+    }
+    if (project.hasProperty('harness.useGateways')) {
+        systemProperty 'harness.useGateways', project.getProperty('harness.useGateways')
+    }
+    testLogging {
+        // Include 'started' so CI streams per-test output live — without
+        // it, a slow spec leaves the runner silent for minutes and the
+        // next regression in harness overhead is invisible in the job log.
+        events 'started', 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+    }
+}

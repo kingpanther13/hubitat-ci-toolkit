@@ -1,0 +1,725 @@
+package server
+
+import groovy.json.JsonOutput
+import support.ToolSpecBase
+
+/**
+ * Issue #181: the flat tools/list catalog (useGateways=false) sits ~360 bytes
+ * under the hub's 124,000-byte response cap. hub_set_rule alone is ~33 KB
+ * (27% of the catalog), most of which is static capability enumeration that's
+ * either (a) covered by the tool's {discover: true} mode or (b) documented in
+ * TOOL_GUIDE.md / docs/rm_action_subtype_schemas.md.
+ *
+ * The fix is a flat-mode-only transform: `[[FLAT_TRIM]] ... [[/FLAT_TRIM]]`
+ * markers in the schema descriptions are STRIPPED WITH CONTENT in flat mode
+ * (recover the bytes) and STRIPPED WITHOUT CONTENT (just the tokens) in every
+ * other client-visible surface (gateway-catalog mode, hub_search_tools corpus,
+ * missing-param error hints).
+ *
+ * These tests pin the contract end-to-end so a future author who adds new
+ * markers, removes them, or breaks the transform learns about it from CI.
+ */
+class UpdateNativeAppSchemaTrimSpec extends ToolSpecBase {
+
+    // 122,000 = ~2 KB headroom under the hub's 124,000-byte JSON-RPC response cap.
+    // The earlier 118,000 budget had ~6 KB headroom but no MCP `annotations.readOnlyHint`
+    // / `destructiveHint` keys -- adding those for client-side Read/Write grouping
+    // costs ~5 KB across the ~100-tool flat catalog. The 2 KB residual headroom
+    // is still wider than any single description's variance. The lower bound
+    // (FLAT_CATALOG_BYTE_FLOOR) guards against an accidental over-trim regression
+    // where someone drops content unconditionally -- if the catalog ever falls
+    // below ~100 KB on a flat-mode run, something important is missing.
+    private static final int FLAT_CATALOG_BYTE_BUDGET = 122_000
+    private static final int FLAT_CATALOG_BYTE_FLOOR = 100_000
+    private static final String OPEN_MARKER = '[[FLAT_TRIM]]'
+    private static final String CLOSE_MARKER = '[[/FLAT_TRIM]]'
+
+    // Deliberately leaves Developer Mode OFF: the [FLOOR, BUDGET] calibration below
+    // is for the default catalog a normal hub serves. The wider dev-mode-on surface
+    // (adds hub_update_package) gets its own hard-cap + leak guard further down.
+    private void enableEveryToggle() {
+        settingsMap.enableCustomRuleEngine = true
+    }
+
+    def "flat-mode tools/list full-catalog size sits between the floor and budget"() {
+        given: 'every feature toggle on so the flat catalog is at its widest'
+        settingsMap.useGateways = false
+        enableEveryToggle()
+
+        when:
+        // tools/list now returns the full catalog in a single response (pagination
+        // was removed in this PR); this test guards the total catalog footprint
+        // as the regression tripwire. The universal response-size guard at
+        // handleMcpRequest's response path emits -32603 if the wire response
+        // exceeds 124,000 bytes -- keep the catalog comfortably below that with
+        // the budget tripwire below.
+        def tools = script.getToolDefinitions()
+        def catalogBytes = JsonOutput.toJson(tools).getBytes('UTF-8').length
+
+        then: 'catalog within [FLOOR, BUDGET] -- ~6 KB cap headroom + over-trim guard'
+        if (catalogBytes > FLAT_CATALOG_BYTE_BUDGET || catalogBytes < FLAT_CATALOG_BYTE_FLOOR) {
+            def topFive = tools.collect { [name: it.name, bytes: JsonOutput.toJson(it).getBytes('UTF-8').length] }
+                               .sort { -it.bytes }
+                               .take(5)
+                               .collect { "  ${it.name}: ${it.bytes} B" }
+                               .join('\n')
+            throw new AssertionError(
+                "flat-mode tools/list catalog ${catalogBytes} B is outside [${FLAT_CATALOG_BYTE_FLOOR}, ${FLAT_CATALOG_BYTE_BUDGET}].\n" +
+                "Top 5 tools by JSON size:\n${topFive}\n" +
+                "Over-budget? Wrap more prose in [[FLAT_TRIM]] markers (issue #181).\n" +
+                "Under-floor? Someone dropped content unconditionally -- check recent edits." as String
+            )
+        }
+        catalogBytes <= FLAT_CATALOG_BYTE_BUDGET
+        catalogBytes >= FLAT_CATALOG_BYTE_FLOOR
+    }
+
+    def "flat-mode tools/list catalog does not leak [[FLAT_TRIM]] tokens"() {
+        given:
+        settingsMap.useGateways = false
+        enableEveryToggle()
+
+        when:
+        // One build, both assertions: a second getToolDefinitions() call would let the named
+        // scan and the serialized payload disagree if a leak ever depended on build state.
+        def tools = script.getToolDefinitions()
+        def catalogJson = JsonOutput.toJson(tools)
+
+        then: 'neither opening nor closing marker appears in the wire payload'
+        // Named, not just counted: on a 116-tool catalog a bare contains() failure prints the
+        // whole payload and never says which tool leaked.
+        tools.findAll {
+            def j = JsonOutput.toJson(it)
+            j.contains(OPEN_MARKER) || j.contains(CLOSE_MARKER)
+        }*.name == []
+        !catalogJson.contains(OPEN_MARKER)
+        !catalogJson.contains(CLOSE_MARKER)
+    }
+
+    def "flat-mode hub_restore_backup keeps its verify-before-retry warning"() {
+        // A blind retry of a lost restore response restores and reboots the whole hub a second
+        // time, so this sentence survives the flat trim even though other writes drop theirs.
+        given:
+        settingsMap.useGateways = false
+
+        when:
+        def restore = script.getToolDefinitions().find { it.name == 'hub_restore_backup' }
+
+        then:
+        restore.description.contains('A transport drop can lose the response while the hub still commits this write; verify current hub state before retrying.')
+    }
+
+    def "flat-mode tools/list with Developer Mode ON stays under the hub cap and leaks no FLAT_TRIM tokens"() {
+        // hub_update_package is catalog-hidden unless enableDeveloperMode is true, so
+        // the default-toggles guards above never serialize it -- its description carries
+        // FLAT_TRIM markers and its entry widens the flat catalog past what the budget
+        // test measures. This is the only guard for the widest catalog a real hub can
+        // emit; over the hard cap, flat+dev clients get -32603 and ZERO tools.
+        given:
+        settingsMap.useGateways = false
+        enableEveryToggle()
+        settingsMap.enableDeveloperMode = true
+
+        when:
+        def tools = script.getToolDefinitions()
+        def catalogJson = JsonOutput.toJson([tools: tools])
+        def catalogBytes = catalogJson.getBytes('UTF-8').length
+
+        then: 'the dev-mode tool is actually present (guard is not vacuous)'
+        tools*.name.contains('hub_update_package')
+
+        and: 'under the hub hard cap with the dev-mode entry included, less an allowance for the JSON-RPC envelope (jsonrpc/id/result wrapper) the live response adds around this payload'
+        assert catalogBytes < 123_500 : "dev-mode flat tools/list payload is ${catalogBytes} bytes; with the JSON-RPC envelope the live response must stay under the 124,000 hub cap"
+
+        and: 'no marker tokens leak from the dev-mode entry (or any other)'
+        !catalogJson.contains(OPEN_MARKER)
+        !catalogJson.contains(CLOSE_MARKER)
+    }
+
+    def "gateway-mode tools/list catalog does not leak [[FLAT_TRIM]] tokens"() {
+        given: 'gateway-mode entries are short prose + sub-tool summaries (no markers expected today, but pin this anyway)'
+        settingsMap.useGateways = true
+        enableEveryToggle()
+
+        when:
+        def catalogJson = JsonOutput.toJson(script.getToolDefinitions())
+
+        then:
+        !catalogJson.contains(OPEN_MARKER)
+        !catalogJson.contains(CLOSE_MARKER)
+    }
+
+    def "hub_set_rule gateway-catalog description is lean after the #181 / gateway trim"() {
+        // The per-capability reference moved OUT of the inline description into the
+        // set_rule_reference guide (reachable inline via guide:true), so it is
+        // gone from BOTH modes -- not merely FLAT_TRIM'd. Consequence: the flat-vs-gateway
+        // delta is now small (most of what FLAT_TRIM used to drop no longer exists inline),
+        // and the gateway def itself, previously ~54 KB, is now well under 40 KB. This test
+        // guards that gateway-side leanness win rather than the old flat-vs-gateway delta.
+        given: 'gateway-catalog mode is the disclosure surface for full per-tool schemas'
+        enableEveryToggle()
+
+        when: 'flat-mode tools/list entry'
+        settingsMap.useGateways = false
+        def flatDef = script.getToolDefinitions().find { it.name == 'hub_set_rule' }
+        def flatBytes = JsonOutput.toJson(flatDef).getBytes('UTF-8').length
+
+        and: 'gateway-catalog response from handleGateway (no toolName)'
+        settingsMap.useGateways = true
+        def gatewayResp = script.handleGateway('hub_manage_rule_machine', null, [:])
+        def gwUpdateNative = gatewayResp.tools.find { it.name == 'hub_set_rule' }
+        def gwBytes = JsonOutput.toJson(gwUpdateNative).getBytes('UTF-8').length
+
+        then: 'flat is still <= gateway (some FLAT_TRIM remains), and the gateway def is now lean (was ~54 KB)'
+        flatBytes <= gwBytes
+        gwBytes < 40_000
+    }
+
+    def "hub_set_rule flat-mode is the thin self-gateway selector that still reaches discover/guide"() {
+        // Flat mode no longer emits hub_set_rule's 25-param fat schema; it folds to a
+        // thin {operation,appId,args,confirm} selector (the per-operation schema is
+        // fetched on demand via the args-omitted probe). The fat per-capability prose +
+        // pointers live in gateway mode + the probe (covered by the sibling tests).
+        given:
+        settingsMap.useGateways = false
+        enableEveryToggle()
+
+        when:
+        def def_ = script.getToolDefinitions().find { it.name == 'hub_set_rule' }
+        def props = def_.inputSchema.properties
+
+        then: 'flat hub_set_rule is the thin selector, NOT the fat 24-param schema'
+        props.keySet() == ['operation', 'appId', 'args', 'confirm'] as Set
+        props.operation.enum.containsAll(['create', 'addTrigger', 'addAction', 'addRequiredExpression', 'guide', 'discover'])
+
+        and: 'an agent is never blind: guide + discover are reachable operations, and the description points to both'
+        props.operation.enum.contains('guide')
+        props.operation.enum.contains('discover')
+        (def_.description + props.operation.description).toLowerCase().contains('discover')
+        (def_.description + props.operation.description).toLowerCase().contains('guide')
+
+        and: 'far smaller than the fat schema (the whole point of the fold)'
+        groovy.json.JsonOutput.toJson(def_).length() < 4000
+    }
+
+    def "hub_set_rule per-capability reference lives in the guide; inline keeps a name summary + pointer"() {
+        // Post-#181/gateway trim: the exhaustive per-capability families moved OUT of the
+        // inline description (both modes) into the set_rule_reference guide. The
+        // inline description keeps a capability-NAME summary + a guide pointer so an agent is
+        // never blind, and can pull the full reference inline via guide:true / discover:true.
+        given:
+        settingsMap.useGateways = true
+        enableEveryToggle()
+
+        when: 'gateway-catalog disclosure (caller invokes the gateway with no toolName)'
+        def gatewayResp = script.handleGateway('hub_manage_rule_machine', null, [:])
+        def updateNative = gatewayResp.tools.find { it.name == 'hub_set_rule' }
+        def addTrigger = updateNative.inputSchema.properties.addTrigger.description
+        def addAction = updateNative.inputSchema.properties.addAction.description
+        def addRequiredExpression = updateNative.inputSchema.properties.addRequiredExpression.description
+        def guide = script.toolGetToolGuide('set_rule_reference').content as String
+
+        then: 'the inline descriptions no longer carry the exhaustive enumerations'
+        !addTrigger.contains('Capability families and the spec fields each accepts')
+        !addAction.contains('Capability families and the spec fields each accepts')
+        !addRequiredExpression.contains("RM's STPage capability list")
+
+        and: 'they keep a capability-name summary + a guide pointer (agent never blind)'
+        addTrigger.contains('Periodic Schedule')
+        addTrigger.contains("hub_get_tool_guide(section='set_rule_reference_triggers')")
+        addAction.contains('ifThen')
+        addRequiredExpression.contains("hub_get_tool_guide(section='set_rule_reference_conditions')")
+
+        and: 'the full per-capability reference lives in the set_rule_reference guide'
+        guide.contains('`addTrigger` capability families')
+        guide.contains('`addAction` capability families')
+        guide.contains('`addRequiredExpression` STPage capability list')
+        guide.contains('Periodic Schedule')
+
+        and: 'no marker tokens leaked into the response'
+        !addTrigger.contains(OPEN_MARKER) && !addTrigger.contains(CLOSE_MARKER)
+        !addAction.contains(OPEN_MARKER) && !addAction.contains(CLOSE_MARKER)
+        !addRequiredExpression.contains(OPEN_MARKER) && !addRequiredExpression.contains(CLOSE_MARKER)
+    }
+
+    def "stripFlatTrim strips include-library line markers on every description surface (issue #342)"() {
+        // The hub appends "// library marker mcp.<Lib>, line N" to every physical line of
+        // an #include'd library, so a multi-line \"\"\" string in a library file (three tool
+        // descriptions had them) carries the markers into its runtime value on a real hub.
+        // The harness re-inlines libraries WITHOUT markers, so catalog-level tests can't
+        // see the leak -- pin the chokepoint helper in both dropContent modes instead.
+        expect:
+        script.stripFlatTrim('Create a device. // library marker mcp.McpVirtualDevicesLib, line 295\nNext line. // library marker mcp.McpVirtualDevicesLib, line 296', dropContent) ==
+            'Create a device.\nNext line.'
+
+        where:
+        dropContent << [true, false]
+    }
+
+    def "stripFlatTrim helper handles own-line and inline markers correctly"() {
+        when: 'own-line block, dropContent=true: marker lines + content removed, surrounding paragraphs separated by one blank line'
+        def ownLineDropped = script.stripFlatTrim(
+            "alpha\n\n[[FLAT_TRIM]]\ndrop this\nand this\n[[/FLAT_TRIM]]\n\nbeta",
+            true
+        )
+
+        then:
+        ownLineDropped == 'alpha\n\nbeta'
+
+        when: 'own-line block, dropContent=false: marker lines stripped, content kept'
+        def ownLineKept = script.stripFlatTrim(
+            "alpha\n\n[[FLAT_TRIM]]\nkeep this\nand this\n[[/FLAT_TRIM]]\n\nbeta",
+            false
+        )
+
+        then:
+        ownLineKept == 'alpha\n\nkeep this\nand this\n\nbeta'
+
+        when: 'inline markers, dropContent=true: mid-sentence content removed, line structure preserved'
+        def inlineDropped = script.stripFlatTrim(
+            'prefix.[[FLAT_TRIM]] drop me[[/FLAT_TRIM]]\nnext line',
+            true
+        )
+
+        then:
+        inlineDropped == 'prefix.\nnext line'
+
+        when: 'inline markers, dropContent=false: just tokens removed, content stays'
+        def inlineKept = script.stripFlatTrim(
+            'prefix.[[FLAT_TRIM]] keep me[[/FLAT_TRIM]]\nnext line',
+            false
+        )
+
+        then:
+        inlineKept == 'prefix. keep me\nnext line'
+
+        when: 'null input returns null'
+        def nullOut = script.stripFlatTrim(null, true)
+
+        then:
+        nullOut == null
+
+        when: 'no markers: text unchanged'
+        def noMarkers = script.stripFlatTrim('just plain text\nno markers here', true)
+
+        then:
+        noMarkers == 'just plain text\nno markers here'
+
+        when: 'empty content between own-line markers: block removed cleanly'
+        def emptyOwnLine = script.stripFlatTrim("before\n\n[[FLAT_TRIM]]\n\n[[/FLAT_TRIM]]\n\nafter", true)
+
+        then:
+        emptyOwnLine == 'before\n\nafter'
+
+        when: 'unmatched open marker, dropContent=true: passes through unchanged so CI leak guard trips loud'
+        def lonelyOpenDrop = script.stripFlatTrim('before [[FLAT_TRIM]] tail with no close', true)
+
+        then: 'paired markers required; a stray open is left visible (fail-loud, not silent data loss)'
+        lonelyOpenDrop == 'before [[FLAT_TRIM]] tail with no close'
+
+        when: 'unmatched open marker, dropContent=false: silently stripped (intentional asymmetry)'
+        def lonelyOpenKeep = script.stripFlatTrim('before [[FLAT_TRIM]] tail with no close', false)
+
+        then: 'token-strip mode strips ANY lone marker since the marker is itself the bug to prevent'
+        lonelyOpenKeep == 'before  tail with no close'
+
+        when: 'unmatched close marker, dropContent=false: same lone-token strip applies'
+        def lonelyCloseKeep = script.stripFlatTrim('before [[/FLAT_TRIM]] tail with no open', false)
+
+        then:
+        lonelyCloseKeep == 'before  tail with no open'
+    }
+
+    def "hub_search_tools BM25 corpus contains no marker tokens in any top-level description"() {
+        given:
+        enableEveryToggle()
+
+        when:
+        def corpus = script.buildToolSearchCorpus()
+
+        then: 'no marker tokens leak into the indexed corpus text'
+        // SCOPE NOTE: `buildToolSearchCorpus` only feeds `tool.description` (core
+        // branch) or `summary + gateway.description` (gateway branch) into BM25 --
+        // it does NOT index `inputSchema.properties.*.description`. So today every
+        // [[FLAT_TRIM]] marker in the schema (all of them in `hub_set_rule`'s
+        // property descriptions) is structurally outside this guard's reach.
+        //
+        // The guard is defensive against a future core tool wrapping prose in its
+        // top-level description: if `applyDescriptionTransform` were skipped on the
+        // core branch (`libraries/mcp-native-rules-lib.groovy`), the marker would surface
+        // here as a BM25 token. We also don't assert on `params` (property names
+        // only -- structurally can't carry markers) or `hints` (author-controlled
+        // gatewayConfig text -- structurally can't carry markers either).
+        corpus.every {
+            !((String) (it.description ?: '')).contains(OPEN_MARKER) &&
+            !((String) (it.description ?: '')).contains(CLOSE_MARKER)
+        }
+    }
+
+    def "applyDescriptionTransform is idempotent -- a second call leaves the descriptions unchanged"() {
+        given: 'fresh tool defs with FLAT_TRIM markers in place'
+        def first = script.applyDescriptionTransform(script.getAllToolDefinitions(), true)
+        def afterFirst = JsonOutput.toJson(first)
+
+        when: 'apply the same transform a second time on the same in-place mutated list'
+        def second = script.applyDescriptionTransform(first, true)
+        def afterSecond = JsonOutput.toJson(second)
+
+        then: 'the second pass is a no-op -- second call must produce identical bytes'
+        // Today no consumer caches the list, but a future memoization refactor that
+        // does would silently double-strip without this guard.
+        afterFirst == afterSecond
+
+        when: 'same check for dropContent=false'
+        def firstFalse = script.applyDescriptionTransform(script.getAllToolDefinitions(), false)
+        def secondFalse = script.applyDescriptionTransform(firstFalse, false)
+
+        then:
+        JsonOutput.toJson(firstFalse) == JsonOutput.toJson(secondFalse)
+    }
+
+    def "schema description pointers resolve to existing hub_get_tool_guide sections"() {
+        given: 'schema descriptions tell callers to fetch reference content via hub_get_tool_guide(section=X)'
+        def allDefs = script.getAllToolDefinitions()
+        def updateNativeDef = allDefs.find { it.name == 'hub_set_rule' }
+        def listDevicesDef = allDefs.find { it.name == 'hub_list_devices' }
+        def hpmPackagesDef = allDefs.find { it.name == 'hub_list_hpm_packages' }
+        // The create-reference pointer now lives in hub_set_rule's create paragraph
+        // (the create+edit upsert absorbed the old hub_create_native_app).
+        def createNativeDef = updateNativeDef
+        def addTriggerDesc = updateNativeDef.inputSchema.properties.addTrigger.description as String
+        def addActionDesc = updateNativeDef.inputSchema.properties.addAction.description as String
+        def addRequiredExprDesc = updateNativeDef.inputSchema.properties.addRequiredExpression.description as String
+        def listDevicesFieldsDesc = listDevicesDef.inputSchema.properties.fields.description as String
+
+        when: 'collect every section name from hub_get_tool_guide and every pointer in the schemas'
+        // Issue #392: a pointer may target a section OR one of the narrower sub-keys the same
+        // `section` parameter resolves; both are reachable content, so both count as valid here.
+        def validSections = (script.getToolGuideSections().keySet() as Set) +
+                            (script.getToolGuideSubSections().values().collectMany { it.keySet().toList() } as Set)
+        def pointerPattern = ~/hub_get_tool_guide\(section\s*=\s*['"]([a-z_]+)['"]\)/
+        def descriptionsToCheck = [
+            addTriggerDesc, addRequiredExprDesc,
+            listDevicesDef.description as String, listDevicesFieldsDesc,
+            hpmPackagesDef.description as String,
+            createNativeDef.description as String,
+        ]
+        def pointerSections = [] as Set
+        descriptionsToCheck.each { desc ->
+            def m = pointerPattern.matcher(desc)
+            while (m.find()) {
+                pointerSections << m.group(1)
+            }
+        }
+
+        then: 'every hub_get_tool_guide(section=...) pointer in the schemas references a section that actually exists'
+        // Guards against silent breakage if a section is renamed in getToolGuideSections
+        // or a pointer is typoed. The previous test version pinned against TOOL_GUIDE.md
+        // headings -- correct as far as it went, but didn't ensure the content was
+        // actually reachable through the MCP layer at runtime. This is the test that
+        // proves flat-mode callers can fetch the reference content the trim points them at.
+        //
+        // 5 unique keys across the 5 trimmed description sites -- issue #392 retargeted the
+        // ones whose parent was oversized at the narrower sub-key that actually answers them:
+        // - set_rule_reference_triggers (addTrigger)
+        // - set_rule_reference_conditions (addRequiredExpression)
+        // - performance_devices (hub_list_devices top-level + .fields property)
+        // - builtin_app_tools_apps (hub_list_hpm_packages -- drift prose lives here post-merge)
+        // - set_rule_create_reference (hub_set_rule create paragraph; parent is already small)
+        pointerSections.containsAll(['set_rule_reference_triggers', 'set_rule_reference_conditions',
+                                     'performance_devices', 'builtin_app_tools_apps', 'set_rule_create_reference'])
+        pointerSections.every { it in validSections }
+
+        and: 'each of the 4 trimmed tools carries at least one valid hub_get_tool_guide pointer in its flat-mode reachable description text'
+        addTriggerDesc =~ pointerPattern
+        addRequiredExprDesc =~ pointerPattern
+        listDevicesDef.description =~ pointerPattern
+        hpmPackagesDef.description =~ pointerPattern
+        createNativeDef.description =~ pointerPattern
+
+        and: 'addAction continues to rely on {discover: true} + docs/rm_action_subtype_schemas.md (separate path; covered for completeness)'
+        addActionDesc.contains('{discover: true}')
+        addActionDesc.contains('docs/rm_action_subtype_schemas.md')
+        new File('docs/rm_action_subtype_schemas.md').exists()
+
+        and: 'the two new sections this PR added are present and non-empty'
+        validSections.contains('set_rule_reference')
+        validSections.contains('set_rule_create_reference')
+        (script.getToolGuideSections()['set_rule_reference'] as String).length() > 500
+        (script.getToolGuideSections()['set_rule_create_reference'] as String).length() > 200
+    }
+
+    def "hub_get_tool_guide section enum stays in lockstep with getToolGuideSections() (#296 reachability guard)"() {
+        given: 'the advertised section enum on hub_get_tool_guide, and the served section + sub-section maps'
+        def guideDef = script.getAllToolDefinitions().find { it.name == 'hub_get_tool_guide' }
+        def enumKeys = (guideDef.inputSchema.properties.section.enum as List) as Set
+        def sectionKeys = script.getToolGuideSections().keySet() as Set
+        // Issue #392: the enum also advertises the sub-keys of the four oversized sections; both
+        // resolve through the same `section` parameter, so both belong in this lockstep check.
+        def subSectionKeys = script.getToolGuideSubSections().values().collectMany { it.keySet() } as Set
+
+        expect: 'every advertised enum key resolves to a real served section or sub-section -- a schema-valid client is never pointed at a missing one'
+        (enumKeys - sectionKeys - subSectionKeys).isEmpty()
+
+        and: 'every served section is advertised in the enum -- a newly added section is discoverable, not orphaned. The #296 defect this guards: dashboards/bundles/rooms/variables were served by getToolGuideSections() but absent from the enum, so schema-validating clients (and LLMs reading the enum) could not request them.'
+        (sectionKeys - enumKeys).isEmpty()
+
+        and: 'every served sub-section is advertised too -- same orphaning failure, one level down'
+        (subSectionKeys - enumKeys).isEmpty()
+    }
+
+    def "hub_get_tool_guide end-to-end: dispatcher resolves the new section keys and returns sentinel-bearing content"() {
+        // The pointer-resolution test above asserts the keys exist in the
+        // getToolGuideSections() map. This test exercises the actual runtime
+        // dispatch path -- toolGetToolGuide() does case-folding + non-alnum
+        // normalization (see hubitat-mcp-server.groovy normalization in
+        // toolGetToolGuide), and the schema enum gate guards the section
+        // parameter. A future refactor that wraps the dispatcher in a guard,
+        // tightens the normalization, or shifts the success-envelope shape
+        // would slip past the previous test but not this one.
+        when: 'fetch the two PR-introduced sections through the live dispatcher'
+        def updateNativeResult = script.toolGetToolGuide('set_rule_reference')
+        def createNativeResult = script.toolGetToolGuide('set_rule_create_reference')
+
+        then: 'success envelope with content matching the section names'
+        updateNativeResult.success == true
+        updateNativeResult.section == 'set_rule_reference'
+        createNativeResult.success == true
+        createNativeResult.section == 'set_rule_create_reference'
+
+        and: 'content carries sentinel phrases unique to each section -- catches drift to a stub even if the map key survives'
+        // set_rule_reference must include all three sub-headings (catches
+        // a stub-replacement that drops one of the three families).
+        updateNativeResult.content.contains('`addTrigger` capability families')
+        updateNativeResult.content.contains('`addAction` capability families')
+        updateNativeResult.content.contains('`addRequiredExpression` STPage capability list')
+        // Plus a few specific capability names from the deepest bullets so a
+        // halving of the body during refactor would show up here.
+        updateNativeResult.content.contains('Periodic Schedule')
+        updateNativeResult.content.contains('Custom Attribute')
+
+        and: 'set_rule_create_reference must include both subsections'
+        createNativeResult.content.contains('appType options')
+        createNativeResult.content.contains('Partial-success protocol')
+        createNativeResult.content.contains('partialTriggers')
+        createNativeResult.content.contains('repairHints')
+
+        and: 'apostrophe escape regression guard -- the bake must not introduce stray backslashes (cf review of b6fe4ab where action\\\'s appeared as a transcription error)'
+        // If the bake reintroduces backslash-escaped apostrophes, the rendered
+        // text would contain a literal backslash followed by an apostrophe.
+        !updateNativeResult.content.contains("action\\'s")
+        !createNativeResult.content.contains("action\\'s")
+    }
+
+    def "the newly-trimmed tools strip their wrapped content in flat mode but keep it in gateway mode"() {
+        // hub_list_devices FLAT_TRIM-wraps a block of duplicate-of-TOOL_GUIDE prose;
+        // hub_set_rule's create paragraph is NOT wrapped (condensed partial-success +
+        // guide pointer, inline in BOTH modes). This is the per-tool counterpart to the
+        // hub_set_rule gateway-catalog-preservation test (above) -- catches
+        // a regression where a marker on just ONE of these tools is unbalanced
+        // (content fails to drop in flat mode) or where the whole transform path
+        // bypasses that tool's description.
+        //
+        // get_hpm_drift was a third site here pre-merge; issue #105 folded it into
+        // hub_list_hpm_packages, which NOW carries FLAT_TRIM wraps of its own (the
+        // heID-normalization notes, the response-field enumeration, and the
+        // multi-instance error protocol); the generic flat/gateway leak guards cover
+        // them. The pointer-resolution test still verifies the hub_list_hpm_packages
+        // description carries the builtin_app_tools pointer.
+        given:
+        enableEveryToggle()
+
+        when: 'flat-mode descriptions'
+        settingsMap.useGateways = false
+        def flatTools = script.getToolDefinitions()
+        def listDevicesFlat = flatTools.find { it.name == 'hub_list_devices' }.description as String
+        def createNativeFlat = flatTools.find { it.name == 'hub_set_rule' }.description as String
+
+        and: 'gateway-mode (token-only strip) descriptions via getAllToolDefinitions + applyDescriptionTransform(false)'
+        def gwAll = script.applyDescriptionTransform(script.getAllToolDefinitions(), false)
+        def listDevicesGw = gwAll.find { it.name == 'hub_list_devices' }.description as String
+        def createNativeGw = gwAll.find { it.name == 'hub_set_rule' }.description as String
+
+        then: 'hub_list_devices: the deferred prose migrated OUT of the tool def (flat AND gateway) to the served performance guide; the flat guide-pointer survives (#296)'
+        !listDevicesFlat.contains('Server-side filtering (all applied before pagination)')
+        !listDevicesGw.contains('Server-side filtering (all applied before pagination)')
+
+        and: 'the deferred prose actually LANDED in the served performance guide -- migrated, not dropped (reachability; a strip that forgets to keep the guide home must fail HERE, not silently green) (#296)'
+        def perfGuide = script.getToolGuideSections()['performance'] as String
+        perfGuide.contains('Server-side filtering')
+        perfGuide.contains('mcpManaged')
+        perfGuide.contains('auto-promotes the response to detailed mode')
+
+        and: 'hub_set_rule fat schema (gateway mode + probe source) carries the deduped partial-success contract + the create-reference pointer'
+        // hub_set_rule is now a flat self-gateway: in flat mode it is the thin
+        // {operation,args} selector (no partial-success prose, no FLAT_TRIM); the fat
+        // schema served in gateway mode + the args-omitted probe holds the deduped
+        // single "Partial-success" statement + the set_rule_create_reference pointer.
+        !createNativeGw.contains('PARTIAL-SUCCESS HANDLING')
+        createNativeGw.contains('Partial-success')
+        createNativeGw.contains("hub_get_tool_guide(section='set_rule_create_reference')")
+
+        and: 'flat-mode hub_set_rule is the thin selector -- the fat partial-success prose is NOT on the flat wire'
+        !createNativeFlat.contains('Partial-success')
+
+        and: 'flat-mode keeps a hub_get_tool_guide pointer for hub_list_devices too -- callers must have a fallback'
+        listDevicesFlat.contains('hub_get_tool_guide(')
+
+        and: 'no marker tokens leak in either mode for either tool'
+        ![listDevicesFlat, createNativeFlat,
+          listDevicesGw, createNativeGw].any {
+            it.contains(OPEN_MARKER) || it.contains(CLOSE_MARKER)
+        }
+    }
+
+    def "hub_list_devices.fields inline-marker drops the valid-name enumeration in flat mode but keeps it in gateway mode"() {
+        // hub_list_devices isn't behind a gateway, but its `fields` property has an
+        // INLINE [[FLAT_TRIM]] marker (different from hub_set_rule's
+        // addRequiredExpression case in terms of placement). Pin both directions
+        // explicitly so a regression in the inline-strip path surfaces here.
+        given:
+        enableEveryToggle()
+
+        when: 'flat-mode hub_list_devices.fields description (dropContent=true)'
+        settingsMap.useGateways = false
+        def flatFieldsDesc = script.getToolDefinitions()
+            .find { it.name == 'hub_list_devices' }
+            .inputSchema.properties.fields.description as String
+
+        and: 'gateway-mode hub_list_devices.fields description (dropContent=false -- tokens-only strip)'
+        def gwFieldsDesc = script.applyDescriptionTransform(script.getAllToolDefinitions(), false)
+            .find { it.name == 'hub_list_devices' }
+            .inputSchema.properties.fields.description as String
+
+        then: 'flat-mode strips the valid-name enumeration; the pointer to hub_get_tool_guide survives'
+        // 'mcpManaged' is a field name inside the wrapped block; "auto-promotes"
+        // is the start of the projection-semantics paragraph also inside the
+        // marker. Both must be absent in flat mode.
+        !flatFieldsDesc.contains('mcpManaged')
+        !flatFieldsDesc.contains('auto-promotes the response to detailed mode')
+        flatFieldsDesc.contains("hub_get_tool_guide(section='performance_devices')")
+
+        and: 'gateway-mode ALSO drops the enumeration -- migrated to the served performance guide (#296); no marker tokens either way'
+        !gwFieldsDesc.contains('mcpManaged')
+        !gwFieldsDesc.contains('auto-promotes the response to detailed mode')
+        !gwFieldsDesc.contains(OPEN_MARKER)
+        !gwFieldsDesc.contains(CLOSE_MARKER)
+    }
+
+    def "tools/list size-guard backstop emits -32603 if the catalog ever overflows the 124,000-byte cap"() {
+        given: 'a stubbed getToolDefinitions returning a synthetic catalog larger than the 124,000-byte hub cap'
+        // This pins the failure-mode rationale documented in handleToolsList: with
+        // tools/list no longer paginating, the universal response-size guard inside
+        // handleMcpRequest is the only thing standing between an oversized catalog
+        // and a silent oversized wire response. If a future PR adds enough catalog
+        // content that the response crosses 124 KB, callers should see a loud
+        // -32603 envelope, NOT a truncated or hub-rejected response.
+        def jumbo = (1..200).collect { i ->
+            [
+                name: "synthetic_jumbo_${i}",
+                description: 'x' * 1200,  // ~240 KB total catalog
+                inputSchema: [type: "object", properties: [:]]
+            ]
+        }
+        script.metaClass.getToolDefinitions = { -> jumbo }
+        mcpDriver.pushBody([jsonrpc: '2.0', id: 999, method: 'tools/list', params: [:]])
+
+        when:
+        script.handleMcpRequest()
+        def response = mcpDriver.parseResponseJson()
+
+        then: 'loud -32603 envelope with "Response too large" message; no silent truncation'
+        response.error != null
+        response.error.code == -32603
+        response.error.message.toLowerCase().contains('response too large')
+
+        // HarnessSpec.setup() wipes the per-instance metaClass and the class-level
+        // ExpandoMetaClass before every feature, so no explicit cleanup needed
+        // here -- next test gets a clean script instance.
+    }
+
+    def "missing-param hint surface for hub_set_rule strips marker tokens but keeps wrapped capability prose"() {
+        given: 'gateway dispatch to hub_set_rule without required confirm triggers the missing-param hint path'
+        settingsMap.useGateways = true
+        enableEveryToggle()
+
+        when:
+        Exception ex = null
+        try { script.handleGateway('hub_manage_rule_machine', 'hub_set_rule', [:]) } catch (Exception e) { ex = e }
+
+        then: 'pre-validation throws the missing-param error (#319: same isError validation result shape as flat)'
+        ex instanceof IllegalArgumentException
+        ex.message.contains('Missing required parameter')
+
+        and: 'parameter description text in the thrown message has no leaking marker tokens'
+        !ex.message.contains(OPEN_MARKER)
+        !ex.message.contains(CLOSE_MARKER)
+
+        and: 'the capability-name summary + guide pointers from BOTH addTrigger and addRequiredExpression survive'
+        // The exhaustive families moved to the set_rule_reference guide; the param
+        // descriptions retain the capability-name summary + guide pointer, which is what the
+        // hint surfaces (token-only strip). An AND assertion catches one going stale.
+        ex.message.contains('Periodic Schedule')      // addTrigger name summary
+        ex.message.contains("hub_get_tool_guide(section='set_rule_reference_conditions')")  // addRequiredExpression guide pointer
+    }
+
+    def "guide:true through the gateway bypasses the required-param pre-validation and returns the reference"() {
+        // Live-hub regression: guide:true short-circuits at the top of _applyNativeAppEdit
+        // (before the appId/confirm gates), but handleGateway's OWN required-param
+        // pre-validation runs first and would reject guide:true for missing appId/confirm
+        // unless it too exempts the gate-bypassing meta-call. The unit test (which calls
+        // _applyNativeAppEdit directly) does not exercise this gateway layer.
+        given:
+        settingsMap.useGateways = true
+        enableEveryToggle()
+
+        when: 'call hub_set_rule via the gateway with ONLY guide:true (no appId/confirm)'
+        def result = script.handleGateway('hub_manage_rule_machine', 'hub_set_rule', [guide: true])
+
+        then: 'the gateway does NOT reject for missing appId/confirm -- the guide short-circuit ran'
+        result instanceof Map
+        result.isError != true
+        result.success == true
+        result.section == 'set_rule_reference'
+        (result.content as String).contains('addTrigger')
+        (result.content as String).contains('walkStep')
+
+        and: 'discover:true is exempted the same way (no appId/confirm needed via the gateway)'
+        def disc = script.handleGateway('hub_manage_rule_machine', 'hub_set_rule', [addAction: [discover: true]])
+        disc instanceof Map
+        disc.isError != true
+    }
+
+    def "#tool intentionally carries NO hub_get_tool_guide pointer in flat mode (kept lean; pin the intent)"() {
+        // These four tools deliberately fold their entire guide pointer INSIDE [[FLAT_TRIM]], so the
+        // flat catalog stays lean and the pointer only shows in gateway mode. That is a choice, not an
+        // accident -- pin it so a future edit that either (a) surfaces a flat pointer or (b) drops the
+        // gateway pointer trips CI and gets a deliberate re-decision.
+        given:
+        enableEveryToggle()
+        settingsMap.enableDeveloperMode = true
+
+        when: 'the flat-mode (dropContent=true) description, the gateway-mode render, and the raw authored def'
+        settingsMap.useGateways = false
+        def flatDesc = script.getToolDefinitions().find { it.name == tool }?.description as String
+        def gwDesc = script.applyDescriptionTransform(script.getAllToolDefinitions(), false)
+            .find { it.name == tool }?.description as String
+        def rawDesc = script.getAllToolDefinitions().find { it.name == tool }?.description as String
+
+        then: 'the tool is present flat, the gateway render is found, and its raw def is found'
+        flatDesc != null
+        gwDesc != null
+        rawDesc != null
+
+        and: 'flat has NO pointer (lean), but the pointer SURVIVES into the gateway-mode render -- deferred, not lost'
+        !flatDesc.contains('hub_get_tool_guide(')
+        gwDesc.contains('hub_get_tool_guide(')
+
+        and: 'the raw def wraps that pointer in FLAT_TRIM -- which is why the flat render drops it'
+        rawDesc.contains('hub_get_tool_guide(')
+        rawDesc.contains('[[FLAT_TRIM]]')
+
+        where:
+        tool << ['hub_list_rules', 'hub_set_native_app', 'hub_get_hub_mesh', 'hub_update_hub_mesh']
+    }
+}

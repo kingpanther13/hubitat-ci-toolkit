@@ -1,0 +1,1513 @@
+{
+  "repository": "https://github.com/kingpanther13/Hubitat-local-MCP-server",
+  "commit": "0e6094bf688d7edefd18d1f52ffe7b0ee7ab2018",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "sha256": "e36cb03fd4b22eac589a3ca2c287aeefff09f9136e6e6221a62c81111f666f9f"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/agent_behavior.yml",
+      "sha256": "fd694118406ade54abdbf2e85b6ef672b29bb54712993cfd7ac25c1aaaa0e843"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/bug_report.yml",
+      "sha256": "a9eba20ac66f88e662b83ed00fc38b424299688427f9adfa0d87af8fd82b1e82"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/config.yml",
+      "sha256": "c869b226356385907acb0b1fa41a085631cd4b45e5d5e44b5de9bfa621059b5b"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/enhancement.yml",
+      "sha256": "af1413a81da9aa8193285c302c48f8113336aaeab723d1c142f6c2fecea6168e"
+    },
+    {
+      "path": ".github/dependabot.yml",
+      "sha256": "4a93fff80f9ba392f75efecc0d67fbc0848c2d6238910a00de302108a128c9b1"
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "sha256": "a8e09f03f37b7a15ba6dfe00b20a353368034d412f954a2543cda90a5aaba4c9"
+    },
+    {
+      "path": ".github/scripts/e2e_scope.py",
+      "sha256": "c75280052ae5c19c66d35e670c97300b62698e0375fe3ebcb8315a2ff6604bb7"
+    },
+    {
+      "path": ".github/scripts/fork_pr_scan.py",
+      "sha256": "1615745631bf2e74e663cc595b1b83ac5bd4b44d0ca2c7f99e5de84aea20e25b"
+    },
+    {
+      "path": ".github/scripts/lane_gate.js",
+      "sha256": "ba2711b62bfdd06d070d57ff5c81fa17257ad50ee34589edc83992a7105eb2d6"
+    },
+    {
+      "path": ".github/scripts/lease_acquire.sh",
+      "sha256": "52fa7c8af7171283908dbfc24492a063f91563abca399dac91d651e310cf32a7"
+    },
+    {
+      "path": ".github/scripts/lease_release.sh",
+      "sha256": "83ac67f9c870ce1197e6328916e0bb859d7eefa5caeb35e049db23e2ab4eb02a"
+    },
+    {
+      "path": ".github/scripts/mcp_arm_watchdog.sh",
+      "sha256": "b91a44c7a6ab6b88abfc10b3f8a2cbff91bc3e3291fb007dd4ac54df9d280f8a"
+    },
+    {
+      "path": ".github/scripts/mcp_disarm_watchdog.sh",
+      "sha256": "a04b355749058bef5a4625de4e8194f471a573b6659b2f437e4e4920b0b9b674"
+    },
+    {
+      "path": ".github/scripts/mcp_probe_hub.sh",
+      "sha256": "17f23d07f563cb4a8fcd1218f0d3086beb6bc6f8588c85c59180a089ea851902"
+    },
+    {
+      "path": ".github/scripts/mcp_setup_env.sh",
+      "sha256": "f30342d932d3c53340abb8d48a75b69f453753d091ddbd265e924da3bfa582d7"
+    },
+    {
+      "path": ".github/scripts/mcp_validate_package_tool.sh",
+      "sha256": "c4db2328c6b267900cf63efb481f89d2c8379504b1856147504534e1b8ccafe6"
+    },
+    {
+      "path": ".github/scripts/mcp_watchdog_deploy.sh",
+      "sha256": "36badc7e1577b45d6afcef081ae12b6c9a28eed2bef47b4bf9e08331fe88d496"
+    },
+    {
+      "path": ".github/scripts/mcp_watchdog_lib.sh",
+      "sha256": "6ff29f2570f51751bd0576223f40b61351b83d25568c147738aa868b89f37b17"
+    },
+    {
+      "path": ".github/scripts/post_e2e_gate.sh",
+      "sha256": "665824db8839b5880b7885676d1ebfbfce20b4488a8b13535efa4c8647fb68de"
+    },
+    {
+      "path": ".github/scripts/pr_guard.py",
+      "sha256": "f9f97bcdeeebdc9c1e0f4319a89ee2b1cd28405018b82f767c0057eb80f7c168"
+    },
+    {
+      "path": ".github/scripts/publish_fork_bundle.sh",
+      "sha256": "6081cbd465b91aa018790254b1b5d0fbb1b56cc822871b7014f2c1b85e8389b5"
+    },
+    {
+      "path": ".github/scripts/release_bump.py",
+      "sha256": "47c8b76131a07b671a1d28885762625abf06851742b88abb685e4c1af834ec8d"
+    },
+    {
+      "path": ".github/scripts/test_self_deploy_recovery.sh",
+      "sha256": "122ada8fbe2f0f86bb185377950c3ca578af5ab4afe7d657d6442936db9edd23"
+    },
+    {
+      "path": ".github/scripts/watchdog_maintenance.sh",
+      "sha256": "4a03ea13442f32e92f8e4726fed678db15eb13ee07e901d120299d11545e5476"
+    },
+    {
+      "path": ".github/scripts/watchdog_maintenance_ci_gate.sh",
+      "sha256": "67a8387eb52048fd3d04879977b0e6ab38b52e4cd0e77854d81c4d2c627a903d"
+    },
+    {
+      "path": ".github/scripts/watchdog_v3.py",
+      "sha256": "897a9aabb1747f550aa7fab3c8457b6cb701bac671dabf3c1c8b4be2c24a1927"
+    },
+    {
+      "path": ".github/workflows/e2e-setup-fixtures.yml",
+      "sha256": "af0976358c8ccd9b8e485fd831fd4a000930af5a303782b981e667106f4b74bb"
+    },
+    {
+      "path": ".github/workflows/groovy24-parse.yml",
+      "sha256": "65a7942142f1b705e70eed6a46c4ba2a2ea612cf429c045e8b6423815b109311"
+    },
+    {
+      "path": ".github/workflows/groovy2x-spock.yml",
+      "sha256": "38b0e7734d1d5635c2a242e1de0f83b575a12e05b6eef18b260fb3829cbf297b"
+    },
+    {
+      "path": ".github/workflows/hub-e2e.yml",
+      "sha256": "6ae41bb6ccbbf86dc9feeff9e55f9775e47d2c1580d69fbbf6ff7a3276c702f1"
+    },
+    {
+      "path": ".github/workflows/hubitat-ci-version-check.yml",
+      "sha256": "9825587ca09819a02dba0924b5d843271b1e66e028dd799017195fc2c91ae826"
+    },
+    {
+      "path": ".github/workflows/lane-gate-test.yml",
+      "sha256": "cdbfc3fc492d18aa63293eab90238f9b6195e44598a91b6ad297b40bacbdc115"
+    },
+    {
+      "path": ".github/workflows/lease-scripts-test.yml",
+      "sha256": "75dd8af270714ccad7ea9dbf54cd6fd9cb75402ac5dd49a162a1257e04824932"
+    },
+    {
+      "path": ".github/workflows/pr-guard.yml",
+      "sha256": "46fea96d0210b5bae8a01992167a94a4f4876030de7ffbd1817fb3465f826b09"
+    },
+    {
+      "path": ".github/workflows/publish-bundle-artifact.yml",
+      "sha256": "e2afde970d5d0d0f193c492a4c93f7e46fc0d5341f62950ddb78537a6d05c24c"
+    },
+    {
+      "path": ".github/workflows/python-tests.yml",
+      "sha256": "0ed1324e84b9b1bcad038361ba6268c56d34d0bf29e69087da8324caa8b70153"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "sha256": "fc74b5641940ee7d607937fb2bf6e477c39a8e066f1d8a8db8cfae7d538f8fea"
+    },
+    {
+      "path": ".github/workflows/ruff.yml",
+      "sha256": "4b9bb167c19c117d4c57c3f997a4d5541f7828172a5ec27a20722c52e56a606f"
+    },
+    {
+      "path": ".github/workflows/sandbox-lint.yml",
+      "sha256": "6888efe1b2e330e7adb969d8a0c7955a3e5387a84a4de518c74314fd4d36070c"
+    },
+    {
+      "path": ".github/workflows/self-deploy-recovery.yml",
+      "sha256": "daa662590dac338974b6473a4ca86e90bc588c68208ca8e8e7dca0986a917fb4"
+    },
+    {
+      "path": ".github/workflows/unit-tests.yml",
+      "sha256": "09bf20ba71041b0c439ab3b2551017f976f4736c6928bab8f37ee18c3d7df00e"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "aa2f498100cc80515995bf8f212f4a6bc518aedb2504f8fdff0e6322d15afd6f"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "42f49b365aee1836d8588976920d2adc9f12251bdd0cc639976246279b91a3d3"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "06dcddbb6908a0c6dd4a9e8ec822eea41d5a460a53089fecccc8a68049e99241"
+    },
+    {
+      "path": "README.md",
+      "sha256": "98027a00b7043799017e8bbdf93750be3de0c3d43a557b75887813c69a8a4ef1"
+    },
+    {
+      "path": "TOOL_GUIDE.md",
+      "sha256": "fee53f8a9eaf505a1cdc101ecb5ca532279e577999a90e1252d9c40b6c4ae89b"
+    },
+    {
+      "path": "build.gradle",
+      "sha256": "d6126791bbf9b68934dbbeff18350aaeefe1e4dc0673a25c8f88dc6342e5282d"
+    },
+    {
+      "path": "ci/groovy24-parse/build.gradle",
+      "sha256": "900caca430efc6fb1a614d3ffcc95b954ee7b6f263a9d02f2abf547e32d0ae12"
+    },
+    {
+      "path": "ci/groovy24-parse/fixtures.groovy",
+      "sha256": "7e56c80f5faa802ebf69ff3a36d7a00ea35af4bc4cd1b7003bacdbd425984e5c"
+    },
+    {
+      "path": "ci/groovy24-parse/parse_check.groovy",
+      "sha256": "204dfeba68b07837f6182deb242ae83a42933462938976c2cc49e81216c8c521"
+    },
+    {
+      "path": "ci/groovy24-parse/settings.gradle",
+      "sha256": "23b6602e7083779ea1f12493daa7603c7155552cefd65f94026e878a374afde9"
+    },
+    {
+      "path": "ci/groovy2x-spock/build.gradle",
+      "sha256": "253d38287e3ead3cc8921af8ff5574ed1e5dcd91494e44efc9e59657c5087389"
+    },
+    {
+      "path": "ci/groovy2x-spock/scaffold/rules/RuleHarnessSpec.groovy",
+      "sha256": "1e17f65ba63c3dd9a294887c94b90a0b2ee7e1040a7bae5fe65bbe704e6b9478"
+    },
+    {
+      "path": "ci/groovy2x-spock/scaffold/rules/RuleParentWiringSpec.groovy",
+      "sha256": "d5eab8de097e49768ef36ef6affbcb3c651ee84c8021a50895954c1e70e5423f"
+    },
+    {
+      "path": "ci/groovy2x-spock/scaffold/support/HarnessSpec.groovy",
+      "sha256": "e69b9eff40c0a74ffd6cc018c268c05f5bb40cf1e3804f40dee22df4a59ffaa4"
+    },
+    {
+      "path": "ci/groovy2x-spock/scaffold/support/LaneChildAppWiringSpec.groovy",
+      "sha256": "f57096334e4cecc315fc4ce490a5be56c118e433d7bf31eb564ffc2e2014e849"
+    },
+    {
+      "path": "ci/groovy2x-spock/settings.gradle",
+      "sha256": "4ab12e753de4f9be07c78a7426bc58089ee043fb68c2927c443f9e1d8ff023d0"
+    },
+    {
+      "path": "docs/capture-storage.md",
+      "sha256": "10b369e3d1196608428862f130009434d4746784e193082be0514773dbf2d0bc"
+    },
+    {
+      "path": "docs/firmware-update-research.md",
+      "sha256": "842e3c577ffc3297dcaff8f2f1707fa2a89dcd22b368704ac1b38b84bddc192f"
+    },
+    {
+      "path": "docs/groovy2x-spock-lane.md",
+      "sha256": "ae0fbdf0f5eee80f6f8fb66b785778dc7327a9696c7c993c1fec8667240c5135"
+    },
+    {
+      "path": "docs/issue-105-pr1-game-plan.md",
+      "sha256": "ad7ea63861eb03bbc4e07f4b077a8ad11be38489ef0e8390c0aef15b4a41917e"
+    },
+    {
+      "path": "docs/issue-105-pr2-game-plan.md",
+      "sha256": "35fb8e4d04dab66fddfb0335ef0bef5988aa8817d091af801d881dac8c0c532a"
+    },
+    {
+      "path": "docs/issue-137-native-app-tool-split-game-plan.md",
+      "sha256": "c9e36894e6b58b2c49b474b5adb611fb3bb2f9038ba27be19c3617c5f1caa769"
+    },
+    {
+      "path": "docs/issue-209-smoke-test-game-plan.md",
+      "sha256": "27826d8ff167ed60eefd6379db273b5ae95e47c241b28b9c7c14a968d5d86165"
+    },
+    {
+      "path": "docs/issue-407-findings.md",
+      "sha256": "243f781ea828d2e5ffde25a4b0aaef93502b5c3520c23b2c910c8a4dcc10e9b7"
+    },
+    {
+      "path": "docs/release-automation-design.md",
+      "sha256": "db597d6730a4f43b6685174d0dbd4701b004a5f6a47164e12a599905d2150dbe"
+    },
+    {
+      "path": "docs/rm_action_subtype_schemas.md",
+      "sha256": "5d64b960da577da1506dad126164ebd3b8043aa288940a287d3d5019ce7d9b94"
+    },
+    {
+      "path": "docs/rm_native_test_matrix.md",
+      "sha256": "482c6302f5a735570d8580a564fe5450b3e8690902aecbdd4c27d38f8553a7d5"
+    },
+    {
+      "path": "docs/rm_wire_format.md",
+      "sha256": "c1582acc75d882ad5572d342b39333b222f1b1a5e3f3fa1525d8e36d8fc28dfc"
+    },
+    {
+      "path": "docs/state-storage-audit.md",
+      "sha256": "14260f0ca4fff8c417316b19c818a8641717943d1a270701b03b960f0356100c"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-06-03-issue-113-114-universal-readwrite-masters.md",
+      "sha256": "eddcf3b37ba92698f695aba31cff8d2d38dfe61938af4c0e5753949e3cae2774"
+    },
+    {
+      "path": "docs/superpowers/specs/2026-06-03-issue-113-114-universal-readwrite-masters-design.md",
+      "sha256": "1fff72a5d4524470f48a2abc76f42355a0119795d555cefa9b688980de9be416"
+    },
+    {
+      "path": "docs/superpowers/specs/2026-06-04-issue-209-include-library-smoketest-design.md",
+      "sha256": "58897a6931e4f2fefc28c5ee63d079371aabeb39f7dc64f840ef2dcbeb417887"
+    },
+    {
+      "path": "docs/superpowers/specs/2026-06-09-issue-250-update-package-hpm-repair-design.md",
+      "sha256": "b4843af0981efc047815b31b41c929c3f57d57641926ca6f21d7f1f9acc8ac06"
+    },
+    {
+      "path": "docs/testing.md",
+      "sha256": "8e4e176109f5b0b114730d4ba39ee80381c5e7f41af32cf8fbaf64d2f142bdee"
+    },
+    {
+      "path": "docs/watchdog-v3-1.md",
+      "sha256": "4795775c206faebf5dd54bb4b686f95dc39c0fdf7147835706c28780fe017e1d"
+    },
+    {
+      "path": "docs/watchdog-v3.md",
+      "sha256": "55f544a9c7bd5da160651a542e932ec914efeb58b05f9ac29c615e097ee87210"
+    },
+    {
+      "path": "e2e-deadman-watchdog-v2.groovy",
+      "sha256": "3adfbcdee1a07648b8024020953a27f30524dbd600ed009bcf43648b9b850968"
+    },
+    {
+      "path": "e2e-deadman-watchdog-v3-1.groovy",
+      "sha256": "c8ca390f7fb92caac92b590b03464f69941d82feaa17e0f6109237d4651fc9b5"
+    },
+    {
+      "path": "e2e-deadman-watchdog-v3.groovy",
+      "sha256": "f88199a5450777e96cc665c8d9fe1f40fa6c34ca02ff9b7c762d501e4e25d88e"
+    },
+    {
+      "path": "e2e-deadman-watchdog.groovy",
+      "sha256": "5360693ff71d544359e7ba5c5b270f2d90c548a16a7a8e9de8ac9e29e1c65693"
+    },
+    {
+      "path": "futureplans.md",
+      "sha256": "a717641a7816239e13d034c03e460a1111a28da738d722767ec8bef0383beb95"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.jar",
+      "sha256": "238e777fcddd7e34f9708186085def2abd6e08e658505b38718d79d74c21abd5"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.properties",
+      "sha256": "d3c8ac7b34869c3184b4c21374153af1ad72c69c1813e723e3cfc7995f3624bd"
+    },
+    {
+      "path": "gradlew",
+      "sha256": "a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59"
+    },
+    {
+      "path": "gradlew.bat",
+      "sha256": "f17917f8dbe61182b149273ee78090fec1197442c3f38276af907bfa5190db16"
+    },
+    {
+      "path": "hubitat-mcp-rule.groovy",
+      "sha256": "8258655de5a76b311c8d669f5f5af9ba6cf31f39dd557977d882687f0fa0e068"
+    },
+    {
+      "path": "hubitat-mcp-server.groovy",
+      "sha256": "3a8798195f6a76b9d1d0ff42eaab63a9c89d1d8e966d58feefc13b8418d7b96b"
+    },
+    {
+      "path": "libraries/mcp-app-cloner-lib.groovy",
+      "sha256": "335630ea3f28ca9b8b19332791d00769c94d14930ff87c9850eca6a94f53995e"
+    },
+    {
+      "path": "libraries/mcp-bundles-lib.groovy",
+      "sha256": "6b40ba115bf0d1e385834d0c5631d0d145ee2765a891453d5df05f1e4e3f0b5f"
+    },
+    {
+      "path": "libraries/mcp-code-management-lib.groovy",
+      "sha256": "4f770529ecfbc254f6b07c2b09004eec282382320263cdff79f25cbbdda5f9ce"
+    },
+    {
+      "path": "libraries/mcp-custom-rules-lib.groovy",
+      "sha256": "766256ad3f94b1deef5165d97878fbe04b84cfc8450f1e624f0be0fa2e2bf7b3"
+    },
+    {
+      "path": "libraries/mcp-dashboards-lib.groovy",
+      "sha256": "2994b5a17f338b28c73249ef7c32290371bdb91799f3cc09434da0f64398ff2a"
+    },
+    {
+      "path": "libraries/mcp-debug-logging-lib.groovy",
+      "sha256": "8b6a2ffde2c4c642a02ac439f1fd9d7ebce34843e2d1ddc5832a997f7347b107"
+    },
+    {
+      "path": "libraries/mcp-devices-lib.groovy",
+      "sha256": "b63f476f4248ac5d43b32162f6caab6bbc1ce360fc0b82374403b8d8719bf06d"
+    },
+    {
+      "path": "libraries/mcp-diagnostics-lib.groovy",
+      "sha256": "74a55356d7446950a8652b699f35832d0250ae494967c395150716c9312b1b77"
+    },
+    {
+      "path": "libraries/mcp-discovery-lib.groovy",
+      "sha256": "1f0dfd6cc2eb86223bf535fc37a4e1addd67be078d23e068f8896da201d1c5a0"
+    },
+    {
+      "path": "libraries/mcp-files-lib.groovy",
+      "sha256": "117ecab701c4d206c6e7ac54599cd35bc5ad6827ebff9131b5cef417edc09531"
+    },
+    {
+      "path": "libraries/mcp-hpm-lib.groovy",
+      "sha256": "b14c16ca7caedd16697ba83df78d6944acaf03737662e7063536098b1f3929be"
+    },
+    {
+      "path": "libraries/mcp-item-backups-lib.groovy",
+      "sha256": "e81d60eed11c773f1c890e89cf07e9d5ea2af293eb7bc3c9582cfe17154a984e"
+    },
+    {
+      "path": "libraries/mcp-native-rules-lib.groovy",
+      "sha256": "d20f39d226a5df509e353fd9fecc61c37dcbcca798586d0f98288e02942024a2"
+    },
+    {
+      "path": "libraries/mcp-rooms-lib.groovy",
+      "sha256": "f6cdb3852f8a0293a76815a140ffd55fbd5a32bc299021b4b3b0535a6f17c4b5"
+    },
+    {
+      "path": "libraries/mcp-self-admin-lib.groovy",
+      "sha256": "325f485bbdca8fa59057e2decd8d3104be8dfc6135e7815a072d9acd51f3057a"
+    },
+    {
+      "path": "libraries/mcp-system-lib.groovy",
+      "sha256": "6e451f3993b199df56e201c79e5e10c782110b6fb26609fa90efa53c819899fb"
+    },
+    {
+      "path": "libraries/mcp-variables-lib.groovy",
+      "sha256": "bab2f3c361ec7fe51cca3ee3c44a00865b2de394c11d79003d7b3750d1a8e2c2"
+    },
+    {
+      "path": "libraries/mcp-virtual-devices-lib.groovy",
+      "sha256": "d56d5aa239da419976b3cf249a5d368774daeef1741b358a6a38a5d1c5ac42d6"
+    },
+    {
+      "path": "libraries/mcp-visual-rules-lib.groovy",
+      "sha256": "a8174e83f5a8f55bb4c5d1914c6a8df2c40a054973d4b4e226bf9a6929ca6136"
+    },
+    {
+      "path": "packageManifest.json",
+      "sha256": "30d39d540317c469c046913a42925f91fe5d3e29af7348a98fe68a694835d28c"
+    },
+    {
+      "path": "pyrightconfig.json",
+      "sha256": "28aea8f0b7cf30b5afc905e2b4111c099c8215de18db356b055e667cc609135b"
+    },
+    {
+      "path": "repository.json",
+      "sha256": "3b9a341f743f5e775480fd531ae2b971336a63e9763f816e840332cfe3c63206"
+    },
+    {
+      "path": "ruff.toml",
+      "sha256": "c80791c64b6201b5dae190b9397fa19a149da0da2c31aa573665e0fc1c2a486f"
+    },
+    {
+      "path": "scripts/app_config_audit.py",
+      "sha256": "6109673eb7bfed9fe4dc1c1abb8773ffdf0498bade925ef5e2fe650e89fe3baf"
+    },
+    {
+      "path": "scripts/audit_config.example.json",
+      "sha256": "1f42ea973bab5a0371501c69aab1cf3abaff41f989767054368caa1c92e3806e"
+    },
+    {
+      "path": "settings.gradle",
+      "sha256": "aced9ba875b71bd6a194e07ada846c481c76afa03b6a1f4742356b3aa9b88a3f"
+    },
+    {
+      "path": "src/main/groovy/hubitat/helper/NetworkUtils.groovy",
+      "sha256": "ade5d62a09c556627056611b5bf7eaf344cb3be8639aca031f38fcf5d9a50efe"
+    },
+    {
+      "path": "src/main/groovy/hubitat/helper/RMUtils.groovy",
+      "sha256": "e0ecec38f1493a84fd3802168840550bb67bf9986069a98cacf1884583866a1e"
+    },
+    {
+      "path": "src/test/groovy/SanitySpec.groovy",
+      "sha256": "1351098b14a47f7e07d9075589e71b391507e552aeea1d6ff4cefd49de339140"
+    },
+    {
+      "path": "src/test/groovy/rules/ActionTypesSpec.groovy",
+      "sha256": "0170e5cd34c4912e2e7e75ed47160055e8ee922b100659c87ec6f1b67a0f32e0"
+    },
+    {
+      "path": "src/test/groovy/rules/ConditionTypesSpec.groovy",
+      "sha256": "41a93bd601edd8f75ea0ac16568c1928c5ea67aa87f3ea3f3cc82943531b8c6d"
+    },
+    {
+      "path": "src/test/groovy/rules/ErrorPathsSpec.groovy",
+      "sha256": "261bea838f0d2423be07f92d426464a2853da329712e2391ed3a79f15fc16a8e"
+    },
+    {
+      "path": "src/test/groovy/rules/EvaluateComparisonSpec.groovy",
+      "sha256": "b89138a0d1f422d1ca5ca4be25c82b35c6bfe4e276287367f37b1422c75fb139"
+    },
+    {
+      "path": "src/test/groovy/rules/EvaluateConditionSpec.groovy",
+      "sha256": "50b98d3a2e220877ba3ee9fc206d55991b0845169ef53d59df6bb05b1c322648"
+    },
+    {
+      "path": "src/test/groovy/rules/EvaluateConditionsSpec.groovy",
+      "sha256": "5066145bd29692d3a495cc00b759fe898a05f3d82b710aae474925d486c2e604"
+    },
+    {
+      "path": "src/test/groovy/rules/HandleDeviceEventSpec.groovy",
+      "sha256": "df3a145f84088d2220b457f7581c4dc54fff920aad47443ac098124f7f23523b"
+    },
+    {
+      "path": "src/test/groovy/rules/LoopGuardSpec.groovy",
+      "sha256": "9cde57a21b6383756947c94e7e308227b2794cedd2cc31d4c2fc31f687fb3c70"
+    },
+    {
+      "path": "src/test/groovy/rules/RegressionsFromHistorySpec.groovy",
+      "sha256": "f4c80f5a7acde912b0ef54175aabaa0d696738bc242a58f6e6624beb9339ceaf"
+    },
+    {
+      "path": "src/test/groovy/rules/RuleEngineExecutionSpec.groovy",
+      "sha256": "2dde4a046218b1df2663cd9dc92e7f91de3fc26a276cbf636267e1dd560d38dc"
+    },
+    {
+      "path": "src/test/groovy/rules/RuleHarnessSpec.groovy",
+      "sha256": "c1ad48cc414aaf73ef648ce86754c2fe1248ba0b70fea3969d24a36004414f14"
+    },
+    {
+      "path": "src/test/groovy/rules/RuleStateHygieneSpec.groovy",
+      "sha256": "e1459601f6a77902a846bed5cd14f18d59458954d0c80f4cb8a29f97b33cd52b"
+    },
+    {
+      "path": "src/test/groovy/rules/SettingsRoutingGuardSpec.groovy",
+      "sha256": "9e91703479944dcdcc7bd4d226bd1ade9be404c968ad05e00b7e5ff8c437cc98"
+    },
+    {
+      "path": "src/test/groovy/rules/SubscribeTriggerIntegrationSpec.groovy",
+      "sha256": "7ab9419403946914b59dd466c10700fbeb49efb3a9930b28a2ff43e9f2f60634"
+    },
+    {
+      "path": "src/test/groovy/rules/SubstituteVariablesSpec.groovy",
+      "sha256": "f906b1e08710df1f87d469a9a9522c7c1863a07e58a8322f9cd477911a91e679"
+    },
+    {
+      "path": "src/test/groovy/rules/TriggerBreadthSpec.groovy",
+      "sha256": "80a624f4b2fab80012580789316a8d1d454414adac5f147f9eb6abc13fd810ed"
+    },
+    {
+      "path": "src/test/groovy/server/AccessTokenRedactionSpec.groovy",
+      "sha256": "73e0a2fa0a8a713814ef345f63fa2e9c094fb7012194d9f712b94c02980df47f"
+    },
+    {
+      "path": "src/test/groovy/server/AddRequiredExpressionUndoSpec.groovy",
+      "sha256": "7e0ccd8043b9848d64eb2fc86de8cfaee051602c52dd71cffb29fe02154b867a"
+    },
+    {
+      "path": "src/test/groovy/server/AdvancedOverridesFilterSpec.groovy",
+      "sha256": "487383b89117f64608c94142b2f5927608e8f9f8b4d4ef2d51e5431708a1e3f1"
+    },
+    {
+      "path": "src/test/groovy/server/AdvancedOverridesPageSpec.groovy",
+      "sha256": "8fbb2f20869db0c6a15ee809c4d2df18962a05b4f7792f594fbaacbd71b1e07e"
+    },
+    {
+      "path": "src/test/groovy/server/AppClonerDiscoverySafetySpec.groovy",
+      "sha256": "6fadda77e8a56c3e3f6a03bb73d55738f5b7400dbebfec01b2507914dbd06373"
+    },
+    {
+      "path": "src/test/groovy/server/AppClonerSafetyParitySpec.groovy",
+      "sha256": "20f47ffcc1b03d5cca0e8c5aa354907945598ee57726700da6f5a8104c7779ee"
+    },
+    {
+      "path": "src/test/groovy/server/AppLifecycleMigrationSpec.groovy",
+      "sha256": "f6ad419109c0c620a2e58d8703a27969be7533bdd1391fba476c86936960ed6e"
+    },
+    {
+      "path": "src/test/groovy/server/BpsSchemaSizeGuardSpec.groovy",
+      "sha256": "6a1a26d28239eadfd3f759f4d3a4e1e4afac9d7a528838df6aadab02b4332d12"
+    },
+    {
+      "path": "src/test/groovy/server/CapturedStateStorageSpec.groovy",
+      "sha256": "ba43fdb098441d6934f07c5d4bef42be15a75957d1084e9b1ac6be63b48561af"
+    },
+    {
+      "path": "src/test/groovy/server/CollectLiveAppsSpec.groovy",
+      "sha256": "07390015570b2f990d736e15ba1a82e08da2738346196211552ac93ef2a0b037"
+    },
+    {
+      "path": "src/test/groovy/server/ConsolidatedLogsSpec.groovy",
+      "sha256": "7f2a9e970229a64cb46e83758ff5de6dc1b50edc88e68933e62774ef33bccda6"
+    },
+    {
+      "path": "src/test/groovy/server/DebugLogBudgetSpec.groovy",
+      "sha256": "282eeb96b72a630a6b1140eebc1efe9fa776dda8fa9e2b2d5a153449c3b44f15"
+    },
+    {
+      "path": "src/test/groovy/server/DebugLogConcurrencySpec.groovy",
+      "sha256": "f9c3ef85362b1204511608a08d7f9c3e790ffa4b4426275ea739ec9395013f51"
+    },
+    {
+      "path": "src/test/groovy/server/DebugLogRingSpec.groovy",
+      "sha256": "aacef180548e127680af941d7b48a00ee672a9fd6cb7cff7678bc6eef098aa06"
+    },
+    {
+      "path": "src/test/groovy/server/DeviceMrtrSpec.groovy",
+      "sha256": "3b2380ed82fdce5da4d2da8daf09a8d2f5c47d256fdc1e5dd7c56132a984d0ae"
+    },
+    {
+      "path": "src/test/groovy/server/DeviceSwapSelfReferenceSpec.groovy",
+      "sha256": "6b15143e76b399cca347f5d74855cdc31e1faab02c45450fc59c4549953c8a73"
+    },
+    {
+      "path": "src/test/groovy/server/DiagnosticLogRecoverySpec.groovy",
+      "sha256": "9f08567888bd33be7324b7644067b7eae6dcb593630de02f76b5731235e68283"
+    },
+    {
+      "path": "src/test/groovy/server/ExecuteToolMandatoryBpsGateSpec.groovy",
+      "sha256": "8a6fac157020aa0c2f92af16483c9b7db8fd45542778888f9418e680643ae391"
+    },
+    {
+      "path": "src/test/groovy/server/ExecuteToolMasterGateSpec.groovy",
+      "sha256": "dc55d51e6d748d31bd433852379baf709be1440048fa02d1f0816b7166c78173"
+    },
+    {
+      "path": "src/test/groovy/server/FlatToolSizeChartSpec.groovy",
+      "sha256": "ba2550dbacf72c0eccce8ba6f456eb1672511c040b1e5a65dfd1fc78870e638a"
+    },
+    {
+      "path": "src/test/groovy/server/GatewayToggleSpec.groovy",
+      "sha256": "6201a5c3dc9d0305a0c82ebdb8bfc6bd59101e8690b73d9fd8524a2e8032a888"
+    },
+    {
+      "path": "src/test/groovy/server/GuideAcknowledgmentKeySpec.groovy",
+      "sha256": "23383edeb5e279dd903f8914ea3e3db32871603d816837f952b79e9be9daceea"
+    },
+    {
+      "path": "src/test/groovy/server/GuideFirstSentenceSpec.groovy",
+      "sha256": "4f61f4d4ffe7868bd31191eecc84557776fe53446c6f8b115e3fb8395ea8000a"
+    },
+    {
+      "path": "src/test/groovy/server/HandleGatewaySpec.groovy",
+      "sha256": "86f95104f23a447535625e946155e91d80b31171b704054b8ae36b02524ba5bd"
+    },
+    {
+      "path": "src/test/groovy/server/HandleMcpRequestDispatchSpec.groovy",
+      "sha256": "2e66a0ed80259e8468a3844caf1a5fc2fe1d678dbd9985d305717183b9e8cbbf"
+    },
+    {
+      "path": "src/test/groovy/server/HandleToolsCallReactiveBpsSpec.groovy",
+      "sha256": "2f75cca64e3070d01ffa218d1ec58420d6bffea5fff3f9345dced2455e75fe31"
+    },
+    {
+      "path": "src/test/groovy/server/HandleToolsCallSpec.groovy",
+      "sha256": "99440eae727d02e73ab421c443f3c303b981559afa2ff08055e06543ca7af13e"
+    },
+    {
+      "path": "src/test/groovy/server/HealthMrtrSpec.groovy",
+      "sha256": "ddc252ac3b82d5d60e72781109bb29c3577351ad3484ba169fe453188600dc49"
+    },
+    {
+      "path": "src/test/groovy/server/Hub2DataDiagnosticsSpec.groovy",
+      "sha256": "05d3a6f274896dc7f8d5770efe0b6a436ccedfceee84d851370792de4f72d8ef"
+    },
+    {
+      "path": "src/test/groovy/server/HubInfoFieldContractSpec.groovy",
+      "sha256": "61dcac5482274703d3d4a8c882c3cfc628ec10a339afdb4abbcc97d81015b22d"
+    },
+    {
+      "path": "src/test/groovy/server/HubInternalRetrySpec.groovy",
+      "sha256": "bb39b319a9fd44033139a6b67cb92aa9e24b4780fff27d29e703898369ce0ab0"
+    },
+    {
+      "path": "src/test/groovy/server/HubSecurityRetirementProofSpec.groovy",
+      "sha256": "ae2f53385cec2d60e8511f4f8515e7a80cd65a700f703000fd4e0f7654bda67e"
+    },
+    {
+      "path": "src/test/groovy/server/HubToolNumberSpec.groovy",
+      "sha256": "5d2325258bfc6ae00bf1a975cc6e19b1595f9c3d0e14dee10127567b33ea904e"
+    },
+    {
+      "path": "src/test/groovy/server/IncludeResolverSpec.groovy",
+      "sha256": "cf7ef610e55086be39781ca099640557314437d37c85522ffee6f63a17ed3726"
+    },
+    {
+      "path": "src/test/groovy/server/Issue257DeviceAppMeshSpec.groovy",
+      "sha256": "aba2e4fed85f191110303d61780c45c3c67abb989bc044775f4de3fdb5e17a3f"
+    },
+    {
+      "path": "src/test/groovy/server/Issue257FoldsSpec.groovy",
+      "sha256": "1ed3ad2b0947d9f1d49272a1cedb0f9d0485369e92e39df19f8326295f2ef82d"
+    },
+    {
+      "path": "src/test/groovy/server/Issue490Firmware252Spec.groovy",
+      "sha256": "5b91c7a650641d482cf7ee865e46c247c9b37c38eb6dd0b49a397e56f0989d1e"
+    },
+    {
+      "path": "src/test/groovy/server/LibraryMapDataKeysSpec.groovy",
+      "sha256": "252e9892329904861f535a6252bfa0d102cf1615c0ff8fe795b198961a3d396d"
+    },
+    {
+      "path": "src/test/groovy/server/LogMrtrContinuationSpec.groovy",
+      "sha256": "f6b6a1ff0099e6a3c9c74f6235464d63ba8eaf7f1a5980d4e82f9e70689c7ac2"
+    },
+    {
+      "path": "src/test/groovy/server/MasterVisibilitySpec.groovy",
+      "sha256": "49b6dd8af0e2965b70fcecad93b8117ebed1cba3f42100d6b28f161b9f558e89"
+    },
+    {
+      "path": "src/test/groovy/server/McpClientIdentitySpec.groovy",
+      "sha256": "f59eac5cbe3aec1e9483b19673c818ddb3c40118b26d5a3e5ed669c6cdd178a1"
+    },
+    {
+      "path": "src/test/groovy/server/McpIncludeSmokeSpec.groovy",
+      "sha256": "7d8210f1a025c511816d9eb12bc7a3ef8c0111f9c64e663bcf4342893f38071f"
+    },
+    {
+      "path": "src/test/groovy/server/McpResourcesSpec.groovy",
+      "sha256": "98c001bf2fb5414aaed44c6c0751aca7bdb9caa3874910b58c1ebaeec3457997"
+    },
+    {
+      "path": "src/test/groovy/server/McpSettingsDeviceScopeSpec.groovy",
+      "sha256": "a9ad73c8013b0880a07de127d846f3ff6c21b5d1bcb495d510dc093d868c7850"
+    },
+    {
+      "path": "src/test/groovy/server/McpToolAnnotationsSpec.groovy",
+      "sha256": "015e2cb399f2cc1bc6139ad869019adeeb79cdf5744aa7f5daa43cb8999c3775"
+    },
+    {
+      "path": "src/test/groovy/server/McpWireSchemaConformanceSpec.groovy",
+      "sha256": "a6304ad40aa3e57d3ebd01c9c705cac3e1af4b267161d2df651104594b91ac0a"
+    },
+    {
+      "path": "src/test/groovy/server/MrtrCleanupSpec.groovy",
+      "sha256": "ffdff9fcb6c2aa20b8a7f9e23f02d202e1218aca6aa21f1543ceb858c97db744"
+    },
+    {
+      "path": "src/test/groovy/server/MrtrContinuationSpec.groovy",
+      "sha256": "7d528d7dc62a62fbf755ac2dd046c6ebb6545f128a8ee0b86945aad7471f0eeb"
+    },
+    {
+      "path": "src/test/groovy/server/MrtrDriverBudgetSpec.groovy",
+      "sha256": "4836414cbe0fa1bf9def2a27db972699ace453cd8489f02e061cdd74da796c9f"
+    },
+    {
+      "path": "src/test/groovy/server/MrtrTerminalStorageSpec.groovy",
+      "sha256": "c5027e713049ea942d6f1c8a1ce2f6167071fa5c2f59510778663dc3949f69d5"
+    },
+    {
+      "path": "src/test/groovy/server/MrtrWorkerBudgetSpec.groovy",
+      "sha256": "1b8f93c53abdf92a08a67382ad2aa2c30250c62a255844a60216fd2a9f769850"
+    },
+    {
+      "path": "src/test/groovy/server/NormalizeTriggerSpec.groovy",
+      "sha256": "cf3235681e5cd4e6558022f6d910c25b9fa8f90d3dbca4f1778eab3f1a3dbc8a"
+    },
+    {
+      "path": "src/test/groovy/server/PredicateClearGenerationSpec.groovy",
+      "sha256": "bba8be8a5af2e675be3178abd493f1ee0b19b9c4ed600de427ffbaf3a805e7ff"
+    },
+    {
+      "path": "src/test/groovy/server/ProtectedAppMutationSpec.groovy",
+      "sha256": "90beba278c765f78f08ed8fc8786ce812327f36d66998f513d044e5692341b46"
+    },
+    {
+      "path": "src/test/groovy/server/ProtectedAppsSettingsSpec.groovy",
+      "sha256": "519a9558d5f6a4f712ea0d8c93cb244e47c790a2a987b6da25192e24790faa8d"
+    },
+    {
+      "path": "src/test/groovy/server/RadioGatewaySpec.groovy",
+      "sha256": "02d0a783fd674873b2aaae1482c08ecfbc70ab03b4df149eb5285e1073733865"
+    },
+    {
+      "path": "src/test/groovy/server/RegressionsFromHistorySpec.groovy",
+      "sha256": "b511850459964346e9deb1a8a0b027c606408962b4909b267cec4c276c376fd2"
+    },
+    {
+      "path": "src/test/groovy/server/RelayBudgetSpec.groovy",
+      "sha256": "3b77df74f997fb82193315288ba0e8c84fc203567e0fab6f7cd7de4535fd7ea6"
+    },
+    {
+      "path": "src/test/groovy/server/ReplaceRequiredExpressionSpec.groovy",
+      "sha256": "f0c93596e05706f624ebfe268e89b2483282f259325e4de586174d0d0d4726f3"
+    },
+    {
+      "path": "src/test/groovy/server/RestoreRequiredExpressionSpec.groovy",
+      "sha256": "48a7e68335b5164968c7c5dc704667a8e145976ace34920fb2a0736712608d39"
+    },
+    {
+      "path": "src/test/groovy/server/RestoreRuleStructureSpec.groovy",
+      "sha256": "663bde26e85b930a8cea680ce95caa0660da519978327fb50d7f1312ce0d2f4d"
+    },
+    {
+      "path": "src/test/groovy/server/RetainedStateCloseoutSpec.groovy",
+      "sha256": "2e99ed166c8faeb00de46bfeafe5f9b96ccf151b76a8f8ea3d3abdf6ff596120"
+    },
+    {
+      "path": "src/test/groovy/server/RmBackupSnapshotCredentialsSpec.groovy",
+      "sha256": "009926f5d8aa28b81574886a528b89cf4bf8d70db9013e4b0e0c977a497babba"
+    },
+    {
+      "path": "src/test/groovy/server/RmGatewayDescTrimSpec.groovy",
+      "sha256": "d9321e22617fca4cf3f978d5c11eb8e0a82119d84d8c14fd758d5cc31654c274"
+    },
+    {
+      "path": "src/test/groovy/server/RmNormalizeAtTimeSpec.groovy",
+      "sha256": "a1da28a30844f5c8dbd9c0b2d98c631e3e150c97c6bc00490ecde5d47d57a46f"
+    },
+    {
+      "path": "src/test/groovy/server/RuleNotFoundRedirectSpec.groovy",
+      "sha256": "2e5737cfa89246d4309999bb32fa89b2f6112f4a8e9b31961ed18aa096a68e2d"
+    },
+    {
+      "path": "src/test/groovy/server/SendRmActionFallbackSpec.groovy",
+      "sha256": "e6dfdf6baa5b26aea4c13fea0651fc7e5f25663dfaf4c76d1aee00345e61c1c9"
+    },
+    {
+      "path": "src/test/groovy/server/SetRuleSelfGatewaySpec.groovy",
+      "sha256": "0ccab348eea83d3845f3eb1be4d542c75789f727d0260a1c21d2ffbbac300e2b"
+    },
+    {
+      "path": "src/test/groovy/server/SetupRefreshLifecycleSpec.groovy",
+      "sha256": "de866a039b23f0053cbfd59a920050f94990794213396f420454b79c25068721"
+    },
+    {
+      "path": "src/test/groovy/server/SetupRefreshSpec.groovy",
+      "sha256": "9cfe058240ffac8169ecf9df60476132519e09100f8e764d6cb9d3f940ead2db"
+    },
+    {
+      "path": "src/test/groovy/server/ToolAppDriverCodeSpec.groovy",
+      "sha256": "a84114d75f96f116863e2325c0be12be6aa16369efeba6ac983d434979f93f78"
+    },
+    {
+      "path": "src/test/groovy/server/ToolAppsDriversSpec.groovy",
+      "sha256": "9e424b24d5a413943efb0e2882c5b5cb794310ee25ec57a9836f5f73f2b8c75d"
+    },
+    {
+      "path": "src/test/groovy/server/ToolBackupSpec.groovy",
+      "sha256": "dcf9ccad935c0655b697ca0f56a973206b9fd721cca1446e954ec6999dca0d46"
+    },
+    {
+      "path": "src/test/groovy/server/ToolBundlesSpec.groovy",
+      "sha256": "3b84662baf72a0b07836765be5126b749fb9a6954f3874e6e5b2f5519f879661"
+    },
+    {
+      "path": "src/test/groovy/server/ToolClassificationCompletenessSpec.groovy",
+      "sha256": "16ba93dc044bc7f380586d44624173ff2103a8093cae32dc535087dfe71ea507"
+    },
+    {
+      "path": "src/test/groovy/server/ToolCommandParameterTypesSpec.groovy",
+      "sha256": "676e038f461b63a488ee4852bda3f6180893d6b50aaa88cdb873bdb816d324f6"
+    },
+    {
+      "path": "src/test/groovy/server/ToolCustomRuleLifecycleSpec.groovy",
+      "sha256": "a4e79b99f80f1036d20acf70d6f9bb6ba37e49f386fa14336576fa6307e015cb"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDashboardSpec.groovy",
+      "sha256": "745287c484892dbc68aa1e68afcbe98b9c348f8af13f5376ad6a2aaa17232803"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDestructiveHubOpsSpec.groovy",
+      "sha256": "45735a52ab645ef62f4a7e2d8b2a895ce7604f08632d654719ffcd18e991d05d"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDeviceAllowlistBypassSpec.groovy",
+      "sha256": "c18e68a62a9365784bf8546967ceacbb112c0ce13855946803fe3a7a69030cb8"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDeviceBasicsSpec.groovy",
+      "sha256": "9e0d1b35537f8e21f1c2f77aa1c2f1623053141fbdefe6d55e467d1e893fe814"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDeviceConfigurationWriteSpec.groovy",
+      "sha256": "3fc7d5afc0444648976fad67abbdad547ca3f4d05c3a682378065356fbbc2d59"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDeviceEditSpec.groovy",
+      "sha256": "610c9cadfb1ec9cd3b94119a5bb9d56bfad89f92f79118314fcb4bb7bbf514d5"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDevicePreferencesSpec.groovy",
+      "sha256": "cc5930799607b328783bfda5d015150a5a88c9f8642de054e2769ebe6165dd8c"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDeviceSwapSpec.groovy",
+      "sha256": "0c94c78b4614dbefe9470c1c7b9813de158e1ddb59e9a1af87ed92bd93512902"
+    },
+    {
+      "path": "src/test/groovy/server/ToolDisplayMetaSpec.groovy",
+      "sha256": "58f83a22279f334e777f806d95c2eb194a2917203e58eb726ef219f1ce5c24cd"
+    },
+    {
+      "path": "src/test/groovy/server/ToolGenerateBugReportSpec.groovy",
+      "sha256": "27aa4adbe15f87744a9e9d18bc7e555f61fd32318df6ec545cce1a95d50b75df"
+    },
+    {
+      "path": "src/test/groovy/server/ToolGetAppConfigSpec.groovy",
+      "sha256": "49d689b5d5807a0e76da8fb37b12aa528daff4c51ada87f50b54b3f183987027"
+    },
+    {
+      "path": "src/test/groovy/server/ToolGetDeviceInUseBySpec.groovy",
+      "sha256": "8060a18dc2bdae0b8cf5bf6a871f35c2f5343f31014f520bf98b9abe685abd22"
+    },
+    {
+      "path": "src/test/groovy/server/ToolGetHubLogsSpec.groovy",
+      "sha256": "6a8a027ccd59b396fae7be7e24f037e81e614c3c3d3c63ee0579d7868bbadf8c"
+    },
+    {
+      "path": "src/test/groovy/server/ToolGuidePaginationSpec.groovy",
+      "sha256": "2cf7f10ef4bd2588a9c41e248931a4be4669303eaa0c5ec7f0b4013ddce6910e"
+    },
+    {
+      "path": "src/test/groovy/server/ToolGuideSubSectionsSpec.groovy",
+      "sha256": "c2a0a7d796744789f77d30d8f63da6fee82bef6702cf078042f60e6a67dc1ad3"
+    },
+    {
+      "path": "src/test/groovy/server/ToolHpmReadonlySpec.groovy",
+      "sha256": "b34922c0d78c2db4271ec3e161cb225b1c797ef10b6ba075f46c0e11ec6243c6"
+    },
+    {
+      "path": "src/test/groovy/server/ToolHubMeshSpec.groovy",
+      "sha256": "372a3ba3d23d4dd6387404b19e68e166af8b239020ad341ccf66e02cf5f85ecd"
+    },
+    {
+      "path": "src/test/groovy/server/ToolHubVariablesSpec.groovy",
+      "sha256": "6052d11d2244e14d5880d92603ad1568279fa7503126b1deb6e02cf66e5be9d9"
+    },
+    {
+      "path": "src/test/groovy/server/ToolImportUrlSpec.groovy",
+      "sha256": "e1b31c422d049a7f58e0bc0f2d6aad6937b3499be8c122e6718c7d03f1cff5bc"
+    },
+    {
+      "path": "src/test/groovy/server/ToolInstallBundleSpec.groovy",
+      "sha256": "a1616dd0bad2ae94d9b81598d940194f4dce50a661c36ae8dc5f25331f2af07e"
+    },
+    {
+      "path": "src/test/groovy/server/ToolLibraryCodeSpec.groovy",
+      "sha256": "1581aa85be78b4279ed79fa2978c7511c7454d8a06a8dcc8be579f78997384b7"
+    },
+    {
+      "path": "src/test/groovy/server/ToolListAppPagesSpec.groovy",
+      "sha256": "073d4d30c9a0cb6f0a18b0b8c81edee6d296dbc6289df7999915d25196ea52eb"
+    },
+    {
+      "path": "src/test/groovy/server/ToolListDevicesSpec.groovy",
+      "sha256": "142d7e2e9369f08b3d866f95dcdf1472428dccbf02f6fe3207ffe3c4d66c48bf"
+    },
+    {
+      "path": "src/test/groovy/server/ToolListInstalledAppsSpec.groovy",
+      "sha256": "16d1ec30f77ade2252d962184a75b8eb5d46c66a2ae5404d05828084bf85fbd1"
+    },
+    {
+      "path": "src/test/groovy/server/ToolListRmRulesSpec.groovy",
+      "sha256": "a6116db8e0b01031cb80394f71cb5f423f8ae2253e56d46f7a3804120c20ad60"
+    },
+    {
+      "path": "src/test/groovy/server/ToolManageDiagnosticsSpec.groovy",
+      "sha256": "3b213ce03e0d9bd0f7d209d722c0b3f16f7d4b677e072889e77345ac3c7fc4c0"
+    },
+    {
+      "path": "src/test/groovy/server/ToolManageFilesSpec.groovy",
+      "sha256": "88045c43bf3b37f18ccc01e3487e5af617c5fdb9aa7cc81e2be714a66f41f8b2"
+    },
+    {
+      "path": "src/test/groovy/server/ToolManageLogsSpec.groovy",
+      "sha256": "e9b79eb75ba914492f6cedac0cd43497d05781b7274acd41c7824fb16766f3c7"
+    },
+    {
+      "path": "src/test/groovy/server/ToolManageVirtualDeviceSpec.groovy",
+      "sha256": "0946f0d85236772cbe4bb2c1f57bbb50dadbd7dd8f79fb783c021dda0c457b88"
+    },
+    {
+      "path": "src/test/groovy/server/ToolMetadataMemorySpec.groovy",
+      "sha256": "85ea2763dd6435bee3392ec2c13e9a8cbf788697fc2b71854f6a2f54fa30f36d"
+    },
+    {
+      "path": "src/test/groovy/server/ToolModeSpec.groovy",
+      "sha256": "5936a243d89a75be8a7cb8e550c71a240b1cc509d2422eb1c28920315ed88f6f"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeAccessSurfacesSpec.groovy",
+      "sha256": "36b5246d4db60766d980f2c40ea560ffc745e60ac64e11330b54f1876fc80b4a"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeCommandRoutingSpec.groovy",
+      "sha256": "23e556a48b37277d9c20a76def9113d6ab40be49e43fa51b5ffd54b8d29095b9"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeDeviceInventorySpec.groovy",
+      "sha256": "1e0d6eaf689fbcc8c1a3115e614546fe851394f96095f1759778486e37e76c75"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeDeviceLogAccessSpec.groovy",
+      "sha256": "9be9c3389d45bd3411307d1053db42c24a3be82d2c3a34dac43691a2951d540a"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeDeviceReadsSpec.groovy",
+      "sha256": "9564ed5e03e5c631de1c489ed34a76d7826bf3df55da10e2802dbe2260d9dd0d"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeDiagnosticsReviewSpec.groovy",
+      "sha256": "0d88680590adac6dfefe1b55423b25692a9bae4ef93af515dd8071d10afa7b1c"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeMetadataBoundarySpec.groovy",
+      "sha256": "7f7cbec4bf4cb602a7c1f8d1889106cd69ec93d136dd40a898220f432d6e2aa7"
+    },
+    {
+      "path": "src/test/groovy/server/ToolNativeVirtualDevicesSpec.groovy",
+      "sha256": "88e2fd95d229c60145482320c0cff1c51816f8c8fbe0ca822ee9e941ac47502d"
+    },
+    {
+      "path": "src/test/groovy/server/ToolPauseRmRuleSpec.groovy",
+      "sha256": "77bf1f3dccfc02cd910f5fd84bc1f0d7fd1b9a9ec158910716842cb4ff3d01f1"
+    },
+    {
+      "path": "src/test/groovy/server/ToolPollComparatorStableSpec.groovy",
+      "sha256": "5f5d81038d851181c730d7e25bdd5737afd38d862e3ad60b7bf35c3bb3768a2f"
+    },
+    {
+      "path": "src/test/groovy/server/ToolPollUntilAttributeSpec.groovy",
+      "sha256": "a4bd0b4090147ae9883d7d49314194d36daa95719d7e57228cf14d9627e97fc5"
+    },
+    {
+      "path": "src/test/groovy/server/ToolResumeRmRuleSpec.groovy",
+      "sha256": "e8278d3eae3afd05e753d70224700e7974c9e9b87620aa90da9f6c03b1cd25d1"
+    },
+    {
+      "path": "src/test/groovy/server/ToolRmNativeCrudSpec.groovy",
+      "sha256": "b3016dc8070759dd5de6a872859dc3c0f6278877674011acb4d5e6b6d2f9607d"
+    },
+    {
+      "path": "src/test/groovy/server/ToolRoomsSpec.groovy",
+      "sha256": "c28af5749d2e28ed58f582559d7ce199ae7c275cb7feabfdea0e6163f10afd9c"
+    },
+    {
+      "path": "src/test/groovy/server/ToolRuleHealthSpec.groovy",
+      "sha256": "a5b48eea1d530127d07af53e0f0a3ccb0df618d17a396e952c15dc418bd3144f"
+    },
+    {
+      "path": "src/test/groovy/server/ToolRulesAdminSpec.groovy",
+      "sha256": "4909eeb06a80989abe8db08265f8d5b15b66c4a4b5a12bf202e6f63805f779e6"
+    },
+    {
+      "path": "src/test/groovy/server/ToolRunRmRuleSpec.groovy",
+      "sha256": "6b8338dca084964d2101863796900413626f3257ca983696712c3fcae9075b22"
+    },
+    {
+      "path": "src/test/groovy/server/ToolSearchToolsSpec.groovy",
+      "sha256": "a54a4def9490bc67482fca473ab4a721bc49bf7ffd8e139314cee31fb14d6dee"
+    },
+    {
+      "path": "src/test/groovy/server/ToolSetRmRuleBooleanSpec.groovy",
+      "sha256": "706a83ebb79fcd0f9789f39acddc45fa24bd3bfec8fa485e29bda8e0b0471ba7"
+    },
+    {
+      "path": "src/test/groovy/server/ToolSystemSettingsSpec.groovy",
+      "sha256": "6e1193d3d3ac123b43f1161ccd1f1682ebff697cf3aefbd54dd5bb6792758a2f"
+    },
+    {
+      "path": "src/test/groovy/server/ToolUpdateMcpSettingsSpec.groovy",
+      "sha256": "6e4b53e662ff6dc3a121f11354fe6d9404772d3fd63d0d994b121113bd7dbecb"
+    },
+    {
+      "path": "src/test/groovy/server/ToolUpdatePackageSpec.groovy",
+      "sha256": "84c88aa639a904634c112a0f19cb072a39bcb8ee58f7e8d55d9d7520c709e4ae"
+    },
+    {
+      "path": "src/test/groovy/server/ToolVisualRule20Spec.groovy",
+      "sha256": "022152c3f033c250cd32f66f861874e992c69cee76c91cf894a1398022a1951c"
+    },
+    {
+      "path": "src/test/groovy/server/ToolVisualRuleRestoreSpec.groovy",
+      "sha256": "150b39816e009ddedcaf5f01f8d507d38b86fe966c5f19309767251d9f2c1f95"
+    },
+    {
+      "path": "src/test/groovy/server/ToolVisualRulesSpec.groovy",
+      "sha256": "123429be41edee263331629ddb27927a21d012663f740176de80fad0107b79fa"
+    },
+    {
+      "path": "src/test/groovy/server/TransportAccessSpec.groovy",
+      "sha256": "4df67435c4767f1dcde254e6acad58b564ae53f0f2f8e089a5dad1fdeee5a729"
+    },
+    {
+      "path": "src/test/groovy/server/UpdateNativeAppSchemaTrimSpec.groovy",
+      "sha256": "4f72e58660b7194e7e8b5e9eeee8d60f40a0ff2a984c550291742ff52fc29b43"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogPackageDeploySpec.groovy",
+      "sha256": "98c8d0d265887fc3bbbf431333e6e0b722c41ec0b8ca5f72cc1c62fd2b4acbad"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogRestoreSpec.groovy",
+      "sha256": "bd99d7ebad72ac0a801bb8621f7c525a33ed3e3337797e7a99f9b1419e8139ca"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV2Spec.groovy",
+      "sha256": "d921df73d0b0cd2e959b3d48fd3691746417c1a56c93aa4f9953ba0cdc229079"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV31Harness.groovy",
+      "sha256": "ad3e5a9ef22be8cb51404d9855427366eec5ab18ff678519582534fcb21c28f2"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV31PackageDeploySpec.groovy",
+      "sha256": "22d706d9667397cba77d99928539e764c1af28eb3ad9b1b92aa5037cf0b91f84"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV31ParitySpec.groovy",
+      "sha256": "b38deebddd278f11b9bc8f85ca5c64626a84719b7bb96714b8aedadfde8851a3"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV3Harness.groovy",
+      "sha256": "45df790df85cd0070eef1e4324317738a4b888b8ccb4eb46825a393178c62506"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV3ManualSpec.groovy",
+      "sha256": "51115ada0e7ec0ce5cb19ac6163b109ac691826f70220ee1435283d323d4780f"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV3ParitySpec.groovy",
+      "sha256": "9f9f49d3efd5cefd1f81b5b9599d32aaac273b305239659fee865ebf4640bc87"
+    },
+    {
+      "path": "src/test/groovy/server/WatchdogV3PurgeFixturesSpec.groovy",
+      "sha256": "277502b87df2cff6d1c1991b77e19325704a7068eaef3b3877af1f799a08d857"
+    },
+    {
+      "path": "src/test/groovy/support/FakeRmExpressionEditor.groovy",
+      "sha256": "635aa177f122f31fa32b4840978c97b6e9b70e8ebe4be461942df04d5ed33ec8"
+    },
+    {
+      "path": "src/test/groovy/support/HarnessLoadingSpec.groovy",
+      "sha256": "4dab4eff2b52b54c6df9c17e84db307938652ae3822f4b3c7f8c3ff1188b8b9c"
+    },
+    {
+      "path": "src/test/groovy/support/HarnessSpec.groovy",
+      "sha256": "1f887e877f2699dad88403d0037e49bb177136f2ff8e47f8cbc25dd48009c892"
+    },
+    {
+      "path": "src/test/groovy/support/HubInternalGetMock.groovy",
+      "sha256": "6e31a2bf0776e037ad48a610e51c6cb22e499ec2bcaca78545f665deadf32d2f"
+    },
+    {
+      "path": "src/test/groovy/support/IncludeResolver.groovy",
+      "sha256": "19fc2d5ed3292ab78846137ea1af796256f795387c719f231a5dfe96ec27a5e6"
+    },
+    {
+      "path": "src/test/groovy/support/McpRequestDriver.groovy",
+      "sha256": "40521f1d414b47819c9c52e1107499e22dcf5613383722eacf532b845df8f297"
+    },
+    {
+      "path": "src/test/groovy/support/McpRequestDriverSpec.groovy",
+      "sha256": "0ffbe4f4df720e51779b4485586c2aa051925f3c328f7312e9855a19dbeba81f"
+    },
+    {
+      "path": "src/test/groovy/support/McpSchemaValidator.groovy",
+      "sha256": "20edceb9853625630481d1e4ca7bec06c3738d687c7ff38366058c71118ec71c"
+    },
+    {
+      "path": "src/test/groovy/support/NativeInventoryFixture.groovy",
+      "sha256": "6a5900815d1eec8c5fb9c890e453953ce2218c8abb2b2dda941be29ff1513b85"
+    },
+    {
+      "path": "src/test/groovy/support/NativePollFixture.groovy",
+      "sha256": "063d9952b0548ae09d2c8c62a00e9b78679d22da92e4d0d5c763722abacfdd72"
+    },
+    {
+      "path": "src/test/groovy/support/NetworkUtilsMock.groovy",
+      "sha256": "8dafae7847971930b507683859ea1a8c31fb9be161d4951401ab713f69a57d09"
+    },
+    {
+      "path": "src/test/groovy/support/PassThroughAppValidator.groovy",
+      "sha256": "2c250481a11c6e17f8b8136cfe1b69b1af459304bd38c30ad04e3f99c625be78"
+    },
+    {
+      "path": "src/test/groovy/support/PassThroughSandboxClassLoader.groovy",
+      "sha256": "cdc91c5948f520785430d08634d437e1d5e8ec84f344f0393760b652fb2694ab"
+    },
+    {
+      "path": "src/test/groovy/support/PermissiveLog.groovy",
+      "sha256": "dcdca3ea2a571cc3f622469bcf6a7f4aef09fea3c9080faebd846cc73ee31874"
+    },
+    {
+      "path": "src/test/groovy/support/PermissiveLogSpec.groovy",
+      "sha256": "fdaac2df9582ff77e33d1596cf4c7cc99901d0aa0c01f895a138858703667e0a"
+    },
+    {
+      "path": "src/test/groovy/support/RMUtilsMock.groovy",
+      "sha256": "5c04e666f6d1ad171e98742d72c584795f1f268d3475353c8c898d80a1da2cdf"
+    },
+    {
+      "path": "src/test/groovy/support/RMUtilsMockSpec.groovy",
+      "sha256": "e0c1eaa4e833040b2adc0cc61e3f5917d8323dd799dd3edd98098b1424dad55a"
+    },
+    {
+      "path": "src/test/groovy/support/RMUtilsSandboxInterceptionSpec.groovy",
+      "sha256": "f74f3dcea808d8a3b8a0833f875654e4db4293ddc8727f8d025c289aaa89c7af"
+    },
+    {
+      "path": "src/test/groovy/support/SettingsRoutingGuardSpec.groovy",
+      "sha256": "65f319399663e6ded91d5a1c29317f381e047e17056ba56898a7a1a39fd0f577"
+    },
+    {
+      "path": "src/test/groovy/support/StrictMetaClassCheckSpec.groovy",
+      "sha256": "bc02759adec797570398c3e94c7c1284f35449d924eb4ca615225e701be4af1b"
+    },
+    {
+      "path": "src/test/groovy/support/SubscriptionRecorder.groovy",
+      "sha256": "e298c4ffe89780209a2271ba48a9f355e48409832d4326d3875e162bcab43fe7"
+    },
+    {
+      "path": "src/test/groovy/support/SubscriptionRecorderSpec.groovy",
+      "sha256": "7b4cccb76927cc4a9830b5751c6831b2ad1cc5201e593b4ac16635147fd63131"
+    },
+    {
+      "path": "src/test/groovy/support/TestAtomicState.groovy",
+      "sha256": "3ce0a77150957ffa2524838cf90bdc7425886ed0779c55dda16fc700433364d4"
+    },
+    {
+      "path": "src/test/groovy/support/TestChildApp.groovy",
+      "sha256": "01cdfa5381006dc7a2d8f123e35ebb7ac800f217257555bf9f8db3592de51ba8"
+    },
+    {
+      "path": "src/test/groovy/support/TestDevice.groovy",
+      "sha256": "fbe8f2d07b75601f580f89bc4de2d12e2d029f3070ec0b89cdb1fb1ad312c4af"
+    },
+    {
+      "path": "src/test/groovy/support/TestHub.groovy",
+      "sha256": "6943d434405abe84365db329ff34c3b8d192d6b34e76c5abb89352793b85e7f3"
+    },
+    {
+      "path": "src/test/groovy/support/TestLocation.groovy",
+      "sha256": "4440bb694eef39a04e194aab9022f6050047f9bc574a4faf4603ab5354e4919a"
+    },
+    {
+      "path": "src/test/groovy/support/TestParent.groovy",
+      "sha256": "6bc0f85966549832817b6c3b5c4cc80e5372986f19320fc1834c3f2c2d1848c9"
+    },
+    {
+      "path": "src/test/groovy/support/ToolSpecBase.groovy",
+      "sha256": "43ea74c22db39302df21db68dc8dadaa8dbf84916476a6ce910a1b9185ae9831"
+    },
+    {
+      "path": "src/test/groovy/support/UnstubbedPathException.groovy",
+      "sha256": "6d3b9df4d7dcbbf25fb98a80ae7b8cfa154d410d7409a631891b149f2cf915f1"
+    },
+    {
+      "path": "src/test/resources/device-details/README.md",
+      "sha256": "97903f1439170070f85af41e14277d516bd069d81883def913b3867a9c0b907f"
+    },
+    {
+      "path": "src/test/resources/device-details/current-root-settings.json",
+      "sha256": "6b828e19dc3fb6ee2dad1e42806dd3554bad98b8a1770d6b289e864c0e85987f"
+    },
+    {
+      "path": "src/test/resources/device-details/unsupported-nested-device-settings.json",
+      "sha256": "6dfbab2a3c5168fd6c3c6433fb6dae090644459bae07580b1d66103a7e360305"
+    },
+    {
+      "path": "src/test/resources/mcp-schema/2025-06-18/schema.json",
+      "sha256": "b3db8f1ca839bc5171ceb4ba013fdf240c5a8a13d4653bb1bdf21f94677aa220"
+    },
+    {
+      "path": "src/test/resources/mcp-schema/2026-07-28/schema.json",
+      "sha256": "6995b6ed8d0c9ac6e24a186b2de718ef6801de46393ecd911663942c9a36fcd6"
+    },
+    {
+      "path": "src/test/resources/mcp-schema/README.md",
+      "sha256": "b758786f5026bc7c35f14f62e5e1a426afcb8aed1c20d87b2f7695359e8788d6"
+    },
+    {
+      "path": "src/test/resources/sandbox-rmutils-probe.groovy",
+      "sha256": "cda7514bb212f94eda6310aa94e203c2474d7448326faed22742c32b2dacbc9a"
+    },
+    {
+      "path": "tests/BAT-rm-native-crud.md",
+      "sha256": "b5e222abe0425b1692f1ed31ba58906a0a5a3c3de1651e2b04cefc18af247279"
+    },
+    {
+      "path": "tests/BAT-v2.md",
+      "sha256": "dd2dc285f03204f926322434e6e1081865fdccf734fc78653ed7a765c7d45b86"
+    },
+    {
+      "path": "tests/BAT.md",
+      "sha256": "5d6099f69982c27c2f713a182f29fe33bfbb43ec4f3b9266b51f37d2e4e50293"
+    },
+    {
+      "path": "tests/conftest.py",
+      "sha256": "3b81d6e6ef79478e207267efff47369413250f47dc4b0b45c6abffbefc258f15"
+    },
+    {
+      "path": "tests/device_configuration_helpers.py",
+      "sha256": "d6e1e7a0f29de5ba00fbe5b8b6551d2deac57925c46123db9b37b056c8f25c22"
+    },
+    {
+      "path": "tests/e2e_config.example.json",
+      "sha256": "4060dd34609bbfca4c2eab92607722762a9260bdcd2ade003d6b8d63f6fc34d4"
+    },
+    {
+      "path": "tests/e2e_test.py",
+      "sha256": "008cdf05a9994b77d1f6244e328f0d53abd8a1fc94012cbda067a35512f1ef78"
+    },
+    {
+      "path": "tests/fixtures/app-code-update.groovy",
+      "sha256": "a0fe907a0a37c3d2c67a26e75f1fc99dbf723cf390f4ec797440459f6b8a7913"
+    },
+    {
+      "path": "tests/fixtures/app-trigger-updated.groovy",
+      "sha256": "ca968d8c2be0dc5b1b4c11986eec21b6846bf52a34decf76bd91aba0bebc91c7"
+    },
+    {
+      "path": "tests/fixtures/device-configuration-manifest.json",
+      "sha256": "78d030fabb7949734d88645af0a78edde343f3d4b8cc2b99e31a3d1d6315213d"
+    },
+    {
+      "path": "tests/fixtures/device-configuration-provisioning.md",
+      "sha256": "d718e7dacb5c26e19c815dd874d389abddf3d2e6b65ee2441524ae3d70f2620c"
+    },
+    {
+      "path": "tests/fixtures/device-configuration-response.json",
+      "sha256": "4b83d24d461f026502404a668736568fdb025de627045dba0dc01fba3eb2f38e"
+    },
+    {
+      "path": "tests/fixtures/device-configuration.groovy",
+      "sha256": "bf33add7d015eff3e799e0f9f3086ab7dc501f2f671243617d07a54b293de704"
+    },
+    {
+      "path": "tests/fixtures/driver-code-update.groovy",
+      "sha256": "4f4b2a67050b322f37853aa9869db9ef26d71180105b93714cf5c9976cdeba4c"
+    },
+    {
+      "path": "tests/fixtures/e2e-throwaway-app.groovy",
+      "sha256": "b29aa66ece79c2a40684fbae262fe113d5e59ed077c29a5faec501dec6216d48"
+    },
+    {
+      "path": "tests/fixtures/mcp-e2e-throwaway-bundle.zip",
+      "sha256": "29ab468bd251c339027178eff3665b414578a4d862d118f4da4aa24a98982b60"
+    },
+    {
+      "path": "tests/fixtures/sandbox-map-attributes.groovy",
+      "sha256": "fb6b3850600fcbfe0fe9514aaf6bb207a9c05e917d41221e52d1b79b4908f6d7"
+    },
+    {
+      "path": "tests/fixtures/sandbox-map-branch-proof.groovy",
+      "sha256": "58143dc134d4693b7480cedd5ff4addb46332057937b30936aa81c5f69401573"
+    },
+    {
+      "path": "tests/fixtures/sandbox-map-candidates.groovy",
+      "sha256": "aa9b7cdc5f7e26d2e21ee4d3f63d9b649ff51586c7b75ea5b351ab7274bae189"
+    },
+    {
+      "path": "tests/fixtures/sandbox-map-probe.groovy",
+      "sha256": "d38f008fb2c1baa228acc8e5c8a4a2d850d2d2161d57470232cb6d01db924604"
+    },
+    {
+      "path": "tests/fixtures/sandbox-map-probes.md",
+      "sha256": "02487ab7c42b500cc593fa38b7ed0af21b5ca1c4feb23c0a973e4fff9c28e5fe"
+    },
+    {
+      "path": "tests/lane_gate_test.js",
+      "sha256": "2cbeb164c603ad7a1ccd497f909afd867645969b268d754b72179230ab7efb69"
+    },
+    {
+      "path": "tests/lease_scripts_test.sh",
+      "sha256": "ec230ed5dfaaa6daf16ef6b2e3a6eeb20004ebd076aeb7ce8841b84f4408e8c7"
+    },
+    {
+      "path": "tests/sandbox_lint.py",
+      "sha256": "9dc93d363cf13ba1d90660ecb0af4a9882e700af7d0b74800f3ec1e69a23bc1f"
+    },
+    {
+      "path": "tests/sdk-conformance-requirements.txt",
+      "sha256": "c466e78fdb9330da865af230f8eb3a4e9b8984b329e08647a7ec8485743c6339"
+    },
+    {
+      "path": "tests/sdk_conformance_helpers.py",
+      "sha256": "91617f27835b991a10d3dc81a647d42526c7279607b4dd239eab472000e24a8e"
+    },
+    {
+      "path": "tests/sdk_conformance_test.py",
+      "sha256": "f629d7ea8adb78621b0cb7742f27968537ab15146f2b73b4503aa40c6f949f18"
+    },
+    {
+      "path": "tests/test_app_config_audit.py",
+      "sha256": "dc511c27565adc60a88d46b4fb237c08c376a2a8ad1fd613ff9c0821b6bca307"
+    },
+    {
+      "path": "tests/test_build_release_app.py",
+      "sha256": "c048162b1dae1324fb9e1147dc0efaa71a8e7d444b367334d306ed4f705efffc"
+    },
+    {
+      "path": "tests/test_deploy_bundle_only.py",
+      "sha256": "e5b10c8982fe35708f97a2674071ec860e5629ffeaaf6dd3413b125cbe0de762"
+    },
+    {
+      "path": "tests/test_deploy_probe_diagnostics.py",
+      "sha256": "d01e8cb61a5552c6177af591a539164238065de3fecf55b05dbdc5205ce8c2b0"
+    },
+    {
+      "path": "tests/test_device_configuration_helpers.py",
+      "sha256": "5698b6d1c8c2b5b8cfcc4781c8832345852a6713d645209464407f6076eae17e"
+    },
+    {
+      "path": "tests/test_e2e_app_lifecycle.py",
+      "sha256": "f8004b33d4fe3a6514f5703fcb3d50ad3d54c13d3153a8af40e009e9b43cfd83"
+    },
+    {
+      "path": "tests/test_e2e_ci_guards.py",
+      "sha256": "dfab14345d0fd90bbd3d7cf6fd02203c0520eecafb8c44a4a13eff95e4dfc06f"
+    },
+    {
+      "path": "tests/test_e2e_configuration_lifecycle.py",
+      "sha256": "b507a6f86b36b62b7a788b3972b902974e058668572a64bdc43fcfeb73b989ed"
+    },
+    {
+      "path": "tests/test_e2e_native_fixture_reset.py",
+      "sha256": "c3b4b9ecb9b0412986287e184f5707561e04814978d0944fc8a09d7d3db7bb53"
+    },
+    {
+      "path": "tests/test_e2e_scope.py",
+      "sha256": "6ae814eb5b5d80034997bfd3a49bcfdef51325485eba59099495aabc9d1a3c17"
+    },
+    {
+      "path": "tests/test_e2e_test_helpers.py",
+      "sha256": "11f121fc91d9101e16a13df0ec3ed974fe41b703d93c631e20284e67c2b0b7e7"
+    },
+    {
+      "path": "tests/test_fork_pr_scan.py",
+      "sha256": "ad83e88d9f88089aedddd2a760130eff6ea1c9442d25b37e1381fb493aa74154"
+    },
+    {
+      "path": "tests/test_mcp_setup_env.py",
+      "sha256": "16148e0be4fe0557f0fb2d395ccda4b61ed12c2bde72ea65c785f9c65ecf8e19"
+    },
+    {
+      "path": "tests/test_pr_guard.py",
+      "sha256": "75f70b8788685d07c8299af5d00bcc4dcb6b233c818d65314af743ac7dbc682b"
+    },
+    {
+      "path": "tests/test_release_bump.py",
+      "sha256": "63ceceb50af4129afdbeb8479afac07a4172f8b673aec0ef0abfdf93de164369"
+    },
+    {
+      "path": "tests/test_sandbox_lint.py",
+      "sha256": "d38a9828c4951ec84089f417b0ce37e82f52f774750695c32ad690cfddbaa0b1"
+    },
+    {
+      "path": "tests/test_sdk_conformance_helpers.py",
+      "sha256": "ed30d77f5fcf6a13269e3e78b531637b8952f774b641382d977b3a56c507925f"
+    },
+    {
+      "path": "tests/test_sdk_mrtr_policy.py",
+      "sha256": "1f4a9de691846d7a94f908cea4d45ccf947e4b1e5fd3966e51fe635af0c83a48"
+    },
+    {
+      "path": "tests/test_strip_source.py",
+      "sha256": "68a81c74563cdadeb8a34e46051d19729b741aba0a842e0cbbff823e2e8c536c"
+    },
+    {
+      "path": "tests/test_watchdog_maintenance.py",
+      "sha256": "109325ceb5bd1a17954d060ab292f22f1fc7e19e0f7c9b7e5e67f9eabe46e5df"
+    },
+    {
+      "path": "tests/test_watchdog_v3.py",
+      "sha256": "935cfe5a7ad155393132d378626f0c403f8fbe8112bc64d317a02d93b74ed309"
+    },
+    {
+      "path": "tests/wizard_probe.py",
+      "sha256": "2c6070f0889a83f618e89a92eedd42144874f9be1a7ff5196cbfbe6dd35f0bec"
+    },
+    {
+      "path": "tests/wizard_probe_examples/.gitignore",
+      "sha256": "c3ce1902bcb4fe4a1ce9e190c4b4f538f23d505c95f2344792f235e6c402ac0b"
+    },
+    {
+      "path": "tests/wizard_probe_examples/diag_demo.py",
+      "sha256": "e5d19b4fcceaf5324eb6673cf578ecb86fb525c08c2ca7b3fb51866f885db62b"
+    },
+    {
+      "path": "tests/wizard_probe_matrix.yaml",
+      "sha256": "98f7b0f84706901179c69cc0e569372ffb42fa84fc8a3fa049aec464e7c2a6c1"
+    },
+    {
+      "path": "tools/build-release-app.py",
+      "sha256": "fbd696a57b6089e5fb17250d7b9b8dd9764b0013ce0605531ba3eff6cf818462"
+    },
+    {
+      "path": "tools/build-tool-guide.py",
+      "sha256": "4a77990188bdf9a1b2274e98669783182f8138a494ca7a97f1e7bd5ee4e54dea"
+    },
+    {
+      "path": "tools/groovy_lex.py",
+      "sha256": "22d7edc23dbbfc8b6511206d22927e7b1f3616367f0e569bcb7459beef3ca88b"
+    },
+    {
+      "path": "tools/strip_source.py",
+      "sha256": "35e88795c460e9caac559bcd9125a8dd99a2a1d7b81cf387d7374e1c947b223c"
+    },
+    {
+      "path": "resources/hub2-source/README.md",
+      "source_path": "resources/hub2-source/README.md",
+      "sha256": "df1a034350ed9a3f8039b2e4039e84e9c4d89b085d579322ba1f5d07d8223275"
+    },
+    {
+      "path": "resources/hub2-source/vrb2-authoring-guide.md",
+      "source_path": "resources/hub2-source/vrb2-authoring-guide.md",
+      "sha256": "ce612ac5e7feffafc38451504747e3797d8f998f4fdda850719e66402e7cfd2f"
+    },
+    {
+      "path": "UPSTREAM_AGENT_GUIDANCE.md",
+      "source_path": "AGENTS.md",
+      "sha256": "eee4aecf9ffee4fe1b9d0580de8585aca8b7eb861e1aea5fbccfe08e00c61412"
+    }
+  ],
+  "omissions": [
+    "Captured Hubitat web UI resources: resources/hub2-source/*.js (not CI implementation)",
+    "Root agent policies and agent skill packaging (not inherited by this project)"
+  ]
+}

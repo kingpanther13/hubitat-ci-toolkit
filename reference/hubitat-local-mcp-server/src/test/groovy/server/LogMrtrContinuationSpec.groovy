@@ -1,0 +1,507 @@
+package server
+
+import groovy.json.JsonOutput
+import java.util.concurrent.atomic.AtomicLong
+import spock.lang.Shared
+import support.TestChildApp
+import support.ToolSpecBase
+
+class LogMrtrContinuationSpec extends ToolSpecBase {
+    @Shared private TestChildApp loggingApp = new TestChildApp(id: 402L)
+
+    def setupSpec() { appExecutor.getApp() >> loggingApp }
+
+    def setup() {
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        settingsMap.relayBudgetMs = 6000
+        settingsMap.mcpLogLevel = 'error'
+        script.metaClass._isCloudRequest = { -> true }
+        def clock = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> clock.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> clock.addAndGet(ms) })
+    }
+
+    private Map call(String outer, Map args, String stateId = null) {
+        def params = [name: outer, arguments: args]
+        if (stateId != null) params.requestState = stateId
+        mcpDriver.pushHeaders(['MCP-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call', 'Mcp-Name': outer])
+        mcpDriver.pushBody([jsonrpc: '2.0', id: ++mcpDriver.lastSentId,
+            method: 'tools/call', params: params])
+        script.handleMcpRequest()
+        mcpDriver.parseResponseJson() as Map
+    }
+
+    def 'queued device log worker and continuation remain available when bypass is revoked'() {
+        given:
+        settingsMap.bypassDeviceAllowlist = true
+        hubGet.register('/logs/past/json') { '[]' }
+        def args = [tool: 'hub_get_logs', args: [deviceId: '42']]
+        def first = call('hub_read_diagnostics', args)
+        assert first.result.resultType == 'input_required'
+        assert runInMillisCalls.size() == 1
+        settingsMap.bypassDeviceAllowlist = false
+
+        when:
+        script.runNativeLogFetch(runInMillisCalls[0][2].data as Map)
+        def completed = call('hub_read_diagnostics', args, first.result.requestState)
+
+        then: 'the scoped read plus its identity probe (empty result); revoking bypass gates neither'
+        completed.result.resultType == 'complete'
+        completed.result.isError != true
+        mcpDriver.parseInner(completed).count == 0
+        mcpDriver.parseInner(completed).deviceIdResolved == false
+        hubGet.calls*.path == ['/logs/past/json', '/device/fullJson/42']
+    }
+
+    def "native log reads continue without foreground HTTP and preserve scoped full messages"() {
+        given:
+        settingsMap.enableWrite = false
+        def text = 'diagnostic ' + ('x' * 12000)
+        hubGet.register('/logs/past/json') { params ->
+            JsonOutput.toJson(["2026-09-06 12:00:00.000\tERROR\tapp|42|Example|${text}".toString()])
+        }
+        def args = [tool: 'hub_get_logs', args: [appId: '42']]
+
+        when:
+        def first = call('hub_read_diagnostics', args)
+        String stateId = first.result.requestState
+
+        then:
+        first.result.resultType == 'input_required'
+        stateId
+        hubGet.calls.empty
+        script._activeWrites().empty
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][1] == 'runNativeLogFetch'
+        runInMillisCalls[0][2].data.query == [type: 'app', id: '42']
+
+        when:
+        script.runNativeLogFetch(runInMillisCalls[0][2].data as Map)
+        script.runNativeLogFetch(runInMillisCalls[0][2].data as Map)
+        long fetchedAt = script.now()
+        NOW_OVERRIDE.set({ -> fetchedAt + 29000L })
+        def result = call('hub_read_diagnostics', args, stateId)
+
+        then:
+        result.result.resultType == 'complete'
+        mcpDriver.parseInner(result).logs[0].message == "app|42|Example|${text}"
+        atomicStateMap.mrtrRequests[stateId].terminalResult == [__slowReadReplay: true, tool: 'hub_get_logs']
+        atomicStateMap.mrtrRequests[stateId].expiresAt == fetchedAt + 30000L
+
+        when:
+        def replay = call('hub_read_diagnostics', args, stateId)
+
+        then:
+        mcpDriver.parseInner(replay).logs[0].message == "app|42|Example|${text}"
+        hubGet.calls.size() == 1
+    }
+
+    def "failed native workers do not repeat and the next call can recover"() {
+        given:
+        hubGet.register('/logs/past/json') { params -> throw new IllegalStateException('503 unavailable') }
+        script._nativeLogSnapshot(null, [__reqT0: 1234567880000L])
+        def job = runInMillisCalls[0][2].data as Map
+
+        when:
+        script.runNativeLogFetch(job)
+        script.runNativeLogFetch(job)
+
+        then:
+        hubGet.calls.size() == 1
+
+        when:
+        script._nativeLogSnapshot(null, [__reqT0: 1234567880000L])
+
+        then:
+        def failure = thrown(IllegalStateException)
+        failure.message.contains('503 unavailable')
+
+        when:
+        hubGet.register('/logs/past/json') { params -> '[]' }
+        script._nativeLogSnapshot(null, [__reqT0: 1234567880000L])
+        script.runNativeLogFetch(runInMillisCalls[1][2].data as Map)
+        def recovered = script._nativeLogSnapshot(null, [:])
+
+        then:
+        recovered.state == 'ready'
+        recovered.text == '[]'
+        hubGet.calls.size() == 2
+    }
+
+    def "native log reads evict completed one-round snapshots without disturbing pending workers"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        (0..<6).each { index ->
+            snapshots.put("pending-${index}".toString(), [at: timestamp - 20000L, pending: true])
+        }
+        snapshots.put('old-ready', [at: timestamp - 10000L, pending: false, text: '[]'])
+        snapshots.put('new-ready', [at: timestamp - 1000L, pending: false, text: '[]'])
+        hubGet.register('/logs/past/json') { params -> '[]' }
+
+        when:
+        def first = script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp - 10000L])
+
+        then:
+        first.state == 'pending'
+        runInMillisCalls.size() == 1
+        !snapshots.containsKey('old-ready')
+        snapshots.containsKey('new-ready')
+        (0..<6).every { index -> snapshots.get("pending-${index}".toString()).pending == true }
+        snapshots.size() == 8
+        hubGet.calls.empty
+
+        when:
+        script.runNativeLogFetch(runInMillisCalls[0][2].data as Map)
+        def ready = script._nativeLogSnapshot([type: 'app', id: '42'], [:])
+
+        then:
+        ready.state == 'ready'
+        ready.text == '[]'
+        hubGet.calls.size() == 1
+        runInMillisCalls.size() == 1
+    }
+
+    def "a worker result cannot be evicted before its foreground caller observes it"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        (0..<7).each { index ->
+            snapshots.put("pending-${index}".toString(), [at: timestamp, pending: true])
+        }
+        hubGet.register('/logs/past/json') { params -> '[]' }
+        Exception capacityFailure = null
+        Map sharedResult = null
+        RUN_IN_MILLIS_OVERRIDE.set({ List scheduled ->
+            runInMillisCalls << scheduled
+            if (scheduled[2].data.query.id == '42') {
+                script.runNativeLogFetch(scheduled[2].data as Map)
+                sharedResult = script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+                try {
+                    script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+                } catch (IllegalStateException error) {
+                    capacityFailure = error
+                }
+            }
+        })
+
+        when:
+        def result = script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+
+        then:
+        capacityFailure?.message?.contains('Background read capacity is full')
+        sharedResult.state == 'ready'
+        result.state == 'ready'
+        result.text == '[]'
+        runInMillisCalls.size() == 1
+        hubGet.calls.size() == 1
+
+        when:
+        def next = script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+
+        then:
+        next.state == 'pending'
+        runInMillisCalls.size() == 2
+        hubGet.calls.size() == 1
+        snapshots.size() == 8
+    }
+
+    def "TTL cleanup retains an observed snapshot until its reader returns pending=#pending"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        long ttl = pending ? 90000L : 30000L
+        String key = '402:app:42'
+        snapshots.put(key, [at: timestamp - ttl + 1L, pending: pending,
+            fetchId: 'original', text: '[]', readers: 0])
+        Map observed = null
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms ->
+            NOW_OVERRIDE.set({ -> timestamp + 1L })
+            script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+            observed = snapshots.get(key)
+            if (observed != null) {
+                observed.pending = false
+                observed.text = 'original result'
+            }
+        })
+        // A pending entry reaches TTL inside its wait; a ready entry is observed
+        // by an already active caller while another request sweeps the pool.
+        if (!pending) snapshots.get(key).readers = 1
+
+        when:
+        Map result
+        if (pending) {
+            result = script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+        } else {
+            NOW_OVERRIDE.set({ -> timestamp + 1L })
+            script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+            result = script._observeHubReadSnapshot(key, 'original', null, [:])
+            snapshots.get(key).readers = 0
+        }
+
+        then:
+        result.state == 'ready'
+        result.text == (pending ? 'original result' : '[]')
+        snapshots.get(key).fetchId == 'original'
+        snapshots.get(key).readers == 0
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][2].data.query.id == '99'
+
+        when:
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp - 10000L])
+
+        then:
+        !snapshots.containsKey(key)
+        runInMillisCalls.size() == 1
+
+        where:
+        pending << [true, false]
+    }
+
+    def "leaked reader retention is bounded for #phase snapshots"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        snapshots.put('stale', [at: timestamp, pending: phase != 'ready', readers: 1,
+            replayProtected: true, work: [tool: phase == 'health' ? 'hub_get_device_health' : 'hub_get_logs']])
+
+        when:
+        NOW_OVERRIDE.set({ -> timestamp + ttl })
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp])
+
+        then:
+        snapshots.get('stale').readers == 1
+
+        when:
+        NOW_OVERRIDE.set({ -> timestamp + 599999L })
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp])
+
+        then:
+        snapshots.get('stale').readers == 1
+
+        when:
+        NOW_OVERRIDE.set({ -> timestamp + 600000L })
+        script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: timestamp])
+
+        then:
+        !snapshots.containsKey('stale')
+
+        where:
+        phase    | ttl
+        'logs'   | 90000L
+        'health' | 240000L
+        'ready'  | 30000L
+    }
+
+    def "hard expiry recovers all eight leaked slots and fences an old queued worker"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        (0..<8).each { index ->
+            snapshots.put("402:app:${index}".toString(), [at: timestamp - 600000L,
+                pending: true, readers: 1, fetchId: 'old'])
+        }
+        Map oldJob = [key: '402:app:0', owner: '402', fetchId: 'old', query: [type: 'app', id: '0']]
+        hubGet.register('/logs/past/json') { params -> 'new result' }
+
+        when:
+        def result = script._nativeLogSnapshot([type: 'app', id: '0'], [__reqT0: timestamp - 10000L])
+        script.runNativeLogFetch(oldJob)
+
+        then:
+        result.state == 'pending'
+        snapshots.size() == 1
+        snapshots.get('402:app:0').fetchId != 'old'
+        runInMillisCalls.size() == 1
+        hubGet.calls.empty
+
+        when:
+        script.runNativeLogFetch(runInMillisCalls[0][2].data as Map)
+
+        then:
+        snapshots.get('402:app:0').text == 'new result'
+        hubGet.calls.size() == 1
+    }
+
+    def "an in-flight worker cannot publish across hard expiry"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp - 10000L])
+        Map oldJob = runInMillisCalls[0][2].data as Map
+        snapshots.get(oldJob.key).readers = 1
+        hubGet.register('/logs/past/json') { params ->
+            NOW_OVERRIDE.set({ -> timestamp + 600000L })
+            script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+            'old result'
+        }
+
+        when:
+        script.runNativeLogFetch(oldJob)
+
+        then:
+        runInMillisCalls.size() == 2
+        snapshots.get(oldJob.key).fetchId == runInMillisCalls[1][2].data.fetchId
+        snapshots.get(oldJob.key).pending == true
+        !snapshots.get(oldJob.key).containsKey('text')
+        hubGet.calls.size() == 1
+    }
+
+    def "hard expiry during observation leaves replacement reader accounting intact"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms ->
+            NOW_OVERRIDE.set({ -> timestamp + 600000L })
+            script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+            snapshots.get('402:app:42').readers = 2
+        })
+
+        when:
+        script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+
+        then:
+        def failure = thrown(IllegalStateException)
+        failure.message.contains('snapshot expired or was lost')
+        runInMillisCalls.size() == 2
+        snapshots.get('402:app:42').readers == 2
+        hubGet.calls.empty
+    }
+
+    def "a lost or replaced foreground snapshot fails without claiming replacement readers replacement=#replacement"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms ->
+            String key = runInMillisCalls[0][2].data.key
+            snapshots.remove(key)
+            if (replacement) snapshots.put(key, [at: timestamp, fetchId: 'replacement',
+                pending: false, text: 'newer data', readers: 2])
+        })
+
+        when:
+        script._nativeLogSnapshot([type: 'app', id: '42'], [__reqT0: timestamp])
+
+        then:
+        def failure = thrown(IllegalStateException)
+        failure.message.contains('snapshot expired or was lost')
+        runInMillisCalls.size() == 1
+        hubGet.calls.empty
+        !replacement || snapshots.values().first().readers == 2
+
+        where:
+        replacement << [false, true]
+    }
+
+    def "terminal native log replay retains its original snapshot under capacity pressure until expiry"() {
+        given:
+        def rows = ['2026-09-06 12:00:00.000\tERROR\tapp|42|Example|original']
+        hubGet.register('/logs/past/json') { params -> JsonOutput.toJson(rows) }
+        def args = [tool: 'hub_get_logs', args: [appId: '42']]
+        def first = call('hub_read_diagnostics', args)
+        String stateId = first.result.requestState
+        script.runNativeLogFetch(runInMillisCalls[0][2].data as Map)
+        long fetchedAt = script.now()
+        def completed = call('hub_read_diagnostics', args, stateId)
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        (0..<7).each { index ->
+            snapshots.put("pending-${index}".toString(), [at: fetchedAt, pending: true])
+        }
+        rows = ['2026-09-06 12:00:01.000\tERROR\tapp|42|Example|newer']
+        NOW_OVERRIDE.set({ -> fetchedAt + 29000L })
+
+        when:
+        def rejected = call('hub_read_diagnostics', [tool: 'hub_get_logs', args: [appId: '99']])
+        def replay = call('hub_read_diagnostics', args, stateId)
+
+        then:
+        completed.result.resultType == 'complete'
+        rejected.error != null || rejected.result?.isError == true
+        JsonOutput.toJson(rejected).contains('Background read capacity is full')
+        replay.result.resultType == 'complete'
+        mcpDriver.parseInner(replay).logs == mcpDriver.parseInner(completed).logs
+        mcpDriver.parseInner(replay).logs[0].message == 'app|42|Example|original'
+        hubGet.calls.size() == 1
+        runInMillisCalls.size() == 1
+        snapshots.size() == 8
+        atomicStateMap.mrtrRequests[stateId].expiresAt == fetchedAt + 30000L
+
+        when:
+        NOW_OVERRIDE.set({ -> fetchedAt + 30000L })
+        def expired = call('hub_read_diagnostics', args, stateId)
+        def next = script._nativeLogSnapshot([type: 'app', id: '99'], [__reqT0: fetchedAt])
+
+        then:
+        expired.error != null
+        JsonOutput.toJson(expired).contains('Invalid or expired requestState')
+        next.state == 'pending'
+        runInMillisCalls.size() == 2
+        snapshots.size() == 8
+        hubGet.calls.size() == 1
+    }
+
+    def "a full pool of pending reads rejects a native log call without empty continuation rounds"() {
+        given:
+        Map snapshots = scriptStaticField('NATIVE_LOG_SNAPSHOTS') as Map
+        long timestamp = script.now()
+        (0..<8).each { index ->
+            snapshots.put("pending-${index}".toString(), [at: timestamp, pending: true])
+        }
+
+        when:
+        def response = call('hub_read_diagnostics', [tool: 'hub_get_logs', args: [appId: '42']])
+
+        then:
+        response.error != null || response.result?.isError == true
+        JsonOutput.toJson(response).contains('Background read capacity is full')
+        response.result?.resultType != 'input_required'
+        runInMillisCalls.empty
+        hubGet.calls.empty
+        snapshots.size() == 8
+        script.now() == timestamp
+    }
+
+    def "MCP log history uses requestState and clearing waits before rotating history"() {
+        given:
+        script.mcpLog('error', 'server', 'retained error')
+        def nativeLine = script.log.messages.last()
+        def rows = ["2026-09-06 12:00:00.000\tERROR\tapp|402|MCP|${nativeLine.substring(nativeLine.indexOf(':') + 1)}".toString()]
+        (scriptStaticField('DEBUG_LOG_BUFFERS') as Map).clear()
+        hubGet.register('/logs/past/json') { params -> JsonOutput.toJson(rows) }
+        def args = [tool: 'hub_get_logs', args: [mode: 'mcp']]
+
+        when:
+        def first = call('hub_read_diagnostics', args)
+
+        then:
+        first.result.resultType == 'input_required'
+        hubGet.calls.empty
+
+        when:
+        def clearFirst = call('hub_delete_debug_logs', [:])
+        String clearState = clearFirst.result.requestState
+        def generation = atomicStateMap.debugLogGeneration
+        def clearPending = call('hub_delete_debug_logs', [:], clearState)
+
+        then:
+        clearPending.result.resultType == 'input_required'
+        atomicStateMap.debugLogGeneration == generation
+
+        when:
+        script.runDebugLogHistoryFetch(runInMillisCalls.find { it[1] == 'runDebugLogHistoryFetch' }[2].data as Map)
+        def recovered = call('hub_read_diagnostics', args, first.result.requestState as String)
+        def cleared = call('hub_delete_debug_logs', [:], clearState)
+        def clearedGeneration = atomicStateMap.debugLogGeneration
+        def replay = call('hub_delete_debug_logs', [:], clearState)
+
+        then:
+        mcpDriver.parseInner(recovered).entries*.message == ['retained error']
+        mcpDriver.parseInner(cleared).clearedCount == 1
+        clearedGeneration != generation
+        mcpDriver.parseInner(replay).clearedCount == 1
+        atomicStateMap.debugLogGeneration == clearedGeneration
+    }
+}

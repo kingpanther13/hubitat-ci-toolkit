@@ -1,0 +1,320 @@
+package server
+
+import support.ToolSpecBase
+
+/**
+ * Reactive best-practice hints on write errors (issue #299, ALWAYS ON — no toggle) at the
+ * handleToolsCall envelope chokepoint. On a write-tool error, the response gains a one-line pointer
+ * to the FAILING tool's OWN guide section (via _guideSectionForTool), on both the thrown-IAE ->
+ * isError validation result path (message augmented) and the returned [success:false]/isError Map path (bp_warning
+ * field). It stays quiet for: tools with no dedicated section (no generic fallback), permission/
+ * config refusals, the gate's own missing-key message, success responses, and errors that already
+ * point at the guide. A hint failure must never mask the genuine error.
+ */
+class HandleToolsCallReactiveBpsSpec extends ToolSpecBase {
+
+    @spock.lang.Unroll
+    def "legacy #refusal validation refusal is error logged at error and debug thresholds"() {
+        given:
+        def handlerCalls = []
+        script.metaClass.toolSetHsm = { a -> handlerCalls << new LinkedHashMap(a); [success: true] }
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = refusal != 'write master disabled'
+        settingsMap.enableMandatoryBPS = refusal in ['missing BPS key', 'wrong BPS key']
+        settingsMap.disabled_tools = refusal == 'advanced tool disabled' ? ['hub_set_hsm'] : []
+        def callArgs = [armCommand: 'armHome']
+        if (refusal == 'wrong BPS key') callArgs.bestPracticeKey = 'definitely-wrong-secret'
+        def observations = [:]
+
+        when:
+        ['error', 'debug'].each { threshold ->
+            settingsMap.mcpLogLevel = threshold
+            def buffer = script.initDebugLogs()
+            buffer.entries.clear()
+            script.log.messages.clear()
+            def response = mcpDriver.callTool('hub_set_hsm', callArgs)
+            def visible = script.toolGetHubLogs([mode: 'mcp', level: 'error', component: 'server'])
+            observations[threshold] = [response: response, visible: visible,
+                                       nativeLines: new ArrayList(script.log.messages)]
+        }
+
+        then: 'logging configuration never changes the actionable protocol response'
+        observations.error.response.error == null
+        observations.error.response.result.isError == true
+        observations.debug.response.error == null
+        observations.debug.response.result.isError == true
+        mcpDriver.parseInner(observations.error.response).error == mcpDriver.parseInner(observations.debug.response).error
+        mcpDriver.parseInner(observations.error.response).error.contains(expectedReason)
+
+        and: 'the refusal is visible through both native logging and the MCP error-log reader'
+        observations.values().every { observation ->
+            observation.visible.entries.size() == 1 &&
+                observation.visible.entries[0].level == 'error' &&
+                observation.visible.entries[0].component == 'server' &&
+                observation.visible.entries[0].message.contains(expectedReason) &&
+                observation.nativeLines.any { it.startsWith('error:') && it.contains(expectedReason) }
+        }
+
+        and: 'the rejected call has no side effect and neither the real nor supplied key leaks'
+        handlerCalls.isEmpty()
+        observations.values().every { observation ->
+            def rendered = observation.visible.entries.toString() + observation.nativeLines.toString()
+            !rendered.contains(script.hubBpsGuideKey('best_practice_reference')) && !rendered.contains('definitely-wrong-secret')
+        }
+
+        where:
+        refusal                 | expectedReason
+        'missing BPS key'       | 'Mandatory best-practice acknowledgment'
+        'wrong BPS key'         | 'Mandatory best-practice acknowledgment'
+        'write master disabled' | 'Write tools are disabled'
+        'advanced tool disabled'| 'disabled in Advanced settings'
+    }
+
+    // ---- THROWN-IAE path (-32602): pointer to the failing tool's section --------
+
+    def "a thrown device-command error points at hub_admin_write_devices (the tool's section)"() {
+        given:
+        script.metaClass.toolSendCommand = { d, c, p = null, w = null, cmds = null, t0 = null, st = true ->
+            throw new IllegalArgumentException("Device not found: ${d}")
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_device_command', [deviceId: '999', command: 'on'])
+
+        then:
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains('Device not found: 999')
+        mcpDriver.parseInner(response).error.contains('hub_get_tool_guide(section="hub_admin_write_devices")')
+        mcpDriver.parseInner(response).error.contains('hub_call_device_command')
+        and: "NOT the generic best-practice page"
+        !mcpDriver.parseInner(response).error.contains('best_practice_reference')
+    }
+
+    def "a thrown hub_set_rule error points at set_rule_reference (a DIFFERENT tool -> different section)"() {
+        given:
+        script.metaClass.toolSetRule = { a -> throw new IllegalArgumentException("trigger is required") }
+
+        when:
+        def response = mcpDriver.callTool('hub_set_rule', [appId: 1, addTrigger: [:]])
+
+        then:
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains('hub_get_tool_guide(section="set_rule_reference")')
+    }
+
+    def "reactive hint resolves the SUB-TOOL section for a gateway-routed error (not the gateway name)"() {
+        given: "a sub-tool error routed through its gateway -- handleToolsCall sees the gateway name"
+        settingsMap.useGateways = true
+        script.metaClass.requiredParamsByTool = { -> [:] }
+        script.metaClass.toolSetAppDisabled = { a -> throw new IllegalArgumentException("appId must be a positive integer") }
+
+        when:
+        def response = mcpDriver.callTool('hub_manage_native_rules_and_apps',
+            [tool: 'hub_set_app_disabled', args: [appId: 'x']])
+
+        then: "the hint maps to the SUB-TOOL's own sub-section (builtin_app_tools_rules), since the gateway has none"
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains('hub_get_tool_guide(section="builtin_app_tools_rules")')
+        mcpDriver.parseInner(response).error.contains('hub_set_app_disabled')
+    }
+
+    def "a gateway-ENVELOPE error (unknown sub-tool) gets NO hint -- the sub-tool never ran"() {
+        given: "a sub-tool that is not a member of the called gateway -> handleGateway rejects it"
+        settingsMap.useGateways = true
+
+        when:
+        def response = mcpDriver.callTool('hub_manage_devices', [tool: 'hub_delete_room', args: [room: 'x']])
+
+        then: "the gateway 'Unknown tool' refusal stands alone -- no resolved-sub-tool guide pointer"
+        response.error.code == -32602
+        response.error.message.contains('Unknown tool')
+        !response.error.message.contains('get_tool_guide')
+    }
+
+    def "malformed gateway arguments (a non-Map) do not crash the reactive-name resolution"() {
+        given: "a gateway call whose 'arguments' is a String, not an object"
+        settingsMap.useGateways = true
+
+        when: "the args.tool probe runs BEFORE handleToolsCall's try -- it must not throw on a String"
+        def response = script.handleToolsCall([id: 1, params: [name: 'hub_manage_devices', arguments: 'not-an-object']])
+
+        then: "the malformed call is reported through the handled JSON-RPC path, not an unhandled crash"
+        noExceptionThrown()
+        response != null
+        (response.error != null) || (response.result != null)
+    }
+
+    def "a thrown error from a tool with NO dedicated section gets no hint"() {
+        given: "hub_set_hsm is not in the tool->section map"
+        script.metaClass.toolSetHsm = { m -> throw new IllegalArgumentException("HSM not configured") }
+
+        when:
+        def response = mcpDriver.callTool('hub_set_hsm', [armCommand: 'armHome'])
+
+        then:
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains('HSM not configured')
+        !mcpDriver.parseInner(response).error.contains('get_tool_guide')
+    }
+
+    def "a permission refusal (Write master OFF) is NOT augmented"() {
+        given:
+        settingsMap.enableWrite = false
+
+        when: "a sectioned write tool blocked by the master gate"
+        def response = mcpDriver.callTool('hub_call_device_command', [deviceId: '1', command: 'on'])
+
+        then: "the message is the master refusal, with no reactive pointer appended"
+        response.error == null
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains('Write tools are disabled')
+        !mcpDriver.parseInner(response).error.contains('get_tool_guide')
+    }
+
+    def "the gate's OWN missing-key refusal is NOT double-coached"() {
+        given: "gate ON, no key -> the gate throws its own guide-pointer message"
+        settingsMap.enableMandatoryBPS = true
+
+        when:
+        def response = mcpDriver.callTool('hub_call_device_command', [deviceId: '1', command: 'on'])
+
+        then:
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains('Mandatory best-practice')
+        !mcpDriver.parseInner(response).error.contains('reference and best practices')   // the reactive suffix is absent
+    }
+
+    // ---- RETURNED-error Map path: bp_warning with the tool's section ------------
+
+    def "a returned success:false error gets a bp_warning pointing at the tool's section"() {
+        given:
+        script.metaClass.toolSendCommand = { d, c, p = null, w = null, cmds = null, t0 = null, st = true -> [success: false, error: "Device not found: 42"] }
+
+        when:
+        def inner = mcpDriver.parseInner(mcpDriver.callTool('hub_call_device_command', [deviceId: '42', command: 'on']))
+
+        then:
+        inner.success == false
+        inner.bp_warning != null
+        inner.bp_warning.contains('hub_get_tool_guide(section="hub_admin_write_devices")')
+    }
+
+    def "a successful result is never scanned (no bp_warning)"() {
+        given:
+        script.metaClass.toolSendCommand = { d, c, p = null, w = null, cmds = null, t0 = null, st = true -> [success: true] }
+
+        when:
+        def inner = mcpDriver.parseInner(mcpDriver.callTool('hub_call_device_command', [deviceId: '1', command: 'on']))
+
+        then:
+        inner.success == true
+        !(inner instanceof Map && inner.containsKey('bp_warning'))
+    }
+
+    def "a pre-existing bp_warning is not overwritten (idempotent)"() {
+        given:
+        script.metaClass.toolSendCommand = { d, c, p = null, w = null, cmds = null, t0 = null, st = true -> [success: false, error: "x", bp_warning: "PRESET"] }
+
+        when:
+        def inner = mcpDriver.parseInner(mcpDriver.callTool('hub_call_device_command', [deviceId: '1', command: 'on']))
+
+        then:
+        inner.bp_warning == "PRESET"
+    }
+
+    def "a thrown IAE with a null message does not crash and is not augmented"() {
+        given:
+        script.metaClass.toolSendCommand = { d, c, p = null, w = null, cmds = null, t0 = null, st = true -> throw new IllegalArgumentException() }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_device_command', [deviceId: '1', command: 'on'])
+
+        then:
+        response.result.isError == true
+        !(mcpDriver.parseInner(response).error?.contains('get_tool_guide'))
+    }
+
+    def "a hint-attach failure (immutable result Map) does NOT mask the original error"() {
+        given:
+        script.metaClass.toolSendCommand = { d, c, p = null, w = null, cmds = null, t0 = null, st = true -> [success: false, error: "Device not found: 7"].asImmutable() }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_device_command', [deviceId: '7', command: 'on'])
+        def inner = mcpDriver.parseInner(response)
+
+        then: "the genuine error survives; no generic envelope replaced it"
+        inner.success == false
+        inner.error == "Device not found: 7"
+        response.result?.isError != true
+    }
+
+    // ---- _guideSectionForTool: the tool -> section map -------------------------
+
+    def "_guideSectionForTool maps each write-tool family to its own section"() {
+        expect:
+        script._guideSectionForTool('hub_set_rule') == 'set_rule_reference'
+        script._guideSectionForTool('hub_set_visual_rule') == 'visual_rule_reference'
+        script._guideSectionForTool('hub_create_custom_rule') == 'rules'
+        script._guideSectionForTool('hub_update_device') == 'update_device'
+        script._guideSectionForTool('hub_manage_virtual_device') == 'virtual_devices'
+
+        and: "where the section splits, the hint names the SUB-key holding that tool's own block -- the error is where an agent is most likely to follow the pointer, so it must not cost the whole parent"
+        script._guideSectionForTool('hub_set_native_app') == 'builtin_app_tools_crud'
+        script._guideSectionForTool('hub_call_rule') == 'builtin_app_tools_rules'
+        script._guideSectionForTool('hub_delete_device') == 'hub_admin_write_destructive'
+        script._guideSectionForTool('hub_call_zwave') == 'hub_admin_write_radios'
+        script._guideSectionForTool('hub_call_device_swap') == 'hub_admin_write_devices'
+        script._guideSectionForTool('hub_call_device_command') == 'hub_admin_write_devices'
+        script._guideSectionForTool('hub_set_zwave') == 'hub_admin_write_radios'
+
+        and: "every mapping resolves to something hub_get_tool_guide actually serves"
+        def served = (script.getToolGuideSections().keySet() as Set) +
+                     (script.getToolGuideSubSections().values().collectMany { it.keySet().toList() } as Set)
+        ['hub_set_rule', 'hub_set_visual_rule', 'hub_create_custom_rule', 'hub_update_device',
+         'hub_manage_virtual_device', 'hub_call_device_command', 'hub_set_native_app',
+         'hub_call_rule', 'hub_delete_device', 'hub_call_zwave', 'hub_call_device_swap',
+         'hub_delete_native_app', 'hub_clone_native_app', 'hub_export_native_app',
+         'hub_import_native_app', 'hub_set_app_disabled', 'hub_set_rule_paused',
+         'hub_set_rule_private_boolean', 'hub_call_zigbee', 'hub_call_matter',
+         'hub_call_device_replace', 'hub_update_firmware', 'hub_call_destructive_ops',
+         'hub_delete_room', 'hub_delete_item', 'hub_reboot', 'hub_shutdown',
+         'hub_create_dashboard', 'hub_create_backup', 'hub_write_file'
+        ].every { script._guideSectionForTool(it) in served }
+
+        and: "a tool with no dedicated section maps to null (no generic fallback)"
+        script._guideSectionForTool('hub_set_hsm') == null
+        script._guideSectionForTool(null) == null
+    }
+
+    // ---- _reactiveBpsWarning: pure-function rules -------------------------------
+
+    def "_reactiveBpsWarning points at the tool's section for a genuine tool error"() {
+        expect:
+        def w = script._reactiveBpsWarning('hub_set_rule', [:], 'some rule failure')
+        w?.contains('hub_get_tool_guide(section="set_rule_reference")')
+    }
+
+    def "_reactiveBpsWarning returns null for a tool with no section"() {
+        expect:
+        script._reactiveBpsWarning('hub_set_hsm', [:], 'some failure') == null
+    }
+
+    def "_reactiveBpsWarning returns null for permission/config refusals"() {
+        expect:
+        script._reactiveBpsWarning('hub_call_device_command', [:], 'Write tools are disabled. Enable ...') == null
+        script._reactiveBpsWarning('hub_call_device_command', [:], 'Mandatory best-practice acknowledgment is enabled ...') == null
+        script._reactiveBpsWarning('hub_delete_device', [:], 'hub_delete_device is disabled in Advanced settings ...') == null
+    }
+
+    def "_reactiveBpsWarning returns null when the error already points at the guide (idempotent)"() {
+        expect:
+        script._reactiveBpsWarning('hub_call_device_command', [:], 'Device not found. See hub_get_tool_guide(...)') == null
+    }
+
+    def "_reactiveBpsWarning returns null for gateway-envelope errors (the sub-tool never ran)"() {
+        expect:
+        script._reactiveBpsWarning('hub_delete_room', [:], "Unknown tool 'hub_delete_room' in hub_manage_devices") == null
+        script._reactiveBpsWarning('hub_call_device_command', [:], "Missing required parameter: command") == null
+        script._reactiveBpsWarning('hub_set_native_app', [:], "Gateway arg 'args' was a String but not valid JSON.") == null
+    }
+}

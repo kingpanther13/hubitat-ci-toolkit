@@ -1,0 +1,3985 @@
+package server
+
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+
+import spock.lang.Shared
+import support.TestChildApp
+import support.ToolSpecBase
+
+/**
+ * Dispatch-level contract for MCP 2026-07-28 request-to-request continuation.
+ *
+ * A modern slow write reserves its state and runs its first slice in the same
+ * request; only work still running at the budget returns an InputRequiredResult.
+ * The client echoes requestState with the unchanged original arguments. Each
+ * resumed request runs a slice or observes a worker; a terminal response is retained under
+ * the same state briefly so a dropped final HTTP response can be replayed without
+ * running the write again.
+ */
+class MrtrContinuationSpec extends ToolSpecBase {
+
+    @Shared private TestChildApp lifecycleApp = new TestChildApp(id: 1L, label: 'MCP')
+
+    def setupSpec() {
+        appExecutor.getApp() >> lifecycleApp
+    }
+
+    def setup() {
+        lifecycleApp.settingsStore.clear()
+    }
+
+    private List<Map> race(int count, Closure<Map> action) {
+        def ready = new CountDownLatch(count)
+        def start = new CountDownLatch(1)
+        def results = java.util.Collections.synchronizedList([])
+        def failures = java.util.Collections.synchronizedList([])
+        def threads = (0..<count).collect { int index ->
+            Thread.start("mrtr-race-${index}") {
+                ready.countDown()
+                start.await()
+                try { results << action.call(index) }
+                catch (Throwable t) { failures << t }
+            }
+        }
+        assert ready.await(5, TimeUnit.SECONDS)
+        start.countDown()
+        threads*.join(5000)
+        assert !threads.any { it.alive }
+        assert failures.isEmpty()
+        return results as List<Map>
+    }
+
+    private Map modernCall(String toolName, Map args, String requestState = null) {
+        int id = ++mcpDriver.lastSentId
+        def params = [name: toolName, arguments: args]
+        if (requestState != null) params.requestState = requestState
+        mcpDriver.pushHeaders([
+            'MCP-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': toolName
+        ])
+        mcpDriver.pushBody([jsonrpc: '2.0', id: id, method: 'tools/call', params: params])
+        script.handleMcpRequest()
+        return mcpDriver.parseResponseJson() as Map
+    }
+
+    private Map directCall(Object target, int id, String toolName, Map args,
+                           String requestState = null) {
+        def params = [name: toolName, arguments: args]
+        if (requestState != null) params.requestState = requestState
+        Map response = target.handleToolsCall([jsonrpc: '2.0', id: id,
+            method: 'tools/call', params: params]) as Map
+        return mcpDriver.decodeToolCallResponse(response)
+    }
+
+    /** First slice succeeds on rule one and pauses with the rest as remainder. */
+    private Closure pausingMultiRuleWrite(Closure onCall = null) {
+        return { Map a ->
+            onCall?.call(a)
+            [success: false, partial: true, ruleIds: a.ruleId,
+             results: [[success: true, ruleId: a.ruleId[0]]], remainingRuleIds: a.ruleId.drop(1)]
+        }
+    }
+
+    /** The single retained record's state id, for calls that returned terminal with no wire state. */
+    private String onlyStateId() {
+        Map records = atomicStateMap.mrtrRequests as Map
+        assert records.size() == 1
+        return records.keySet().first()
+    }
+
+    def "argument canonicalization preserves collision-named data and value types"() {
+        given:
+        def input = [z: null, fields: ['id', 'label'], nested: [fields: false, class: 0, getClass: []]]
+
+        when:
+        def canonical = script._mrtrCanonicalArgs(input)
+
+        then:
+        canonical == input
+        canonical.keySet().toList() == ['fields', 'nested', 'z']
+        canonical.nested.keySet().toList() == ['class', 'fields', 'getClass']
+        !canonical.is(input)
+        !canonical.nested.is(input.nested)
+        input.keySet().toList() == ['z', 'fields', 'nested']
+    }
+
+    private String nativeRuleConfig(int appId, String label, int parentAppId) {
+        return groovy.json.JsonOutput.toJson([
+            app: [id: appId, name: 'Rule-5.1', label: label, trueLabel: label,
+                  installed: true, parentAppId: parentAppId,
+                  appType: [name: 'Rule-5.1', namespace: 'hubitat']],
+            configPage: [name: 'mainPage', title: 'Edit Rule', install: true,
+                         error: null, sections: [[title: '', input: []]]],
+            settings: [:], childApps: []
+        ])
+    }
+
+    private String nativeParentConfig(int parentAppId, List<Map> children) {
+        return groovy.json.JsonOutput.toJson([
+            app: [id: parentAppId, label: 'Rule Machine'],
+            configPage: [name: 'mainPage', title: 'RM', install: true,
+                         error: null, sections: []],
+            settings: [:], childApps: children
+        ])
+    }
+
+    private String clonerPageState(String action, int index) {
+        return groovy.json.JsonOutput.toJson([configPage: [name: 'main', sections: [
+            [input: [], body: [[description:
+                "<button name='_action_href_name|${action}|${index}'>Go</button>".toString()]]]
+        ]]])
+    }
+
+    private Map decodeForm(String encoded) {
+        if (!encoded) return [:]
+        Map decoded = [:]
+        encoded.split('&').each { pair ->
+            int equalsAt = pair.indexOf('=')
+            String key = equalsAt < 0 ? pair : pair.substring(0, equalsAt)
+            String value = equalsAt < 0 ? '' : pair.substring(equalsAt + 1)
+            decoded[java.net.URLDecoder.decode(key, 'UTF-8')] =
+                java.net.URLDecoder.decode(value, 'UTF-8')
+        }
+        return decoded
+    }
+
+    def "pure native-write preflight refuses #caseName before reserving MRTR state"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        def backupCalls = []
+        def posts = []
+        script.metaClass._rmBackupRuleSnapshot = { Integer id, String reason ->
+            backupCalls << [id: id, reason: reason]
+            [backupKey: 'must-not-exist']
+        }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, location: null, data: '{}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: body]
+            [status: 200, location: null, data: '{}']
+        }
+        def wireArgs = (outer == leaf)
+            ? new LinkedHashMap(leafArgs)
+            : [tool: leaf, args: new LinkedHashMap(leafArgs)]
+
+        when:
+        def response = modernCall(outer, wireArgs)
+        def inner = mcpDriver.parseInner(response)
+
+        then: 'the ordinary structured refusal is terminal and no continuation protocol leaks out'
+        response.error == null
+        response.result.resultType == 'complete'
+        response.result.isError != true
+        !response.result.containsKey('requestState')
+        inner.success == false
+        inner.appId == 777
+        inner.error.toLowerCase().contains(errorNeedle)
+        inner.wizardStuck == false
+        !inner.containsKey('backup')
+        inner.restoreHint == script._rmPreflightRestoreHint()
+
+        and: 'round zero created no durable work and touched no backup or wizard surface'
+        !(atomicStateMap.mrtrRequests instanceof Map) || atomicStateMap.mrtrRequests.isEmpty()
+        backupCalls.isEmpty()
+        posts.isEmpty()
+        hubGet.calls.isEmpty()
+        runInMillisCalls.isEmpty()
+
+        where:
+        caseName                    | outer                              | leaf                 | leafArgs                                                                                                    | errorNeedle
+        'periodic map missing'      | 'hub_manage_rule_machine'          | 'hub_set_rule'       | [appId: 777, addTrigger: [capability: 'Periodic Schedule', minutes: 1], confirm: true]                       | 'periodic'
+        'state token in state'      | 'hub_set_rule'                     | 'hub_set_rule'       | [appId: 777, addTrigger: [capability: 'Temperature', state: 'changed'], confirm: true]                      | 'comparator'
+        'periodic field missing'    | 'hub_manage_rule_machine'          | 'hub_set_rule'       | [appId: 777, addTrigger: [capability: 'Periodic Schedule', periodic: [frequency: 'Hourly']], confirm: true] | 'everyn'
+        'action verb in state'      | 'hub_manage_native_rules_and_apps' | 'hub_set_native_app' | [appId: 777, addAction: [capability: 'switch', state: 'on'], confirm: true]                                 | 'action:'
+        'numeric-string appId'      | 'hub_manage_rule_machine'          | 'hub_set_rule'       | [appId: '777', addAction: [capability: 'switch', state: 'on'], confirm: true]                               | 'action:'
+    }
+
+    def "the pre-flight restore hint names a reused baseline for what it is (#label)"() {
+        expect:
+        script._rmPreflightRestoreHint("x", backup).contains(expected)
+
+        where:
+        label            | backup                                              | expected
+        'no backup'      | null                                                | 'No backup was taken'
+        'fresh snapshot' | [backupKey: 'rm-rule_1_a', baselineReused: false]   | 'unused snapshot taken before the refusal'
+        'reused'         | [backupKey: 'rm-rule_1_a', baselineReused: true]    | 'baseline reused from an earlier edit'
+    }
+
+    def "direct flat-mode native preflight still returns a terminal refusal"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = false
+        stateMap.lastBackupTimestamp = 1234567890000L
+        def args = [appId: 781,
+            addAction: [capability: 'switch', state: 'on'], confirm: true]
+
+        when:
+        def response = modernCall('hub_set_rule', args)
+        def inner = mcpDriver.parseInner(response)
+
+        then:
+        response.error == null
+        response.result.resultType == 'complete'
+        !response.result.containsKey('requestState')
+        inner.success == false
+        inner.error.toLowerCase().contains('action:')
+        !(atomicStateMap.mrtrRequests instanceof Map) || atomicStateMap.mrtrRequests.isEmpty()
+        runInMillisCalls.isEmpty()
+    }
+
+    def "round zero dispatches #caseName to the canonical worker"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = useGateways
+        stateMap.lastBackupTimestamp = 1234567890000L
+        def leafArgs = [appId: 782, confirm: true] + editShape
+        def wireArgs = outer == leaf
+            ? leafArgs
+            : [tool: leaf, args: leafArgs]
+
+        when:
+        def response = modernCall(outer, wireArgs)
+        String requestState = response.result.requestState
+
+        then: 'round zero schedules the canonical worker without replacing bulk or gateway routing semantics'
+        response.error == null
+        response.result.resultType == 'input_required'
+        requestState instanceof String
+        atomicStateMap.mrtrRequests[requestState].leafTool == leaf
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runMrtrSlice']
+
+        where:
+        caseName                  | useGateways | outer                     | leaf           | editShape
+        'plural trigger envelope' | true        | 'hub_set_rule'            | 'hub_set_rule' | [addTriggers: [[capability: 'Switch', state: 'changed']]]
+        'plural action envelope'  | true        | 'hub_set_rule'            | 'hub_set_rule' | [addActions: [[capability: 'switch', state: 'on']]]
+    }
+
+    def "round-zero native validation cannot outrank the #gateName gate"() {
+        given:
+        settingsMap.enableWrite = enableWrite
+        // This feature exercises the owning gateway's access gates explicitly.
+        // Pin it on so the flat CI matrix default cannot turn the request into
+        // the distinct disabled-gateway routing case covered above.
+        settingsMap.useGateways = true
+        settingsMap.enableMandatoryBPS = mandatoryBps
+        stateMap.lastBackupTimestamp = backupEpoch
+        def leafArgs = [appId: 778,
+            addTrigger: [capability: 'Periodic Schedule', minutes: 1],
+            confirm: confirm]
+        if (bestPracticeKey != null) leafArgs.bestPracticeKey = bestPracticeKey
+        if (backupEpoch == null) {
+            hubGet.register('/hub2/localBackups') { params -> '[]' }
+        }
+        def args = [tool: 'hub_set_rule', args: leafArgs]
+
+        when:
+        def response = modernCall('hub_manage_rule_machine', args)
+
+        then:
+        response.result != null
+        response.error == null
+        response.result.isError == true
+        mcpDriver.parseInner(response).error.contains(expected)
+        !mcpDriver.parseInner(response).error.toLowerCase().contains('periodic')
+        !(atomicStateMap.mrtrRequests instanceof Map) || atomicStateMap.mrtrRequests.isEmpty()
+        runInMillisCalls.isEmpty()
+
+        where:
+        gateName        | enableWrite | mandatoryBps | backupEpoch    | confirm | bestPracticeKey || expected
+        'Write master'  | false       | false        | 1234567890000L | true    | null            || 'Write tools are disabled'
+        'mandatory BPS' | true        | true         | 1234567890000L | true    | 'wrong'         || 'Mandatory best-practice acknowledgment'
+        'confirmation'  | true        | false        | 1234567890000L | false   | null            || 'SAFETY CHECK FAILED'
+        'backup freshness' | true     | false        | null           | true    | null            || 'BACKUP REQUIRED'
+    }
+
+    def "valid #leaf native write schedules its worker after pure validation"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        def leafArgs = [appId: 779,
+            addAction: [capability: 'log', message: 'valid preflight'],
+            confirm: true]
+        def args = (outer == leaf) ? leafArgs : [tool: leaf, args: leafArgs]
+
+        when:
+        def response = modernCall(outer, args)
+        String requestState = response.result.requestState
+
+        then:
+        response.error == null
+        response.result.resultType == 'input_required'
+        requestState instanceof String
+        atomicStateMap.mrtrRequests[requestState].leafTool == leaf
+        runInMillisCalls.size() == 1
+
+        where:
+        outer                              | leaf
+        'hub_set_rule'                     | 'hub_set_rule'
+        'hub_manage_native_rules_and_apps' | 'hub_set_native_app'
+    }
+
+    def "pure refusal does not outrank existing multi-operation dispatch"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        def args = [appId: 780,
+            addTrigger: [capability: 'Periodic Schedule', minutes: 1],
+            addLocalVariable: [name: 'mustNotLand', type: 'String', value: 'x'],
+            confirm: true]
+
+        when:
+        def response = modernCall('hub_set_rule', args)
+        String requestState = response.result.requestState
+
+        then: 'round zero defers to the existing worker-side operation-family guard'
+        response.error == null
+        response.result.resultType == 'input_required'
+        requestState instanceof String
+        atomicStateMap.mrtrRequests[requestState].leafTool == 'hub_set_rule'
+        runInMillisCalls.size() == 1
+    }
+
+    def "modern slow write runs its first slice, continues across bounded slices, and replays its terminal result"() {
+        given:
+        settingsMap.enableWrite = true
+        def ranWith = []
+        script.metaClass.toolRunRmRule = { Map a ->
+            ranWith << new LinkedHashMap(a)
+            if (ranWith.size() == 1) {
+                return [
+                    success: false,
+                    partial: true,
+                    ruleIds: [11, 12],
+                    rmAction: 'stopRule toggle x1',
+                    results: [[success: true, ruleId: 11]],
+                    remainingRuleIds: [12]
+                ]
+            }
+            return [
+                success: true,
+                partial: false,
+                ruleIds: [12],
+                rmAction: 'stopRule toggle x1',
+                results: [[success: true, ruleId: 12]]
+            ]
+        }
+        def original = [ruleId: [11, 12], action: 'stop']
+
+        when: 'the first request executes one bounded slice and pauses with a remainder'
+        def first = modernCall('hub_call_rule', original)
+        String requestState = first.result.requestState
+
+        then:
+        first.error == null
+        first.result.resultType == 'input_required'
+        requestState instanceof String
+        requestState.size() >= 24
+        !first.result.containsKey('content')
+        ranWith.size() == 1
+        ranWith[0].ruleId == [11, 12]
+        !ranWith[0].containsKey('__mrtr')
+
+        when: 'the resumed request executes only the stored remainder'
+        def third = modernCall('hub_call_rule', original, requestState)
+        def finalInner = mcpDriver.parseInner(third)
+
+        then:
+        third.error == null
+        third.result.resultType == 'complete'
+        third.result.isError != true
+        ranWith.size() == 2
+        ranWith[1].ruleId == [12]
+        finalInner.success == true
+        finalInner.ruleIds == [11, 12]
+        finalInner.results*.ruleId == [11, 12]
+        finalInner.mrtr.rounds == 2
+
+        when: 'a lost terminal response is retried with the same requestState'
+        def replay = modernCall('hub_call_rule', original, requestState)
+
+        then: 'the cached terminal result is returned and the write is not run again'
+        replay.result.resultType == 'complete'
+        mcpDriver.parseInner(replay).results*.ruleId == [11, 12]
+        ranWith.size() == 2
+    }
+
+    def "a continuation is not re-gated after its key rotates, while an initial call still is"() {
+        given: 'the gate ON; one second before an hour boundary, a paused bulk write starts with the key of the PREVIOUS hour (still in grace)'
+        settingsMap.enableWrite = true
+        settingsMap.enableMandatoryBPS = true
+        long hourEnd = (1234567890000L.intdiv(3600000L) + 1L) * 3600000L
+        def virtualNow = new AtomicLong(hourEnd - 1000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        def ranWith = []
+        script.metaClass.toolRunRmRule = { Map a ->
+            ranWith << new LinkedHashMap(a)
+            if (ranWith.size() == 1) {
+                return [success: false, partial: true, ruleIds: [51, 52],
+                        rmAction: 'stopRule toggle x1',
+                        results: [[success: true, ruleId: 51]], remainingRuleIds: [52]]
+            }
+            return [success: true, partial: false, ruleIds: [52],
+                    rmAction: 'stopRule toggle x1', results: [[success: true, ruleId: 52]]]
+        }
+        def original = [ruleId: [51, 52], action: 'stop',
+                        bestPracticeKey: script.hubBpsGuideKey('builtin_app_tools_rules', hourEnd - 3600000L - 1000L)]
+
+        when:
+        def first = modernCall('hub_call_rule', original)
+        String requestState = first.result.requestState
+
+        then:
+        first.result.resultType == 'input_required'
+        ranWith.size() == 1
+
+        when: 'two seconds later the hour has rolled, the key is two hours old, and the client resumes with the unchanged args'
+        virtualNow.addAndGet(2000L)
+        assert !script.hubBpsKeyAccepted('builtin_app_tools_rules', original.bestPracticeKey)
+        def resumed = modernCall('hub_call_rule', original, requestState)
+
+        then: 'the remainder runs to completion'
+        resumed.error == null
+        resumed.result.resultType == 'complete'
+        resumed.result.isError != true
+        !resumed.toString().contains('Mandatory best-practice')
+        ranWith.size() == 2
+        ranWith[1].ruleId == [52]
+        mcpDriver.parseInner(resumed).success == true
+
+        when: 'a new initial call carrying another section\'s current key'
+        def refused = modernCall('hub_call_rule', [ruleId: [53], action: 'stop',
+                                                   bestPracticeKey: script.hubBpsGuideKey('set_rule_reference')])
+        def refusal = mcpDriver.parseInner(refused).error as String
+
+        then: 'the gate refuses it before anything runs'
+        refused.result.isError == true
+        refusal.startsWith('Mandatory best-practice acknowledgment')
+        refusal.contains("section='builtin_app_tools_rules'")
+        ranWith.size() == 2
+
+        cleanup:
+        NOW_OVERRIDE.set(null)
+    }
+
+    def "an invalid gateway route (#caseName) refuses through ordinary dispatch without reserving state"() {
+        given: 'an MRTR-eligible leaf on a route the canonical dispatcher will refuse'
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = useGateways
+
+        when:
+        def response = modernCall(outer,
+            [tool: 'hub_set_rule', args: [appId: 777, addAction: [capability: 'switch', command: 'on'], confirm: true]])
+
+        then: 'the canonical route error arrives at round zero, and no requestState record pins a cap slot'
+        response.result?.resultType != 'input_required'
+        !(response.result?.containsKey('requestState'))
+        !(atomicStateMap.mrtrRequests instanceof Map) || atomicStateMap.mrtrRequests.isEmpty()
+
+        where:
+        caseName           | useGateways | outer
+        'wrong gateway'    | true        | 'hub_manage_devices'
+        'gateways disabled'| false       | 'hub_manage_rule_machine'
+    }
+
+    def "a gateway-routed continuation round runs on its own fresh budget clock"() {
+        given: 'a paused bulk call routed through the gateway, with real time passing between rounds'
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        def ranWith = []
+        script.metaClass.toolRunRmRule = { Map a ->
+            ranWith << new LinkedHashMap(a)
+            if (ranWith.size() == 1) {
+                return [success: false, partial: true, ruleIds: [31, 32],
+                        rmAction: 'stopRule toggle x1',
+                        results: [[success: true, ruleId: 31]], remainingRuleIds: [32]]
+            }
+            return [success: true, partial: false, ruleIds: [32],
+                    rmAction: 'stopRule toggle x1', results: [[success: true, ruleId: 32]]]
+        }
+        def wire = [tool: 'hub_call_rule', args: [ruleId: [31, 32], action: 'stop']]
+
+        when: 'the first request executes one slice and pauses with a remainder'
+        def first = modernCall('hub_manage_rule_machine', wire)
+        String requestState = first.result.requestState
+
+        then: 'the persisted next-round arguments carry no budget stamp'
+        first.result.resultType == 'input_required'
+        ranWith.size() == 1
+        atomicStateMap.mrtrRequests[requestState].nextArguments.args.__reqT0 == null
+
+        when: 'a later round arrives after round 1\'s budget would be long exhausted'
+        virtualNow.addAndGet(60_000L)
+        def third = modernCall('hub_manage_rule_machine', wire, requestState)
+
+        then: 'the remainder executes against the NEW round\'s clock, not round 1\'s'
+        third.result.resultType == 'complete'
+        ranWith.size() == 2
+        ranWith[1].ruleId == [32]
+        ranWith[1].__reqT0 == 1234567890000L + 60_000L
+
+        cleanup:
+        NOW_OVERRIDE.set(null)
+    }
+
+    def "a native write returns requestState before its blocked worker leaf finishes"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def args = [appId: 321, confirm: true, settings: [description: 'slow edit']]
+        def entered = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def workerDone = new CountDownLatch(1)
+        def leafCalls = new AtomicInteger(0)
+        def observedWaitMs = new AtomicLong(0L)
+        def failure = new AtomicReference()
+        def virtualNow = new AtomicLong(1234567890000L)
+        long schedulerElapsedMs = 1000L
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long delayMs ->
+            observedWaitMs.addAndGet(delayMs)
+            virtualNow.addAndGet(delayMs)
+        })
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            virtualNow.addAndGet(schedulerElapsedMs)
+        })
+        script.metaClass.toolSetRule = { Map actual ->
+            leafCalls.incrementAndGet()
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            [success: true, appId: actual.appId, settingsApplied: true]
+        }
+
+        when: 'the first HTTP leg reserves, claims and schedules the generation'
+        def scheduled = modernCall('hub_set_rule', args)
+        String stateId = scheduled.result.requestState
+
+        then: 'the mapped request is already free and the Hubitat leaf has not run inline'
+        scheduled.error == null
+        scheduled.result.resultType == 'input_required'
+        stateId instanceof String
+        leafCalls.get() == 0
+        observedWaitMs.get() ==
+            (script._mrtrScheduleObserveWaitMs('hub_set_rule') as Long) - schedulerElapsedMs
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runMrtrSlice']
+        runInMillisCalls[0][2].overwrite == false
+        runInMillisCalls[0][2].data.stateId == stateId
+        runInMillisCalls[0][2].data.claimId instanceof String
+        !runInMillisCalls[0][2].data.containsKey('arguments')
+
+        when: 'another write arrives while the claimed worker is only queued'
+        def capped = modernCall('hub_call_rule', [ruleId: [401, 402], action: 'stop'])
+        def cappedInner = mcpDriver.parseInner(capped)
+
+        then: 'queued work still occupies the all-write concurrency slot'
+        capped.result.isError == true
+        cappedInner.status == 'too_many_writes_in_flight'
+        cappedInner.active == [[tool: 'hub_set_rule', startedAt: 1234567890000L, transport: 'mrtr']]
+
+        when: 'Hubitat invokes the scheduled worker and its real leaf remains blocked'
+        Map workerData = new LinkedHashMap(runInMillisCalls[0][2].data as Map)
+        Thread worker = Thread.start {
+            try {
+                script.runMrtrSlice(workerData)
+            } catch (Throwable t) {
+                failure.set(t)
+            } finally {
+                workerDone.countDown()
+            }
+        }
+        assert entered.await(5, TimeUnit.SECONDS)
+        def whileRunning = (1..12).collect { modernCall('hub_set_rule', args, stateId) }
+
+        then: 'more polls than the SDK default and server slice cap do not release the owner'
+        whileRunning.every { it.error == null && it.result.resultType == 'input_required' }
+        whileRunning.every { it.result.requestState == stateId }
+        atomicStateMap.mrtrRequests[stateId].rounds == 0
+        leafCalls.get() == 1
+
+        when: 'the client stops polling past TTL while the worker remains alive'
+        virtualNow.addAndGet((script._mrtrActiveTtlMs() as Long) + 1L)
+        def stillCapped = modernCall('hub_call_rule', [ruleId: [403, 404], action: 'stop'])
+
+        then: 'client exhaustion is not worker cancellation or permission for another write'
+        mcpDriver.parseInner(stillCapped).status == 'too_many_writes_in_flight'
+        leafCalls.get() == 1
+        runInMillisCalls.size() == 1
+
+        when: 'the worker finishes and the client advances once more'
+        release.countDown()
+        assert workerDone.await(5, TimeUnit.SECONDS)
+        worker.join(5000)
+        def complete = modernCall('hub_set_rule', args, stateId)
+        def inner = mcpDriver.parseInner(complete)
+        script.runMrtrSlice(workerData)
+
+        then: 'the retained terminal result replays and a stale worker cannot repeat the write'
+        !worker.alive
+        failure.get() == null
+        complete.error == null
+        complete.result.resultType == 'complete'
+        complete.result.isError != true
+        inner.success == true
+        inner.appId == 321
+        inner.mrtr.rounds == 1
+        leafCalls.get() == 1
+
+        cleanup:
+        release.countDown()
+        worker?.join(5000)
+    }
+
+    def "the first request observes a fast detached terminal result and its state replays it exactly once"() {
+        given:
+        settingsMap.enableWrite = true
+        def args = [appId: 322, confirm: true, settings: [description: 'fast edit']]
+        def leafCalls = new AtomicInteger(0)
+        script.metaClass.toolSetRule = { Map actual ->
+            leafCalls.incrementAndGet()
+            [success: true, appId: actual.appId, settingsApplied: true]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+
+        when:
+        def complete = modernCall('hub_set_rule', args)
+        String stateId = onlyStateId()
+        def replay = modernCall('hub_set_rule', args, stateId)
+
+        then:
+        complete.result.resultType == 'complete'
+        complete.result.isError != true
+        !complete.result.containsKey('requestState')
+        mcpDriver.parseInner(complete).appId == 322
+        replay.result.resultType == 'complete'
+        mcpDriver.parseInner(replay).settingsApplied == true
+        leafCalls.get() == 1
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runMrtrSlice']
+        runInMillisCalls[0][2].overwrite == false
+        runInMillisCalls[0][2].data.keySet() == ['stateId', 'claimId', 'generation'] as Set
+    }
+
+    def "the scheduling request observes generation advancement without claiming the next generation"() {
+        given:
+        settingsMap.enableWrite = true
+        def args = [appId: 323, confirm: true, settings: [description: 'two slices']]
+        def leafCalls = new AtomicInteger(0)
+        script.metaClass.toolSetRule = { Map actual ->
+            leafCalls.incrementAndGet()
+            [success: false, partial: true, status: 'in_progress',
+             stepsRemaining: [[name: 'finish']], appId: actual.appId]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+
+        when:
+        def advanced = modernCall('hub_set_rule', args)
+        String stateId = advanced.result.requestState
+        Map stored = atomicStateMap.mrtrRequests[stateId] as Map
+
+        then:
+        advanced.result.resultType == 'input_required'
+        advanced.result.requestState == stateId
+        leafCalls.get() == 1
+        runInMillisCalls.size() == 1
+        stored.status == 'active'
+        stored.generation == 1
+        stored.rounds == 1
+        !stored.containsKey('claimId')
+        !stored.containsKey('claimedGeneration')
+    }
+
+    def "the scheduling request observes and replays a fast detached worker error"() {
+        given:
+        settingsMap.enableWrite = true
+        def args = [appId: 324, confirm: true, settings: [description: 'worker error']]
+        def leafCalls = new AtomicInteger(0)
+        script.metaClass.toolSetRule = { Map actual ->
+            leafCalls.incrementAndGet()
+            throw new IllegalStateException('detached leaf failed')
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+
+        when:
+        def failed = modernCall('hub_set_rule', args)
+        String stateId = onlyStateId()
+        def replay = modernCall('hub_set_rule', args, stateId)
+
+        then:
+        failed.result.resultType == 'complete'
+        failed.result.isError == true
+        mcpDriver.parseInner(failed).error.contains('detached leaf failed')
+        replay.result.resultType == 'complete'
+        replay.result.isError == true
+        mcpDriver.parseInner(replay).error.contains('detached leaf failed')
+        leafCalls.get() == 1
+        runInMillisCalls.size() == 1
+    }
+
+    def "an exact first-request replay rejoins the active MRTR operation without running a second write"() {
+        given: 'the original leaf is still executing when the identical call arrives'
+        settingsMap.enableWrite = true
+        mcpDriver.pushHeaders([
+            'MCP-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': 'hub_call_rule'
+        ])
+        def entered = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def ran = new AtomicInteger(0)
+        script.metaClass.toolRunRmRule = { Map a ->
+            ran.incrementAndGet()
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            [success: true, ruleIds: a.ruleId, results: a.ruleId.collect { [success: true, ruleId: it] }]
+        }
+        def original = [ruleId: [21, 22], action: 'stop']
+        def winner = new AtomicReference()
+        def failure = new AtomicReference()
+        Thread first = Thread.start {
+            try {
+                winner.set(directCall(script, 2101, 'hub_call_rule', original))
+            } catch (Throwable t) {
+                failure.set(t)
+            }
+        }
+
+        when:
+        assert entered.await(5, TimeUnit.SECONDS)
+        def duplicate = directCall(script, 2102, 'hub_call_rule', original)
+        String activeState = onlyStateId()
+        release.countDown()
+        first.join(5000)
+
+        then:
+        !first.alive
+        failure.get() == null
+        duplicate.result.resultType == 'input_required'
+        duplicate.result.requestState == activeState
+        duplicate.result.rejoined == true
+        !duplicate.result.containsKey('opToken')
+        !duplicate.result.containsKey('content')
+        winner.get().result.resultType == 'complete'
+        !winner.get().result.containsKey('rejoined')
+        ran.get() == 1
+
+        cleanup:
+        release.countDown()
+        first?.join(5000)
+    }
+
+    def "parallel writes are capped by active requestState records without exposing their ids"() {
+        given: 'a first write whose slice pauses with a remainder, holding its record active'
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+
+        when:
+        def first = modernCall('hub_call_rule', [ruleId: [21, 22], action: 'stop'])
+        def second = modernCall('hub_call_rule', [ruleId: [31, 32], action: 'stop'])
+        def inner = mcpDriver.parseInner(second)
+
+        then:
+        first.result.resultType == 'input_required'
+        second.result.resultType == 'complete'
+        second.result.isError == true
+        inner.status == 'too_many_writes_in_flight'
+        inner.limit == 1
+        inner.active == [[tool: 'hub_call_rule', startedAt: 1234567890000L, transport: 'mrtr']]
+        !inner.toString().contains(first.result.requestState.toString())
+    }
+
+    def "two compiled app instances keep a blocked ordinary write counted past lease TTL"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def peer = newCompiledScriptInstance()
+        assert !peer.is(script)
+        assert peer.getClass().is(script.getClass())
+        def entered = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def calls = new AtomicInteger(0)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        Closure leaf = { deviceId, command, parameters, waitFor = null, commands = null, reqT0 = null, includeState = true ->
+            calls.incrementAndGet()
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            [success: true, deviceId: deviceId, command: command]
+        }
+        script.metaClass.toolSendCommand = leaf
+        peer.metaClass.toolSendCommand = leaf
+        def winner = new AtomicReference()
+        def failure = new AtomicReference()
+        Thread first = Thread.start {
+            try {
+                winner.set(directCall(script, 1701, 'hub_call_device_command',
+                    [deviceId: '17', command: 'on']))
+            } catch (Throwable t) {
+                failure.set(t)
+            }
+        }
+
+        when:
+        assert entered.await(5, TimeUnit.SECONDS)
+        virtualNow.addAndGet((script._mrtrActiveTtlMs() as Long) + 1L)
+        def contender = directCall(peer, 1702, 'hub_call_device_command',
+            [deviceId: '18', command: 'off'])
+        def contenderInner = mcpDriver.parseInner(contender)
+        release.countDown()
+        first.join(5000)
+
+        then:
+        !first.alive
+        failure.get() == null
+        calls.get() == 1
+        contender.result.isError == true
+        contenderInner.status == 'too_many_writes_in_flight'
+        winner.get().result.isError != true
+
+        cleanup:
+        release.countDown()
+        first?.join(5000)
+    }
+
+    def "simultaneous cap-one device calls on two compiled instances dispatch one leaf"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def peer = newCompiledScriptInstance()
+        def ready = new CountDownLatch(2)
+        def start = new CountDownLatch(1)
+        def entered = new CountDownLatch(1)
+        def oneFinished = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def calls = new AtomicInteger(0)
+        def results = java.util.Collections.synchronizedList([])
+        def failures = java.util.Collections.synchronizedList([])
+        Closure leaf = { deviceId, command, parameters, waitFor = null, commands = null, reqT0 = null, includeState = true ->
+            calls.incrementAndGet()
+            entered.countDown()
+            release.await(10, TimeUnit.SECONDS)
+            [success: true, deviceId: deviceId, command: command]
+        }
+        script.metaClass.toolSendCommand = leaf
+        peer.metaClass.toolSendCommand = leaf
+        def targets = [script, peer]
+        def threads = (0..<2).collect { int index ->
+            Thread.start("device-dispatch-race-${index}") {
+                ready.countDown()
+                start.await()
+                try {
+                    results << directCall(targets[index], 1750 + index,
+                        'hub_call_device_command',
+                        [deviceId: "${20 + index}".toString(), command: 'on'])
+                } catch (Throwable t) {
+                    failures << t
+                } finally {
+                    oneFinished.countDown()
+                }
+            }
+        }
+
+        when:
+        assert ready.await(5, TimeUnit.SECONDS)
+        start.countDown()
+        assert entered.await(5, TimeUnit.SECONDS)
+        assert oneFinished.await(5, TimeUnit.SECONDS)
+
+        then: 'the loser was refused while the winner remains blocked in its leaf'
+        calls.get() == 1
+        results.size() == 1
+        mcpDriver.parseInner(results[0]).status == 'too_many_writes_in_flight'
+
+        when:
+        release.countDown()
+        threads*.join(5000)
+
+        then:
+        !threads.any { it.alive }
+        failures.isEmpty()
+        calls.get() == 1
+        results.size() == 2
+        results.count { it.result.isError == true } == 1
+        results.count { it.result.isError != true } == 1
+
+        cleanup:
+        release.countDown()
+        threads*.join(5000)
+    }
+
+    def "two compiled app instances serialize identical first requests onto one execution"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 0
+        mcpDriver.pushHeaders([
+            'MCP-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': 'hub_call_rule'
+        ])
+        def peer = newCompiledScriptInstance()
+        def args = [ruleId: [901, 902], action: 'stop']
+        def entered = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def calls = new AtomicInteger(0)
+        Closure leaf = { Map a ->
+            calls.incrementAndGet()
+            entered.countDown()
+            release.await(10, TimeUnit.SECONDS)
+            [success: true, partial: false, ruleIds: a.ruleId,
+             results: a.ruleId.collect { [success: true, ruleId: it] }]
+        }
+        script.metaClass.toolRunRmRule = leaf
+        peer.metaClass.toolRunRmRule = leaf
+        def results = java.util.Collections.synchronizedList([])
+        def failures = java.util.Collections.synchronizedList([])
+        def ready = new CountDownLatch(24)
+        def start = new CountDownLatch(1)
+        def coalesced = new CountDownLatch(23)
+        def threads = (0..<24).collect { int index ->
+            Thread.start("mrtr-identical-${index}") {
+                ready.countDown()
+                start.await()
+                try {
+                    def response = directCall(index % 2 == 0 ? script : peer, 1800 + index,
+                        'hub_call_rule', args)
+                    results << response
+                    if (response.result?.resultType == 'input_required') coalesced.countDown()
+                } catch (Throwable t) {
+                    failures << t
+                }
+            }
+        }
+
+        when: 'every identical call arrives while the single execution is still blocked'
+        assert ready.await(5, TimeUnit.SECONDS)
+        start.countDown()
+        assert entered.await(5, TimeUnit.SECONDS)
+        assert coalesced.await(10, TimeUnit.SECONDS)
+        release.countDown()
+        threads*.join(5000)
+
+        then: 'one leaf ran; every other caller got a state-only continuation naming that record'
+        !threads.any { it.alive }
+        failures.isEmpty()
+        calls.get() == 1
+        results.size() == 24
+        results.count { it.result?.resultType == 'complete' } == 1
+        results.count { it.result?.resultType == 'input_required' } == 23
+        results.findAll { it.result?.resultType == 'input_required' }
+            .collect { it.result.requestState }.unique().size() == 1
+        (atomicStateMap.mrtrRequests as Map).size() == 1
+
+        cleanup:
+        release.countDown()
+        threads*.join(5000)
+    }
+
+    def "a blocked MRTR generation stays counted past TTL and contention remains a continuation"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        mcpDriver.pushHeaders([
+            'MCP-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': 'hub_call_rule'
+        ])
+        def peer = newCompiledScriptInstance()
+        def args = [ruleId: [911, 912], action: 'stop']
+        def entered = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def calls = new AtomicInteger(0)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        Closure leaf = { Map a ->
+            calls.incrementAndGet()
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            [success: true, partial: false, ruleIds: a.ruleId,
+             results: a.ruleId.collect { [success: true, ruleId: it] }]
+        }
+        script.metaClass.toolRunRmRule = leaf
+        peer.metaClass.toolRunRmRule = leaf
+        def winner = new AtomicReference()
+        def failure = new AtomicReference()
+        Thread first = Thread.start {
+            try {
+                winner.set(directCall(script, 1901, 'hub_call_rule', args))
+            } catch (Throwable t) {
+                failure.set(t)
+            }
+        }
+
+        when:
+        assert entered.await(5, TimeUnit.SECONDS)
+        String stateId = onlyStateId()
+        virtualNow.addAndGet((script._mrtrActiveTtlMs() as Long) + 1L)
+        def sameState = directCall(peer, 1902, 'hub_call_rule', args, stateId)
+        def competingFresh = directCall(peer, 1903, 'hub_call_rule',
+            [ruleId: [913, 914], action: 'stop'])
+        def competingInner = mcpDriver.parseInner(competingFresh)
+        release.countDown()
+        first.join(5000)
+
+        then:
+        !first.alive
+        failure.get() == null
+        calls.get() == 1
+        sameState.error == null
+        sameState.result.resultType == 'input_required'
+        sameState.result.requestState == stateId
+        !sameState.result.containsKey('content')
+        competingFresh.result.isError == true
+        competingInner.status == 'too_many_writes_in_flight'
+        winner.get().result.resultType == 'complete'
+
+        cleanup:
+        release.countDown()
+        first?.join(5000)
+    }
+
+    def "repeated contention waits preserve the logical call until the winner finishes"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        mcpDriver.pushHeaders([
+            'MCP-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': 'hub_call_rule'
+        ])
+        def peer = newCompiledScriptInstance()
+        def args = [ruleId: [921, 922], action: 'stop']
+        def entered = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def ownerDone = new CountDownLatch(1)
+        def calls = new AtomicInteger(0)
+        def pauses = new AtomicInteger(0)
+        def releaseOnPause = new AtomicInteger(0)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        Closure pause = { Long delayMs ->
+            pauses.incrementAndGet()
+            virtualNow.addAndGet(delayMs)
+            if (releaseOnPause.compareAndSet(1, 0)) {
+                release.countDown()
+                ownerDone.await(5, TimeUnit.SECONDS)
+            }
+        }
+        PAUSE_EXECUTION_OVERRIDE.set(pause)
+        Closure leaf = { Map a ->
+            calls.incrementAndGet()
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            [success: true, partial: false, ruleIds: a.ruleId,
+             results: a.ruleId.collect { [success: true, ruleId: it] }]
+        }
+        script.metaClass.toolRunRmRule = leaf
+        peer.metaClass.toolRunRmRule = leaf
+        def winner = new AtomicReference()
+        def failure = new AtomicReference()
+        Thread first = Thread.start {
+            try {
+                winner.set(directCall(script, 1951, 'hub_call_rule', args))
+            } catch (Throwable t) {
+                failure.set(t)
+            } finally {
+                ownerDone.countDown()
+            }
+        }
+
+        when: 'three complete continuation legs wait while the original leaf remains blocked'
+        assert entered.await(5, TimeUnit.SECONDS)
+        String stateId = onlyStateId()
+        def contention = (0..<3).collect { int index ->
+            directCall(peer, 1952 + index, 'hub_call_rule', args, stateId)
+        }
+
+        then:
+        contention.every { it.error == null && it.result.resultType == 'input_required' }
+        contention.every { it.result.requestState == stateId }
+        calls.get() == 1
+        pauses.get() >= 3
+        virtualNow.get() >= 1234567890000L +
+            3L * (script._mrtrContentionWaitMs('hub_call_rule') as Long)
+
+        when: 'the next leg observes owner completion during its bounded wait'
+        releaseOnPause.set(1)
+        def replay = directCall(peer, 1955, 'hub_call_rule', args, stateId)
+        first.join(5000)
+
+        then:
+        !first.alive
+        failure.get() == null
+        winner.get().result.resultType == 'complete'
+        replay.error == null
+        replay.result.resultType == 'complete'
+        calls.get() == 1
+
+        cleanup:
+        release.countDown()
+        first?.join(5000)
+    }
+
+    def "cloud contention wait leaves half the relay budget for reclaimed slice work"() {
+        given:
+        script.metaClass._isCloudRequest = { -> true }
+
+        expect: 'half of the 6000ms default'
+        script._mrtrContentionWaitMs() == 3000L
+
+        when: 'a sub-minimum budget is floored to 6000'
+        settingsMap.relayBudgetMs = 3000
+
+        then:
+        script._mrtrContentionWaitMs() == 3000L
+    }
+
+    def "cloud worker contention waits within safe relay headroom"() {
+        given:
+        script.metaClass._isCloudRequest = { -> true }
+
+        expect: 'detached writes wait in-leg but preserve measured cloud-relay jitter headroom'
+        // budget - 2000ms headroom = 4000, now under the 4500 detached cap
+        script._mrtrContentionWaitMs('hub_set_rule') == 4000L
+        script._mrtrContentionWaitMs('hub_set_native_app') == 4000L
+
+        and: 'the scheduling observer uses a lower cloud wait cap'
+        script._mrtrScheduleObserveWaitMs('hub_set_rule') == 3500L
+        script._mrtrScheduleObserveWaitMs('hub_set_native_app') == 3500L
+
+        and: 'synchronous slices retain half their request budget for actual leaf work'
+        script._mrtrContentionWaitMs('hub_call_rule') == 3000L
+
+        when: 'a budget large enough that the caps, not the budget, bind'
+        settingsMap.relayBudgetMs = 12000
+
+        then: 'the detached 4500 and synchronous 4000 caps are the ceiling -- nothing at the default reaches them'
+        script._mrtrContentionWaitMs('hub_set_rule') == 4500L
+        script._mrtrContentionWaitMs('hub_call_rule') == 4000L
+        script._mrtrScheduleObserveWaitMs('hub_set_rule') == 3500L
+
+        when: 'an operator configures a cloud budget below the supported minimum'
+        settingsMap.relayBudgetMs = 5000
+
+        then: 'the effective minimum preserves 2000ms for parsing, scheduling, and rendering'
+        script._mrtrContentionWaitMs('hub_set_rule') == 4000L
+        script._mrtrScheduleObserveWaitMs('hub_set_rule') == 3500L
+        script._mrtrContentionWaitMs('hub_call_rule') == 3000L
+
+        when: 'the same explicit budget is applied to a LAN request'
+        script.metaClass._isCloudRequest = { -> false }
+        settingsMap.lanBudgetMs = 5000
+
+        then: 'LAN retains its prior 1500ms reserve because the measured defect is cloud-only'
+        script._mrtrContentionWaitMs('hub_set_rule') == 4500L
+        script._mrtrScheduleObserveWaitMs('hub_set_rule') == 4500L
+    }
+
+    def "a gateway first request observes the resolved leaf terminal result"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        def gateway = 'hub_manage_native_rules_and_apps'
+        def args = [tool: 'hub_set_native_app', args: [appId: 654, confirm: true,
+            settings: [description: 'gateway worker']]]
+        def seen = []
+        script.metaClass.toolSetNativeApp = { Map actual ->
+            seen << new LinkedHashMap(actual)
+            [success: true, appId: actual.appId, settingsApplied: true]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+
+        when:
+        def complete = modernCall(gateway, args)
+        def inner = mcpDriver.parseInner(complete)
+
+        then:
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runMrtrSlice']
+        seen == [[appId: 654, confirm: true, settings: [description: 'gateway worker']]]
+        complete.result.resultType == 'complete'
+        complete.result.isError != true
+        inner.appId == 654
+        inner.success == true
+    }
+
+    def "modern driver-code lifecycle leaf #leaf schedules its worker without dispatching inline"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        def dispatched = []
+        script.metaClass.toolInstallDriver = { Map actual ->
+            dispatched << [leaf: 'hub_create_driver', arguments: new LinkedHashMap(actual)]
+            [success: true]
+        }
+        script.metaClass.toolUpdateDriverCode = { Map actual ->
+            dispatched << [leaf: 'hub_update_driver', arguments: new LinkedHashMap(actual)]
+            [success: true]
+        }
+        script.metaClass.toolDeleteItem = { Map actual ->
+            dispatched << [leaf: 'hub_delete_item', arguments: new LinkedHashMap(actual)]
+            [success: true]
+        }
+        def gatewayArgs = [tool: leaf, args: leafArgs]
+
+        when:
+        def first = modernCall('hub_manage_code', gatewayArgs)
+
+        then: 'round zero schedules the detached worker; nothing mutates Hubitat code inline'
+        first.error == null
+        first.result.resultType == 'input_required'
+        first.result.requestState instanceof String
+        dispatched.isEmpty()
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runMrtrSlice']
+
+        where:
+        leaf                | leafArgs
+        'hub_create_driver' | [source: 'metadata { }', confirm: true]
+        'hub_update_driver' | [driverId: '55', source: 'metadata { }', confirm: true]
+        'hub_delete_item'   | [type: 'driver', item_id: '55', confirm: true]
+    }
+
+    def "modern hub_delete_item keeps unproven #itemType deletion on the synchronous path"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        def dispatched = []
+        script.metaClass.toolDeleteItem = { Map actual ->
+            dispatched << new LinkedHashMap(actual)
+            [success: true, itemType: actual.type]
+        }
+        def args = [tool: 'hub_delete_item', args: [
+            type: itemType, item_id: '55', confirm: true
+        ]]
+
+        when:
+        def response = modernCall('hub_manage_code', args)
+
+        then: 'app/library deletion remains outside the driver-only detached proof'
+        response.error == null
+        response.result.resultType == 'complete'
+        mcpDriver.parseInner(response).success == true
+        dispatched == [args.args]
+        runInMillisCalls.isEmpty()
+
+        where:
+        itemType << ['app', 'library']
+    }
+
+    def "a rule backup restore runs once in a detached worker and replays its terminal result"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        def args = [tool: 'hub_restore_backup', args: [scope: 'source', backupKey: 'rm-rule_55_20261007-000000-000', confirm: true]]
+        def dispatched = []
+        script.metaClass.toolRestoreItemBackup = { Map actual ->
+            dispatched << new LinkedHashMap(actual)
+            [success: true, type: 'rm-rule', ruleId: 56, restoredVia: 'nativeImport']
+        }
+
+        when: 'the first HTTP leg schedules the restore instead of running it inline'
+        def scheduled = modernCall('hub_manage_backup', args)
+        String stateId = scheduled.result.requestState
+
+        then:
+        scheduled.result.resultType == 'input_required'
+        dispatched.isEmpty()
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runMrtrSlice']
+
+        when:
+        script.runMrtrSlice(new LinkedHashMap(runInMillisCalls[0][2].data as Map))
+        def complete = modernCall('hub_manage_backup', args, stateId)
+        def replay = modernCall('hub_manage_backup', args, stateId)
+
+        then:
+        dispatched == [args.args]
+        complete.result.resultType == 'complete'
+        mcpDriver.parseInner(complete).ruleId == 56
+        mcpDriver.parseInner(replay).ruleId == 56
+        dispatched.size() == 1
+    }
+
+    def "modern hub_restore_backup keeps #label on the synchronous path"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        def dispatched = []
+        script.metaClass.toolRestoreItemBackup = { Map actual ->
+            dispatched << new LinkedHashMap(actual)
+            [success: true]
+        }
+        def args = [tool: 'hub_restore_backup', args: restoreArgs + [confirm: true]]
+
+        when:
+        def response = modernCall('hub_manage_backup', args)
+
+        then: 'only a rule snapshot restore runs in the background'
+        response.result.resultType == 'complete'
+        dispatched.size() == 1
+        runInMillisCalls.isEmpty()
+
+        where:
+        label               | restoreArgs
+        'an app code restore' | [scope: 'source', backupKey: 'app_228_20261007-000000-000']
+        'a hub DB restore'    | [scope: 'hub_local', fileName: 'backup.lzf']
+    }
+
+    def "gateway driver update runs once in a detached worker and replays its terminal result"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        settingsMap.maxConcurrentWrites = 1
+        def gateway = 'hub_manage_code'
+        def args = [tool: 'hub_update_driver', args: [
+            driverId: '55', source: 'metadata { }', confirm: true
+        ]]
+        def dispatched = []
+        script.metaClass.toolUpdateDriverCode = { Map actual ->
+            dispatched << new LinkedHashMap(actual)
+            [success: true, driverId: '55', previousVersion: 7]
+        }
+
+        when: 'the first HTTP leg reserves, claims and schedules the generation'
+        def scheduled = modernCall(gateway, args)
+        String stateId = scheduled.result.requestState
+
+        then:
+        stateId instanceof String
+        scheduled.error == null
+        scheduled.result.resultType == 'input_required'
+        scheduled.result.requestState == stateId
+        dispatched.isEmpty()
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runMrtrSlice']
+
+        when: 'another slow code write arrives while the worker is queued'
+        def capped = modernCall(gateway, [tool: 'hub_create_driver', args: [
+            source: 'metadata { }', confirm: true
+        ]])
+        def cappedInner = mcpDriver.parseInner(capped)
+
+        then: 'the queued code update owns the global write slot'
+        capped.result.resultType == 'complete'
+        capped.result.isError == true
+        cappedInner.status == 'too_many_writes_in_flight'
+        cappedInner.active*.tool == ['hub_update_driver']
+        cappedInner.active*.transport == ['mrtr']
+
+        when: 'the worker executes once and later calls observe its retained terminal result'
+        Map workerData = new LinkedHashMap(runInMillisCalls[0][2].data as Map)
+        script.runMrtrSlice(workerData)
+        def complete = modernCall(gateway, args, stateId)
+        def replay = modernCall(gateway, args, stateId)
+
+        then:
+        dispatched == [args.args]
+        complete.result.resultType == 'complete'
+        complete.result.isError != true
+        mcpDriver.parseInner(complete).success == true
+        mcpDriver.parseInner(complete).mrtr.rounds == 1
+        replay.result.resultType == 'complete'
+        mcpDriver.parseInner(replay).previousVersion == 7
+        dispatched.size() == 1
+    }
+
+    def "installed clears old request visibility and a late queued callback cannot execute"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def args = [appId: 654, confirm: true, button: 'pausRule']
+        int calls = 0
+        script.metaClass.toolSetRule = { Map actual ->
+            calls++
+            [success: true, appId: actual.appId]
+        }
+        String completedId = modernCall('hub_set_rule', args).result.requestState
+        script.runMrtrSlice(new LinkedHashMap(runInMillisCalls.last()[2].data as Map))
+        String queuedId = modernCall('hub_set_rule', args).result.requestState
+        Map lateCallback = new LinkedHashMap(runInMillisCalls.last()[2].data as Map)
+
+        when: 'a new installation has empty durable state but the class statics are retained'
+        // Exercise installed(), not a cache-only test seam. Platform initialization is unrelated.
+        atomicStateMap.clear()
+        stateMap.clear()
+        script.metaClass.initialize = { -> }
+        script.installed()
+        def oldTerminal = modernCall('hub_set_rule', args, completedId)
+        def oldQueued = modernCall('hub_set_rule', args, queuedId)
+        script.runMrtrSlice(lateCallback)
+        def fresh = modernCall('hub_set_rule', args)
+
+        then: 'neither stale evidence nor queued arguments resurrects a removed request'
+        oldTerminal.error.code == -32602
+        oldQueued.error.code == -32602
+        calls == 1
+        fresh.result.resultType == 'input_required'
+        !(fresh.result.requestState in [completedId, queuedId])
+        (scriptStaticField('MRTR_WORK_ITEMS') as Map).values().every {
+            it.stateId == fresh.result.requestState
+        }
+    }
+
+    def "durable terminal replay survives #boundary without repeating the write"() {
+        given:
+        settingsMap.enableWrite = true
+        def args = [appId: 654, confirm: true, button: 'pausRule']
+        int calls = 0
+        script.metaClass.toolSetRule = { Map actual ->
+            calls++
+            [success: true, appId: actual.appId]
+        }
+        String stateId = modernCall('hub_set_rule', args).result.requestState
+        script.runMrtrSlice(new LinkedHashMap(runInMillisCalls.last()[2].data as Map))
+
+        when:
+        if (boundary == 'updated') {
+            script.metaClass.initialize = { -> }
+            script.updated()
+        } else {
+            // Model loss of all coordination statics, not the platform's disable/enable behavior.
+            ['MRTR_TERMINAL_EVIDENCE', 'MRTR_WORK_ITEMS', 'WRITE_REQUEST_LEASES'].each {
+                (scriptStaticField(it) as Map).clear()
+            }
+            (scriptStaticField('LIVE_WRITE_EXECUTIONS') as Set).clear()
+            script._writeStateCacheInvalidate()
+        }
+        def replay = modernCall('hub_set_rule', args, stateId)
+
+        then:
+        replay.result.resultType == 'complete'
+        mcpDriver.parseInner(replay).success == true
+        mcpDriver.parseInner(replay).appId == 654
+        calls == 1
+        runInMillisCalls.size() == 1
+
+        where:
+        boundary << ['updated', 'modeled class-static loss']
+    }
+
+    def "loss of coordination statics does not steal an already claimed generation"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        def args = [appId: 654, confirm: true, button: 'pausRule']
+        int calls = 0
+        script.metaClass.toolSetRule = { Map actual -> calls++; [success: true] }
+        String stateId = modernCall('hub_set_rule', args).result.requestState
+        Map lateCallback = new LinkedHashMap(runInMillisCalls.last()[2].data as Map)
+        ['MRTR_TERMINAL_EVIDENCE', 'MRTR_WORK_ITEMS', 'WRITE_REQUEST_LEASES'].each {
+            (scriptStaticField(it) as Map).clear()
+        }
+        (scriptStaticField('LIVE_WRITE_EXECUTIONS') as Set).clear()
+        script._writeStateCacheInvalidate()
+
+        when: 'durable ownership survives, but queued arguments and liveness did not'
+        def waiting = modernCall('hub_set_rule', args, stateId)
+        script.runMrtrSlice(lateCallback)
+
+        then: 'absence of the worker is not proof it never committed'
+        waiting.result.resultType == 'input_required'
+        calls == 0
+        runInMillisCalls.size() == 1
+
+        when: 'the retained claim expires without live execution or terminal evidence'
+        virtualNow.addAndGet((script._mrtrActiveTtlMs() as Long) + 1L)
+        def expired = modernCall('hub_set_rule', args, stateId)
+
+        then: 'reject the state instead of guessing success or repeating the write'
+        expired.error.code == -32602
+        calls == 0
+        runInMillisCalls.size() == 1
+    }
+
+    def "terminal evidence repairs a synthetically restored active snapshot after cache-only reset"() {
+        // Deliberately manufacture stale durable state plus a cache-only reset.
+        // This proves defensive exact-generation repair, not a Hubitat bounce path.
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def args = [appId: 654, confirm: true, button: 'pausRule']
+        def binding = script._mrtrBinding('hub_set_rule', 'hub_set_rule', args) as Map
+        def calls = 0
+        script.metaClass.toolSetRule = { Map actual ->
+            calls++
+            [success: true, appId: actual.appId]
+        }
+        def scheduled = modernCall('hub_set_rule', args)
+        String stateId = scheduled.result.requestState
+        Map activeSnapshot = script._mrtrCopyMap(
+            atomicStateMap.mrtrRequests[stateId] as Map) as Map
+        Map workerData = new LinkedHashMap(runInMillisCalls[0][2].data as Map)
+        script.runMrtrSlice(workerData)
+        def complete = modernCall('hub_set_rule', args, stateId)
+
+        expect: 'the original logical write completed exactly once before the synthetic reset'
+        scheduled.result.resultType == 'input_required'
+        complete.result.resultType == 'complete'
+        calls == 1
+
+        when: 'the test injects the older claimed-active snapshot'
+        atomicStateMap.mrtrRequests[stateId] = activeSnapshot
+        // Reloading atomicState is what makes the older snapshot the read path again;
+        // MRTR_TERMINAL_EVIDENCE deliberately survives, and is the only repair proof.
+        script._writeStateCacheInvalidate()
+        def recovered = script._mrtrClaim(stateId, 'hub_set_rule', 'hub_set_rule', binding) as Map
+
+        then: 'the exact terminal generation is recovered, never treated as still running'
+        recovered.outcome == 'terminal'
+        recovered.record.status == 'terminal'
+        recovered.record.terminalResult.success == true
+        calls == 1
+
+        when: 'a later identical toggle is a new logical operation'
+        def next = script._mrtrReserve('hub_set_rule', 'hub_set_rule', binding) as Map
+
+        then: 'the stale snapshot cannot cause duplicate_in_flight or consume the write cap'
+        next.accepted == true
+        next.stateId != stateId
+        calls == 1
+    }
+
+    def "terminal evidence does not repair an active snapshot with mismatched #field"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def args = [appId: 654, confirm: true, button: 'pausRule']
+        def binding = script._mrtrBinding('hub_set_rule', 'hub_set_rule', args) as Map
+        def calls = 0
+        script.metaClass.toolSetRule = { Map actual ->
+            calls++
+            [success: true, appId: actual.appId]
+        }
+        String stateId = modernCall('hub_set_rule', args).result.requestState
+        Map activeSnapshot = script._mrtrCopyMap(
+            atomicStateMap.mrtrRequests[stateId] as Map) as Map
+        Map workerData = new LinkedHashMap(runInMillisCalls[0][2].data as Map)
+        script.runMrtrSlice(workerData)
+        def complete = modernCall('hub_set_rule', args, stateId)
+
+        expect: 'terminal evidence exists for the actual claim and generation'
+        complete.result.resultType == 'complete'
+        calls == 1
+
+        when: 'the exposed active snapshot does not identify that exact execution'
+        activeSnapshot[field] = mismatch
+        atomicStateMap.mrtrRequests[stateId] = activeSnapshot
+        script._writeStateCacheInvalidate()
+        script._activeWrites()
+        Map afterSweep = atomicStateMap.mrtrRequests[stateId] as Map
+        def replay = script._mrtrReserve(
+            'hub_set_rule', 'hub_set_rule', binding) as Map
+
+        then: 'terminal proof is ignored and the active operation retains the write slot'
+        afterSweep.status == 'active'
+        afterSweep[field] == mismatch
+        replay.accepted == true
+        replay.rejoined == true
+        replay.stateId == stateId
+        calls == 1
+
+        where:
+        field               | mismatch
+        'claimId'           | 'different-claim'
+        'claimedGeneration' | 999
+        'generation'        | 999
+    }
+
+    def "clone continuation checkpoints clicks then commits exactly once"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            nativeRuleConfig(100, 'Source Rule', 21)
+        }
+        hubGet.register('/apps/api/4242/app/100') { params -> '<html>source-context</html>' }
+        hubGet.register('/installedapp/configure/json/4242/main') { params ->
+            clonerPageState('importRule', 0)
+        }
+        int parentReads = 0
+        hubGet.register('/installedapp/configure/json/21') { params ->
+            parentReads++
+            parentReads == 1
+                ? nativeParentConfig(21, [[id: 100, label: 'Source Rule']])
+                : nativeParentConfig(21, [[id: 100, label: 'Source Rule'],
+                                          [id: 250, label: 'Source Rule clone']])
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            [status: 302, location: '/apps/api/4242/app/100', data: '']
+        }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: decodeForm(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        def args = [sourceAppId: 100, confirm: true]
+
+        when: 'the first request initializes and checkpoints the click phase'
+        def initialized = modernCall('hub_clone_native_app', args)
+        String requestState = initialized.result.requestState
+
+        then:
+        initialized.result.resultType == 'input_required'
+        requestState instanceof String
+        autoContinueJobs().size() == 1
+        atomicStateMap.mrtrRequests[requestState].checkpoint.phase == 'clone_clicks'
+        atomicStateMap.mrtrRequests[requestState].checkpoint.clonerAppId == 4242
+        posts.isEmpty()
+
+        when: 'the next resume performs the click phase and checkpoints the commit'
+        def clicked = modernCall('hub_clone_native_app', args, requestState)
+        def cloneClicks = posts.findAll {
+            it.path == '/installedapp/btn' && it.body.name == 'cloneRuleButton'
+        }
+
+        then:
+        clicked.result.resultType == 'input_required'
+        clicked.result.requestState == requestState
+        atomicStateMap.mrtrRequests[requestState].checkpoint.phase == 'clone_commit'
+        cloneClicks.size() == 2
+        !posts.any { it.path == '/installedapp/btn' && it.body.name == 'importNow' }
+
+        when: 'the final resume commits and a replay observes the retained terminal result'
+        def completed = modernCall('hub_clone_native_app', args, requestState)
+        def completedInner = mcpDriver.parseInner(completed)
+        int postsAfterCommit = posts.size()
+        def replay = modernCall('hub_clone_native_app', args, requestState)
+        def importNowClicks = posts.findAll {
+            it.path == '/installedapp/btn' && it.body.name == 'importNow'
+        }
+        def commitNavigations = posts.findAll {
+            it.path == '/installedapp/update/json' &&
+                it.body.containsKey('_action_href_name|importRule|0')
+        }
+
+        then:
+        completed.result.resultType == 'complete'
+        completed.result.isError != true
+        completedInner.success == true
+        completedInner.newAppId == 250
+        completedInner.mrtr.rounds == 3
+        commitNavigations.size() == 1
+        importNowClicks.size() == 2
+        replay.result.resultType == 'complete'
+        mcpDriver.parseInner(replay).newAppId == 250
+        posts.size() == postsAfterCommit
+    }
+
+    def "import continuation uploads once then commits exactly once"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        String importJson = '{"deviceReplacements":{},"appReplacements":{"42":{"appLabel":"Source Rule","appTypeName":"Rule-5.1"}}}'
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            nativeRuleConfig(100, 'Existing Rule', 21)
+        }
+        hubGet.register('/apps/api/4242/app/100') { params -> '<html>source-context</html>' }
+        hubGet.register('/installedapp/configure/json/4242/main') { params ->
+            clonerPageState('importRule', 55)
+        }
+        int parentReads = 0
+        hubGet.register('/installedapp/configure/json/21') { params ->
+            parentReads++
+            parentReads == 1
+                ? nativeParentConfig(21, [[id: 100, label: 'Existing Rule']])
+                : nativeParentConfig(21, [[id: 100, label: 'Existing Rule'],
+                                          [id: 700, label: 'Source Rule import']])
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            [status: 302, location: '/apps/api/4242/app/100', data: '']
+        }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: decodeForm(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        def args = [jsonContent: importJson, parentHintAppId: 100, confirm: true]
+
+        when: 'the first request uploads once and checkpoints import_commit'
+        def uploaded = modernCall('hub_import_native_app', args)
+        String requestState = uploaded.result.requestState
+        def uploads = posts.findAll {
+            it.path == '/installedapp/update/json' &&
+                it.body['settings[ruleUpload]'] == importJson
+        }
+
+        then:
+        uploaded.result.resultType == 'input_required'
+        requestState instanceof String
+        autoContinueJobs().size() == 1
+        !(atomicStateMap.mrtrRequests[requestState].nextArguments.toString().contains('appData'))
+        atomicStateMap.mrtrRequests[requestState].checkpoint.phase == 'import_commit'
+        atomicStateMap.mrtrRequests[requestState].checkpoint.clonerAppId == 4242
+        uploads.size() == 1
+        !posts.any { it.path == '/installedapp/btn' && it.body.name == 'importNow' }
+
+        when: 'the next resume commits and a replay cannot upload or commit again'
+        def completed = modernCall('hub_import_native_app', args, requestState)
+        def completedInner = mcpDriver.parseInner(completed)
+        int postsAfterCommit = posts.size()
+        def replay = modernCall('hub_import_native_app', args, requestState)
+        def importNowClicks = posts.findAll {
+            it.path == '/installedapp/btn' && it.body.name == 'importNow'
+        }
+        def commitNavigations = posts.findAll {
+            it.path == '/installedapp/update/json' &&
+                it.body.containsKey('_action_href_name|importRule|55')
+        }
+
+        then:
+        completed.result.resultType == 'complete'
+        completed.result.isError != true
+        completedInner.success == true
+        completedInner.newAppId == 700
+        completedInner.originalSourceId == 42
+        completedInner.mrtr.rounds == 2
+        uploads.size() == 1
+        commitNavigations.size() == 1
+        importNowClicks.size() == 2
+        replay.result.resultType == 'complete'
+        mcpDriver.parseInner(replay).newAppId == 700
+        posts.size() == postsAfterCommit
+    }
+
+    def "detached worker schedule failure becomes a retained terminal error without running the leaf"() {
+        given:
+        settingsMap.enableWrite = true
+        def args = [appId: 777, confirm: true, settings: [description: 'no scheduler']]
+        def leafCalls = new AtomicInteger(0)
+        script.metaClass.toolSetRule = { Map actual ->
+            leafCalls.incrementAndGet()
+            [success: true, appId: actual.appId]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call -> throw new IllegalStateException('scheduler unavailable') })
+
+        when:
+        def failed = modernCall('hub_set_rule', args)
+        def failedInner = mcpDriver.parseInner(failed)
+        String stateId = onlyStateId()
+        def replay = modernCall('hub_set_rule', args, stateId)
+        def replayInner = mcpDriver.parseInner(replay)
+
+        then:
+        failed.result.resultType == 'complete'
+        failed.result.isError == true
+        failedInner.status == 'schedule_failed'
+        failedInner.error.contains('scheduler unavailable')
+        replay.result.resultType == 'complete'
+        replay.result.isError == true
+        replayInner.status == 'schedule_failed'
+        leafCalls.get() == 0
+        script._activeWrites().isEmpty()
+    }
+
+    def "maxConcurrentWrites zero disables the write cap"() {
+        given: 'each first slice pauses with a remainder, so both records stay active'
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 0
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+
+        expect:
+        modernCall('hub_call_rule', [ruleId: [41, 42], action: 'stop']).result.resultType == 'input_required'
+        modernCall('hub_call_rule', [ruleId: [51, 52], action: 'stop']).result.resultType == 'input_required'
+    }
+
+    def "a terminal MRTR call releases its write slot"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        script.metaClass.toolRunRmRule = { Map a ->
+            [success: true, partial: false, ruleIds: a.ruleId,
+             rmAction: 'stopRule toggle x1', results: a.ruleId.collect { [success: true, ruleId: it] }]
+        }
+        def args = [ruleId: [61, 62], action: 'stop']
+
+        when:
+        def complete = modernCall('hub_call_rule', args)
+        def next = modernCall('hub_call_rule', [ruleId: [71, 72], action: 'stop'])
+
+        then:
+        complete.result.resultType == 'complete'
+        next.result.resultType == 'complete'
+        next.result.isError != true
+    }
+
+    def "ordinary write-request leases share the same cap and release in finally"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        def activeDuring = []
+        script.metaClass.toolRunRmRule = { Map a ->
+            activeDuring.addAll(script._activeWrites())
+            [success: true, ruleIds: a.ruleId, results: []]
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: [81, 82], action: 'stop'])
+
+        then:
+        response.error == null
+        activeDuring*.tool == ['hub_call_rule']
+        script._activeWrites().isEmpty()
+    }
+
+    def "an ordinary write lease is memory-only and ages out when its execution is gone"() {
+        given: 'a lease from a hard-killed execution, past the TTL AND the live-grace ceiling'
+        settingsMap.maxConcurrentWrites = 1
+        (scriptStaticField('WRITE_REQUEST_LEASES') as Map)['write-abandoned'] = [
+            tool: 'hub_set_variable', transport: 'modern',
+            startedAt: 1234567500000L,
+            expiresAt: 1234567890000L - (script._writeLeaseMs() as Long) - 1L
+        ]
+        // A hard kill strands the id in the live set too, looking forever "live".
+        // Past the hard ceiling (expiry + one further TTL) eviction must be
+        // unconditional or two strandings wedge the cap until recompile.
+        (scriptStaticField('LIVE_WRITE_EXECUTIONS') as Set).add('write-abandoned')
+
+        when: 'a lease is taken through the ordinary reservation path'
+        Map reservation = script._writeReserveRequest('hub_call_device_command', 'legacy') as Map
+
+        then: 'the expired one is swept, live-set entry included, so a hard-killed execution cannot jam the cap'
+        reservation.accepted == true
+        script._activeWrites()*.tool == ['hub_call_device_command']
+        !(scriptStaticField('LIVE_WRITE_EXECUTIONS') as Set).contains('write-abandoned')
+
+        and: 'the cap costs no hub DB round trips -- nothing about it reaches atomicState'
+        atomicStateMap.writeRequestLeases == null
+
+        when:
+        script._writeReleaseRequest(reservation.leaseId as String)
+
+        then:
+        script._activeWrites().isEmpty()
+    }
+
+    def "an active write lease refuses a parallel device command before dispatch"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.enableMandatoryBPS = false
+        settingsMap.maxConcurrentWrites = 1
+        script._writeReserveRequest('hub_set_variable', 'modern')
+        def ran = 0
+        script.metaClass.toolCallDeviceCommand = { Map a -> ran++; [success: true] }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_device_command', [deviceId: '1', command: 'on'])
+        def inner = mcpDriver.parseInner(response)
+
+        then:
+        response.error == null
+        response.result.isError == true
+        inner.status == 'too_many_writes_in_flight'
+        inner.active*.tool == ['hub_set_variable']
+        ran == 0
+    }
+
+    def "the hub LED identify read ignores the write cap"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.maxConcurrentWrites = 1
+        script._writeReserveRequest('hub_call_device_command', 'legacy')
+        def seen = null
+        script.metaClass.toolGetHubInfo = { Map a -> seen = new LinkedHashMap(a); [identifyHubTriggered: true] }
+
+        when:
+        def response = mcpDriver.callTool('hub_get_info', [identifyHub: true])
+        def inner = mcpDriver.parseInner(response)
+
+        then:
+        response.error == null
+        response.result.isError != true
+        inner.identifyHubTriggered == true
+        seen == [identifyHub: true, __reqT0: 1234567890000L]
+    }
+
+    def "mixed-mode metrics count only snapshot writes and firmware status polls stay read-shaped"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 1
+        script._writeReserveRequest('hub_call_device_command', 'legacy')
+        def metricsArgs = []
+        def firmwareArgs = []
+        script.metaClass.toolGetHubPerformance = { Map a -> metricsArgs << new LinkedHashMap(a); [success: true] }
+        script.metaClass.toolUpdateFirmware = { Map a -> firmwareArgs << new LinkedHashMap(a); [success: true, statusOnly: a.statusOnly == true] }
+
+        when:
+        def metricsRead = mcpDriver.callTool('hub_get_metrics', [recordSnapshot: false])
+        def metricsWrite = mcpDriver.callTool('hub_get_metrics', [recordSnapshot: true])
+        def firmwareRead = mcpDriver.callTool('hub_update_firmware', [statusOnly: true])
+        def firmwareWrite = mcpDriver.callTool('hub_update_firmware', [confirm: true])
+
+        then:
+        metricsRead.result.isError != true
+        metricsArgs == [[recordSnapshot: false]]
+        mcpDriver.parseInner(metricsWrite).status == 'too_many_writes_in_flight'
+        firmwareRead.result.isError != true
+        firmwareArgs == [[statusOnly: true]]
+        mcpDriver.parseInner(firmwareWrite).status == 'too_many_writes_in_flight'
+    }
+
+    def "a nonexpired package marker with unrelated terminal evidence keeps its write slot"() {
+        given:
+        settingsMap.maxConcurrentWrites = 1
+        atomicStateMap.packageDeployInFlight = [
+            requestId: 'pkg-live', ref: 'feat/live', startedAt: 1234567800000L,
+            phase: 'queued', expiresAt: 1234567920000L, args: [ref: 'feat/live']
+        ]
+        script._writeStateCacheInvalidate()
+        atomicStateMap.lastSelfDeploy = [
+            success: true, sourceMode: 'importUrl', at: 1234567889000L
+        ]
+
+        when:
+        Map reservation = script._writeReserveRequest('hub_call_device_command', 'legacy') as Map
+
+        then:
+        reservation.accepted == false
+        reservation.refusal.status == 'too_many_writes_in_flight'
+        reservation.refusal.active == [[
+            tool: 'hub_update_package', startedAt: 1234567800000L, transport: 'background'
+        ]]
+    }
+
+    def "an expired inactive package marker is removed before ordinary write admission"() {
+        given:
+        settingsMap.maxConcurrentWrites = 1
+        atomicStateMap.packageDeployInFlight = [
+            requestId: 'pkg-dead', ref: 'feat/dead', startedAt: 1234567200000L,
+            phase: 'queued', expiresAt: 1234567889999L, args: [ref: 'feat/dead']
+        ]
+        script._writeStateCacheInvalidate()
+
+        when:
+        Map reservation = script._writeReserveRequest('hub_call_device_command', 'legacy') as Map
+
+        then:
+        reservation.accepted == true
+        atomicStateMap.packageDeployInFlight == null
+        script._activeWrites()*.tool == ['hub_call_device_command']
+
+        cleanup:
+        if (reservation?.leaseId) script._writeReleaseRequest(reservation.leaseId as String)
+    }
+
+    def "matching package terminal evidence releases an orphaned write slot"() {
+        given:
+        settingsMap.maxConcurrentWrites = 1
+        atomicStateMap.packageDeployInFlight = [
+            requestId: 'pkg-finished', ref: 'feat/finished',
+            startedAt: 1234567880000L, args: [ref: 'feat/finished']
+        ]
+        script._writeStateCacheInvalidate()
+        atomicStateMap.lastSelfDeploy = [
+            success: true, sourceMode: 'package', requestId: 'pkg-finished',
+            ref: 'feat/finished', at: 1234567889000L
+        ]
+
+        when:
+        Map reservation = script._writeReserveRequest('hub_call_device_command', 'legacy') as Map
+
+        then:
+        reservation.accepted == true
+        script._activeWrites()*.tool == ['hub_call_device_command']
+    }
+
+    def "active request-state storage saturation refuses admission without evicting live work"() {
+        given:
+        settingsMap.maxConcurrentWrites = 0
+        Map targetBinding = script._mrtrBinding('hub_call_rule', 'hub_call_rule',
+            [ruleId: [921, 922], action: 'stop']) as Map
+        atomicStateMap.mrtrRequests = (0..<16).collectEntries { int index ->
+            Map b = script._mrtrBinding('hub_call_rule', 'hub_call_rule',
+                [ruleId: [1000 + index, 2000 + index], action: 'stop']) as Map
+            [("mrtr-seeded-active-${index}".toString()): [
+                schemaVersion: 1, status: 'active', outerTool: 'hub_call_rule', leafTool: 'hub_call_rule',
+                argDigest: b.argDigest,
+                startedAt: 1234567880000L + index, updatedAt: 1234567880000L + index,
+                expiresAt: 1234567990000L, rounds: 0, generation: 0
+            ]]
+        }
+        script._writeStateCacheInvalidate()
+        def before = atomicStateMap.mrtrRequests.keySet() as Set
+
+        when:
+        Map result = script._mrtrReserve('hub_call_rule', 'hub_call_rule', targetBinding) as Map
+
+        then:
+        result.accepted == false
+        result.refusal.status == 'request_state_capacity'
+        atomicStateMap.mrtrRequests.size() == 16
+        atomicStateMap.mrtrRequests.keySet() as Set == before
+        atomicStateMap.mrtrRequests.values().every { it.status == 'active' }
+    }
+
+    def "terminal request-state records are evicted before a new active reservation"() {
+        given:
+        settingsMap.maxConcurrentWrites = 0
+        Map targetBinding = script._mrtrBinding('hub_call_rule', 'hub_call_rule',
+            [ruleId: [931, 932], action: 'stop']) as Map
+        atomicStateMap.mrtrRequests = (0..<15).collectEntries { int index ->
+            [("mrtr-live-${index}".toString()): [
+                schemaVersion: 1, status: 'active', outerTool: 'hub_call_rule', leafTool: 'hub_call_rule',
+                argDigest: "seed-digest-${index}".toString(),
+                startedAt: 1234567880000L + index, updatedAt: 1234567880000L + index,
+                expiresAt: 1234567990000L, rounds: 0, generation: 0
+            ]]
+        }
+        atomicStateMap.mrtrRequests['mrtr-old-terminal'] = [
+            schemaVersion: 1, status: 'terminal', outerTool: 'hub_call_rule', leafTool: 'hub_call_rule',
+            startedAt: 1234567800000L, updatedAt: 1234567800000L,
+            expiresAt: 1234567990000L, terminalResult: [success: true]
+        ]
+        script._writeStateCacheInvalidate()
+
+        when:
+        Map result = script._mrtrReserve('hub_call_rule', 'hub_call_rule', targetBinding) as Map
+
+        then:
+        result.accepted == true
+        atomicStateMap.mrtrRequests.size() == 16
+        !atomicStateMap.mrtrRequests.containsKey('mrtr-old-terminal')
+        atomicStateMap.mrtrRequests[result.stateId].status == 'active'
+    }
+
+    def "expired active request-state cleanup runs before its storage slot is reused"() {
+        given:
+        settingsMap.maxConcurrentWrites = 0
+        def cleanupPaths = []
+        script.metaClass.hubInternalGetRaw = { String path, Map params = null, Integer timeout = 30 ->
+            cleanupPaths << path
+            [status: 302, data: '']
+        }
+        atomicStateMap.mrtrRequests = ['mrtr-expired-with-helper': [
+            schemaVersion: 1, status: 'active', outerTool: 'hub_clone_native_app',
+            leafTool: 'hub_clone_native_app', startedAt: 1L, updatedAt: 1L, expiresAt: 2L,
+            rounds: 0, generation: 0, checkpoint: [clonerAppId: 77]
+        ]]
+        script._writeStateCacheInvalidate()
+        Map binding = script._mrtrBinding('hub_call_rule', 'hub_call_rule',
+            [ruleId: [941, 942], action: 'stop']) as Map
+
+        when:
+        Map result = script._mrtrReserve('hub_call_rule', 'hub_call_rule', binding) as Map
+
+        then:
+        result.accepted == true
+        cleanupPaths == ['/installedapp/forcedelete/77/quiet']
+        !atomicStateMap.mrtrRequests.containsKey('mrtr-expired-with-helper')
+    }
+
+    def "requestState is bound to the exact leaf tool and original arguments"() {
+        given:
+        settingsMap.enableWrite = true
+        def ran = 0
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite { ran++ }
+        def first = modernCall('hub_call_rule', [ruleId: [31, 32], action: 'stop'])
+        String requestState = first.result.requestState
+
+        when: 'the client changes the original arguments'
+        def mismatchedArgs = modernCall('hub_call_rule', [ruleId: [31, 99], action: 'stop'], requestState)
+
+        then:
+        mismatchedArgs.error.code == -32602
+        mismatchedArgs.error.message.contains('requestState')
+        ran == 1
+
+        when: 'the client changes the leaf tool'
+        def mismatchedTool = modernCall('hub_set_rule', [appId: 31, confirm: true, settings: [x: 1]], requestState)
+
+        then:
+        mismatchedTool.error.code == -32602
+        mismatchedTool.error.message.contains('requestState')
+        ran == 1
+    }
+
+    def "requestState binding includes a changed best-practice acknowledgment"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+        def original = [ruleId: [81, 82], action: 'stop', bestPracticeKey: 'original-key']
+        def first = modernCall('hub_call_rule', original)
+
+        when:
+        def changed = modernCall('hub_call_rule',
+            [ruleId: [81, 82], action: 'stop', bestPracticeKey: 'different-key'],
+            first.result.requestState as String)
+
+        then:
+        changed.error.code == -32602
+        changed.error.message.contains('requestState')
+    }
+
+    def "SHA-256 request binding separates payloads that collide under the legacy compact tuple"() {
+        given: 'two equal-length payloads with identical 48-char edges and both Java hashes equal'
+        String payloadA = 'PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP' +
+            'AaBBAaAaBBBBAaBBBBBBAaAaBBBBBBAaBBAaBBBBAaAaBBBBAaBBAaAaAaBBBBAaBBAaAaBBBBBBBBBBAaAaAaBBBBBBAaAaBBBBBBBBBBBBBBAaBBAaBBBBAaBBAaBB' +
+            'SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS'
+        String payloadB = 'PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP' +
+            'BBAaBBAaBBBBBBAaBBBBAaBBBBAaAaBBAaAaBBAaBBBBAaBBBBAaAaBBAaAaBBBBBBAaBBBBBBBBBBBBAaAaBBAaBBAaBBBBAaAaBBBBBBBBAaBBAaBBBBBBAaAaAaBB' +
+            'SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS'
+        String oldA = groovy.json.JsonOutput.toJson([importJson: payloadA])
+        String oldB = groovy.json.JsonOutput.toJson([importJson: payloadB])
+
+        expect:
+        oldA != oldB
+        oldA.length() == oldB.length()
+        oldA.substring(0, 48) == oldB.substring(0, 48)
+        oldA.substring(oldA.length() - 48) == oldB.substring(oldB.length() - 48)
+        oldA.hashCode() == oldB.hashCode()
+        oldA.reverse().hashCode() == oldB.reverse().hashCode()
+        script._mrtrSha256('abc') ==
+            'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+        script._mrtrBinding('hub_import_native_app', 'hub_import_native_app',
+            [importJson: payloadA]).argDigest !=
+            script._mrtrBinding('hub_import_native_app', 'hub_import_native_app',
+                [importJson: payloadB]).argDigest
+    }
+
+    def "large import binding persists only a fixed-size digest"() {
+        given:
+        settingsMap.maxConcurrentWrites = 0
+        String importJson = '{"apps":[' + ('x' * 200000) + ']}'
+        Map binding = script._mrtrBinding('hub_import_native_app',
+            'hub_import_native_app', [importJson: importJson]) as Map
+
+        when:
+        Map admitted = script._mrtrReserve('hub_import_native_app',
+            'hub_import_native_app', binding) as Map
+        Map stored = atomicStateMap.mrtrRequests[admitted.stateId] as Map
+
+        then:
+        admitted.accepted == true
+        binding.argDigest ==~ /[0-9a-f]{64}/
+        stored.argDigest == binding.argDigest
+        !stored.toString().contains(importJson.substring(0, 100))
+        stored.keySet().intersect(['canonicalArgs', 'originalArgs', 'importJson']).isEmpty()
+    }
+
+    def "unknown and expired requestState fail without dispatching a write"() {
+        given:
+        settingsMap.enableWrite = true
+        def ran = 0
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite { ran++ }
+        def original = [ruleId: [41, 42], action: 'stop']
+
+        when:
+        def unknown = modernCall('hub_call_rule', original, 'mrtr-does-not-exist-1234567890')
+
+        then:
+        unknown.error.code == -32602
+        unknown.error.message.contains('Invalid or expired requestState')
+        ran == 0
+
+        when:
+        def first = modernCall('hub_call_rule', original)
+        String stateId = first.result.requestState
+        atomicStateMap.mrtrRequests[stateId].expiresAt = 1L
+        script._writeStateCacheInvalidate()
+        def expired = modernCall('hub_call_rule', original, stateId)
+
+        then: 'the first slice ran once; the expired state dispatches nothing more'
+        expired.error.code == -32602
+        expired.error.message.contains('Invalid or expired requestState')
+        ran == 1
+    }
+
+    def "legacy slow write keeps its ordinary remainder result and creates no MRTR state"() {
+        given:
+        settingsMap.enableWrite = true
+        def ran = 0
+        script.metaClass.toolRunRmRule = { Map a ->
+            ran++
+            [success: false, partial: true, ruleIds: [51, 52], results: [[success: true, ruleId: 51]], remainingRuleIds: [52]]
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_call_rule', [ruleId: [51, 52], action: 'stop'])
+        def inner = mcpDriver.parseInner(response)
+
+        then:
+        response.result.resultType == null
+        inner.remainingRuleIds == [52]
+        ran == 1
+        !(atomicStateMap.mrtrRequests instanceof Map) || atomicStateMap.mrtrRequests.isEmpty()
+    }
+
+
+    def "a call_rule rule that failed in an earlier slice and then succeeded on retry does not poison the terminal verdict"() {
+        given: 'slice 1 banked a failure for rule 12; the continuation re-queued it and the retry succeeded'
+        Map rec = [aggregate: [kind: 'call_rule',
+                               results: [[ruleId: 11, success: true], [ruleId: 12, success: false]],
+                               ruleIds: [11, 12]]]
+        Map lastSlice = [success: true, ruleIds: [12, 13, 14],
+                         results: [[ruleId: 12, success: true], [ruleId: 13, success: true],
+                                   [ruleId: 14, success: true]]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then: 'the retry outcome replaces the banked failure -- one row per rule, none failed'
+        out.results.size() == 4
+        out.results.count { it.ruleId == 12 } == 1
+        out.results.every { it.success == true }
+
+        and: 'so the operation reports the truth: every rule was actioned'
+        out.success == true
+        out.partial == false
+        out.failedRuleIds == null
+    }
+
+    def "a call_rule rule still failing after its retry keeps the terminal verdict failed"() {
+        given: 'the negative pin -- collapsing to the LAST outcome must not hide a real failure'
+        Map rec = [aggregate: [kind: 'call_rule', results: [[ruleId: 12, success: false]], ruleIds: [12]]]
+        Map lastSlice = [success: true, ruleIds: [12], results: [[ruleId: 12, success: false]]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then:
+        out.results.size() == 1
+        out.success == false
+        out.failedRuleIds == [12]
+
+        and: 'but NOT partial: every rule failed, so nothing was actioned. partial means some-actioned-some-not -- reporting an all-failed batch as partial would tell a client some rules landed when none did'
+        out.partial == false
+    }
+
+    def "a call_rule batch with a mix of outcomes IS partial"() {
+        given: 'the positive counterpart -- without this, partial:false everywhere would satisfy the pin above'
+        Map rec = [aggregate: [kind: 'call_rule', results: [[ruleId: 12, success: true]], ruleIds: [12]]]
+        Map lastSlice = [success: true, ruleIds: [13], results: [[ruleId: 13, success: false]]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then: 'one actioned, one failed'
+        out.results.size() == 2
+        out.success == false
+        out.partial == true
+        out.failedRuleIds == [13]
+
+        and: 'and the id ledger merges both rounds -- results[] and ruleIds are separate merges, so a dedupe that fixed only one would still ship a self-contradicting envelope'
+        out.ruleIds.collect { it.toString() } == ['12', '13']
+    }
+
+    def "a continuation tail that narrows to one rule still contributes its row"() {
+        given: 'the leaf takes its SCALAR path for a single id -- outcome reported top-level, no results[] -- which is the natural tail of any paginated batch'
+        Map rec = [aggregate: [kind: 'call_rule', results: [[ruleId: 12, success: true]], ruleIds: [12]]]
+        Map scalarTail = [success: false, ruleId: 13, ruleIds: [13], rmAction: 'stopRule button -> state.stopped=true',
+                          error: 'rule 13 is broken']
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, scalarTail)
+
+        then: 'the tail rule appears in the ledger rather than vanishing from it'
+        out.results.size() == 2
+        out.results*.ruleId.collect { it.toString() } == ['12', '13']
+
+        and: 'the id ledger agrees with the rows -- these are separate merges and must not drift'
+        out.ruleIds.collect { it.toString() } == ['12', '13']
+
+        and: 'and its failure is attributable -- success:false with an empty failedRuleIds would name no culprit'
+        out.success == false
+        out.failedRuleIds == [13]
+        out.partial == true
+
+        and: 'the scalar tail\'s top-level ruleId is dropped: leaving it would name the tail rule as if it were the whole batch'
+        !out.containsKey('ruleId')
+
+        and: 'the note the leaf attaches to a row survives the synthesizer -- an allowlist silently drops whatever the leaf adds next'
+        script._mrtrRuleResultRows([success: false, ruleId: 13, rmAction: 'noop',
+                                    note: 'Rule was already stopped'])[0].note == 'Rule was already stopped'
+    }
+
+    def "a single-rule terminal keeps its top-level ruleId"() {
+        given: 'the negative pin -- the field is legitimate when exactly one rule was asked for, so the strip must be conditional rather than unconditional'
+        Map rec = [aggregate: [kind: 'call_rule', results: [], ruleIds: []]]
+        Map lastSlice = [success: true, ruleId: 12, ruleIds: [12],
+                         results: [[ruleId: 12, success: true]]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then:
+        out.ruleIds.collect { it.toString() } == ['12']
+        out.ruleId == 12
+    }
+
+    def "the work-item sweep reaps by claim identity and never under a live worker"() {
+        given: 'three items: no record, a record that has moved on to a LATER claim, and a genuinely executing one'
+        Map workItems = scriptStaticField('MRTR_WORK_ITEMS') as Map
+        Set live = scriptStaticField('LIVE_WRITE_EXECUTIONS') as Set
+        workItems['orphan'] = [stateId: 'gone', claimId: 'orphan', started: false,
+                               arguments: [driverSource: 'x' * 64]]
+        // Freshly queued AND its record is active, so nothing about its age marks it dead --
+        // only the claimId mismatch does. This is the item an age ceiling would have held for
+        // a full window while its record was already serving a different claim.
+        workItems['superseded'] = [stateId: 'moved', claimId: 'superseded', started: true,
+                                   arguments: [driverSource: 'z' * 64]]
+        // Its record has ALSO moved on to a later claim, so claim identity alone would reap it.
+        // The live marker is the only thing that can spare it -- delete the liveness line and
+        // this item is gone, which is what makes the assertion below a guard rather than a
+        // restatement of the superseded case.
+        workItems['running'] = [stateId: 'alive', claimId: 'running', started: true,
+                                arguments: [driverSource: 'y' * 64]]
+        live.add('running')
+        atomicStateMap.mrtrRequests = [
+            'moved': [status: 'active', claimId: 'claim-2', generation: 2, claimedGeneration: 2,
+                      expiresAt: script.now() + 60000L],
+            'alive': [status: 'active', claimId: 'claim-9', generation: 2, claimedGeneration: 2,
+                      expiresAt: script.now() + 60000L]
+        ]
+        script._writeStateCacheInvalidate()
+
+        when: 'a sweep runs'
+        script._activeWrites()
+
+        then: 'the orphan (a full copy of its call arguments) is released'
+        workItems['orphan'] == null
+
+        and: 'so is the superseded one, which no age ceiling could have seen'
+        workItems['superseded'] == null
+
+        and: 'the executing worker keeps its item even though its record moved on -- reaping under a live worker would break the slice mid-write'
+        workItems['running'] != null
+    }
+
+    def "modern #operation staging cap preserves the latest recovery ledger and replays without writes"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        String tool = "hub_${operation}_native_app".toString()
+        String importJson = '{"appReplacements":{"42":{"appLabel":"Source Rule"}}}'
+        Map args = [confirm: true, stageDisabled: true] + (operation == 'clone'
+            ? [sourceAppId: 100]
+            : [parentHintAppId: 100, jsonContent: importJson])
+        int cap = script._mrtrMaxContinuationSlices() as Integer
+        int setupSlices = operation == 'clone' ? 3 : 2
+        List targets = (250..(250 + cap)).toList()
+        List expectedAttempted = targets.take(cap - setupSlices)
+        List expectedStaged = expectedAttempted.findAll { it != 251 }
+        List expectedRemaining = targets.drop(expectedAttempted.size())
+        def disabled = []
+        def posts = []
+        def cleaned = []
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            nativeRuleConfig(100, 'Source Rule', 21)
+        }
+        hubGet.register('/apps/api/4242/app/100') { params -> '<html>source-context</html>' }
+        hubGet.register('/installedapp/configure/json/4242/main') { params ->
+            clonerPageState('importRule', 0)
+        }
+        int parentReads = 0
+        hubGet.register('/installedapp/configure/json/21') { params ->
+            parentReads++
+            nativeParentConfig(21, parentReads == 1
+                ? [[id: 100, label: 'Source Rule']]
+                : [[id: 100, label: 'Source Rule'], [id: 250, label: 'Source Rule clone']])
+        }
+        hubGet.register('/hub2/appsList') { params ->
+            groovy.json.JsonOutput.toJson([apps: [[data: [id: 250],
+                children: targets.drop(1).collect { [data: [id: it]] }]]])
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            if (path.startsWith('/installedapp/forcedelete/')) cleaned << path
+            [status: 302, location: '/apps/api/4242/app/100', data: '']
+        }
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, data: '{"status":"success"}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: decodeForm(body)]
+            [status: 200, data: '{"status":"success"}']
+        }
+        script.metaClass._timeBudgetExceeded = { Long start -> true }
+        script.metaClass.toolSetAppDisabled = { Map disableArgs ->
+            disabled << disableArgs.appId
+            disableArgs.appId == 251 ? [success: false, error: 'denied'] : [success: true]
+        }
+
+        when: 'the first request runs the initialize slice'
+        def first = modernCall(tool, args)
+        String requestState = first.result.requestState
+
+        then:
+        first.result.resultType == 'input_required'
+        disabled.isEmpty()
+
+        when: 'ordinary continuations commit and stage one target per slice'
+        for (int round = 2; round < cap; round++) {
+            def continued = modernCall(tool, args, requestState)
+            assert continued.result.resultType == 'input_required'
+        }
+
+        then: 'the pre-cap checkpoint contains the earlier failure and has not attempted the final slice yet'
+        atomicStateMap.mrtrRequests[requestState].checkpoint.newAppId == 250
+        atomicStateMap.mrtrRequests[requestState].checkpoint.stageFailures*.appId == [251]
+        disabled == expectedAttempted.take(expectedAttempted.size() - 1)
+        cleaned.isEmpty()
+
+        when: 'the actual MRTR cap finalizes the last staging continuation'
+        def completed = modernCall(tool, args, requestState)
+        def terminal = mcpDriver.parseInner(completed)
+        int postsAfterCap = posts.size()
+
+        then:
+        completed.result.resultType == 'complete'
+        completed.result.isError == true
+        terminal.status == 'continuation_limit'
+        terminal.success == false
+        terminal.partial == true
+        terminal.newAppId == 250
+        terminal.stagedDisabled == expectedStaged
+        terminal.stageFailures == [[appId: 251, kind: 'disable', error: 'denied']]
+        terminal.stageRemaining == expectedRemaining
+        terminal.error.contains('do NOT re-issue')
+        terminal.error.contains('hub_set_app_disabled')
+        terminal.error.contains('newAppId=250')
+        terminal.mrtr.rounds == cap
+        disabled == expectedAttempted
+        cleaned == ['/installedapp/forcedelete/4242/quiet']
+        parentReads == 2
+        posts.count { it.path == '/installedapp/btn' && it.body.name == 'importNow' } == 2
+        !atomicStateMap.mrtrRequests[requestState].containsKey('checkpoint')
+
+        when: 'a dropped cap response is replayed using the same requestState'
+        def replay = modernCall(tool, args, requestState)
+
+        then:
+        replay.result.resultType == 'complete'
+        replay.result.isError == true
+        mcpDriver.parseInner(replay) == terminal
+        posts.size() == postsAfterCap
+        disabled == expectedAttempted
+        cleaned == ['/installedapp/forcedelete/4242/quiet']
+
+        where:
+        operation << ['clone', 'import']
+    }
+
+    def "the continuation cap returns the per-rule ledger it is holding"() {
+        given: 'a call_rule request one round below the cap, with two rules already banked and a third round still pausing'
+        Map claim = [claimId: 'cap1', generation: 1]
+        Map rec = [status: 'active', claimId: 'cap1', claimedGeneration: 1, generation: 1,
+                   rounds: script._mrtrMaxContinuationSlices() - 1,
+                   outerTool: 'hub_manage_rule_machine', leafTool: 'hub_call_rule',
+                   startedAt: script.now(), expiresAt: script.now() + 60000L,
+                   aggregate: [kind: 'call_rule',
+                               results: [[ruleId: 11, success: true], [ruleId: 12, success: false]],
+                               ruleIds: [11, 12]]]
+        atomicStateMap.mrtrRequests = ['cap': rec]
+        script._writeStateCacheInvalidate()
+        Map execArgs = [tool: 'hub_call_rule', args: [ruleId: [13, 14], action: 'stop']]
+        // ruleIds is the FULL list this slice was asked for and remainingRuleIds is a
+        // subList of it -- the leaf derives one from the other, so a paused slice can never
+        // report [13] with [14] remaining.
+        Map slice = [success: true, ruleIds: [13, 14], results: [[ruleId: 13, success: true]],
+                     remainingRuleIds: [14], partial: true]
+
+        when:
+        def outcome = script._mrtrCommitSlice('cap', rec, claim, execArgs, slice)
+
+        then: 'the request ends terminally at the cap rather than continuing'
+        outcome.outcome == 'terminal'
+        outcome.isError == true
+        outcome.result.status == 'continuation_limit'
+
+        and: 'the ledger it was already holding is handed back, not discarded for a go-look-at-the-hub note'
+        outcome.result.results*.ruleId.collect { it.toString() } == ['11', '12', '13']
+        outcome.result.ruleIds.collect { it.toString() } == ['11', '12', '13', '14']
+        outcome.result.failedRuleIds == [12]
+
+        and: 'the rules never reached are named -- failed and not-yet-reached are different sets'
+        outcome.result.remainingRuleIds == [14]
+
+        and: 'partial means some rules were actioned, the same definition the ordinary terminal uses'
+        outcome.result.partial == true
+
+        and: 'and it carries the provenance block consumers read'
+        outcome.result.mrtr?.continued == true
+    }
+
+    def "an all-SUCCESS batch at the continuation cap is still partial"() {
+        given: 'the case the two siblings leave open. The cap formula deliberately differs from the ordinary terminal, and unifying them on the terminal formula would silently report this batch as complete with rules still un-actioned'
+        Map claim = [claimId: 'cap3', generation: 1]
+        Map rec = [status: 'active', claimId: 'cap3', claimedGeneration: 1, generation: 1,
+                   rounds: script._mrtrMaxContinuationSlices() - 1,
+                   outerTool: 'hub_manage_rule_machine', leafTool: 'hub_call_rule',
+                   startedAt: script.now(), expiresAt: script.now() + 60000L,
+                   aggregate: [kind: 'call_rule',
+                               results: [[ruleId: 31, success: true]], ruleIds: [31]]]
+        atomicStateMap.mrtrRequests = ['cap3': rec]
+        script._writeStateCacheInvalidate()
+        Map execArgs = [tool: 'hub_call_rule', args: [ruleId: [32, 33], action: 'stop']]
+        Map slice = [success: true, ruleIds: [32, 33], results: [[ruleId: 32, success: true]],
+                     remainingRuleIds: [33], partial: true]
+
+        when:
+        def outcome = script._mrtrCommitSlice('cap3', rec, claim, execArgs, slice)
+
+        then: 'every banked rule succeeded, but rule 33 was never reached -- that is partial'
+        outcome.result.status == 'continuation_limit'
+        outcome.result.partial == true
+        !outcome.result.failedRuleIds
+        outcome.result.remainingRuleIds == [33]
+
+        and: 'and the note names the re-issue set rather than sending the caller to the hub'
+        outcome.result.note.contains('33')
+    }
+
+    def "an all-failed batch at the continuation cap is a failure, not a partial one"() {
+        given: 'the negative pin -- keying partial on "anything banked" would be structurally always true here, since reaching the cap requires a banked row'
+        Map claim = [claimId: 'cap2', generation: 1]
+        Map rec = [status: 'active', claimId: 'cap2', claimedGeneration: 1, generation: 1,
+                   rounds: script._mrtrMaxContinuationSlices() - 1,
+                   outerTool: 'hub_manage_rule_machine', leafTool: 'hub_call_rule',
+                   startedAt: script.now(), expiresAt: script.now() + 60000L,
+                   aggregate: [kind: 'call_rule',
+                               results: [[ruleId: 21, success: false]], ruleIds: [21]]]
+        atomicStateMap.mrtrRequests = ['cap2': rec]
+        script._writeStateCacheInvalidate()
+        Map execArgs = [tool: 'hub_call_rule', args: [ruleId: [22, 23], action: 'stop']]
+        Map slice = [success: false, ruleIds: [22, 23], results: [[ruleId: 22, success: false]],
+                     remainingRuleIds: [23], partial: true]
+
+        when:
+        def outcome = script._mrtrCommitSlice('cap2', rec, claim, execArgs, slice)
+
+        then: 'every rule failed, so nothing was actioned'
+        outcome.result.status == 'continuation_limit'
+        outcome.result.partial == false
+        outcome.result.failedRuleIds.collect { it.toString() } == ['21', '22']
+    }
+
+    def "abandoning a claimed request releases its queued work item on the next sweep"() {
+        given: 'a claimed active record with a queued slice payload'
+        Map workItems = scriptStaticField('MRTR_WORK_ITEMS') as Map
+        Map claim = [claimId: 'c1', generation: 1]
+        Map rec = [status: 'active', claimId: 'c1', claimedGeneration: 1, generation: 1,
+                   outerTool: 'hub_set_rule', leafTool: 'hub_set_rule',
+                   startedAt: script.now(), expiresAt: script.now() + 60000L]
+        atomicStateMap.mrtrRequests = ['s1': rec]
+        script._writeStateCacheInvalidate()
+        workItems['c1'] = [stateId: 's1', claimId: 'c1', started: false,
+                           arguments: [patches: [1, 2, 3]]]
+
+        when: 'the request is abandoned and any later write sweeps'
+        script._mrtrAbandon('s1', rec, claim, 'test-abandon')
+        script._activeWrites()
+
+        then: 'the item is released. Abandon both ends the claim and drops the record out of active, so this pins the OUTCOME rather than isolating which of the two the sweep noticed -- deleting the sweep is what turns it red'
+        workItems['c1'] == null
+    }
+
+
+    // -------- slow reads --------
+
+    private void registerLogsJson(AtomicInteger fetches, int jobCount) {
+        hubGet.register('/logs/json') { params ->
+            fetches.incrementAndGet()
+            groovy.json.JsonOutput.toJson([
+                uptime: '2d',
+                jobs: (1..jobCount).collect { [id: it, name: "Job${it}".toString(), recurring: false, methodName: 'run', nextRun: 'soon'] },
+                runningJobs: [], hubCommands: []
+            ])
+        }
+    }
+
+    @spock.lang.Unroll
+    def "cold gateway #leaf with #argumentForm inner args continues until the read is complete"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = false
+        settingsMap.useGateways = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 3)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        Map args = [tool: leaf]
+        if (argumentForm == 'null') args.args = null
+        if (argumentForm == 'empty map') args.args = [:]
+        if (argumentForm == 'encoded object') args.args = '{}'
+
+        when: 'the cold fetch is queued but cannot complete during the request'
+        def first = modernCall('hub_manage_logs', args)
+        String stateId = first.result.requestState
+
+        then: 'a pending read is a protocol continuation, never a complete in_progress payload'
+        first.error == null
+        first.result.resultType == 'input_required'
+        stateId?.startsWith('mrtr-')
+        !first.result.containsKey('content')
+        fetches.get() == 0
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runLogsJsonFetch']
+        script._activeWrites().isEmpty()
+
+        when: 'the client echoes its original arguments while the fetch remains queued'
+        def waiting = modernCall('hub_manage_logs', args, stateId)
+
+        then:
+        waiting.error == null
+        waiting.result.resultType == 'input_required'
+        waiting.result.requestState == stateId
+        fetches.get() == 0
+        runInMillisCalls.size() == 1
+
+        when: 'the worker publishes and the same call resumes'
+        script.runLogsJsonFetch(runInMillisCalls[0][2].data as Map)
+        def completed = modernCall('hub_manage_logs', args, stateId)
+        def inner = mcpDriver.parseInner(completed)
+
+        then:
+        completed.error == null
+        completed.result.resultType == 'complete'
+        completed.result.isError != true
+        inner.status != 'in_progress'
+        leaf == 'hub_get_performance_stats' ? inner.uptime == '2d' : inner.scheduledJobs.count == 3
+        inner.snapshot.background == true
+        inner.mrtr.continued == true
+        fetches.get() == 1
+        runInMillisCalls.size() == 1
+        script._activeWrites().isEmpty()
+
+        where:
+        [leaf, argumentForm] << [['hub_get_performance_stats', 'hub_get_jobs'],
+            ['omitted', 'null', 'empty map', 'encoded object']].combinations()
+    }
+
+    @spock.lang.Unroll
+    def "malformed gateway inner args #innerArgs remain rejected before any read or continuation"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.useGateways = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 3)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+
+        when:
+        def refused = modernCall('hub_manage_logs', [tool: 'hub_get_performance_stats', args: innerArgs])
+
+        then:
+        refused.error.code == -32602
+        refused.error.message.contains("Gateway arg 'args'")
+        refused.result == null
+        fetches.get() == 0
+        runInMillisCalls.isEmpty()
+        !(atomicStateMap.mrtrRequests instanceof Map) || (atomicStateMap.mrtrRequests as Map).isEmpty()
+        script._activeWrites().isEmpty()
+
+        where:
+        innerArgs << ['not JSON', '[]', 'null', 'true', '42']
+    }
+
+    def "a budgeted hub_get_jobs continues through requestState while its background fetch runs, holding no write slot"() {
+        given: 'the Write master is OFF (a read must not need it) and the write cap is already full'
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = false
+        settingsMap.useGateways = true
+        settingsMap.maxConcurrentWrites = 1
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 120)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        assert script._writeReserveRequest('hub_set_rule', 'legacy').accepted == true
+        def args = [tool: 'hub_get_jobs', args: [cursor: '']]
+
+        when: 'round zero runs the read: the fetch is scheduled and observed, and is still pending'
+        def preflight = modernCall('hub_read_diagnostics', args)
+        String stateId = preflight.result.requestState
+
+        then: 'a requestState is reserved despite the full write cap; nothing ran on the request thread'
+        preflight.error == null
+        preflight.result.resultType == 'input_required'
+        stateId?.startsWith('mrtr-')
+        fetches.get() == 0
+        runInMillisCalls.size() == 1
+        runInMillisCalls[0][0..1] == [50, 'runLogsJsonFetch']
+        script._activeWrites()*.tool == ['hub_set_rule']
+
+        when: 'the client continues while the worker is still queued'
+        def leg1 = modernCall('hub_read_diagnostics', args, stateId)
+
+        then: 'same state, no second worker, still not an active write'
+        leg1.error == null
+        leg1.result.resultType == 'input_required'
+        leg1.result.requestState == stateId
+        fetches.get() == 0
+        runInMillisCalls.size() == 1
+        script._activeWrites()*.tool == ['hub_set_rule']
+
+        when: 'the worker lands the snapshot; five seconds later the client continues'
+        script.runLogsJsonFetch(runInMillisCalls[0][2].data as Map)
+        virtualNow.addAndGet(5000L)
+        def leg2 = modernCall('hub_read_diagnostics', args, stateId)
+        def inner = mcpDriver.parseInner(leg2)
+
+        then: 'one normal complete result, paged, carrying the continuation and snapshot provenance'
+        leg2.error == null
+        leg2.result.resultType == 'complete'
+        !leg2.result.isError
+        fetches.get() == 1
+        inner.scheduledJobs.count == 100
+        inner.scheduledJobs.total == 120
+        inner.nextCursor == '100'
+        inner.snapshot.background == true
+        inner.snapshot.ageMs == 5000
+        inner.mrtr.continued == true
+        inner.mrtr.rounds == 2
+
+        when: 'the final response is replayed under the same state'
+        def replay = mcpDriver.parseInner(modernCall('hub_read_diagnostics', args, stateId))
+        def rec = (atomicStateMap.mrtrRequests as Map)[stateId] as Map
+
+        then: 'the terminal record holds a marker, not the payload; the replay re-reads the cached snapshot; the record expires with that snapshot, clocked from its fetch'
+        replay.scheduledJobs.total == 120
+        replay.nextCursor == '100'
+        fetches.get() == 1
+        rec.status == 'terminal'
+        rec.terminalResult == [__slowReadReplay: true, tool: 'hub_get_jobs']
+        rec.expiresAt == (inner.snapshot.fetchedAt as Long) + 30000L
+        (rec.expiresAt as Long) < (rec.finishedAt as Long) + 30000L
+
+        when: 'the snapshot ages out and the same state is replayed'
+        virtualNow.set((inner.snapshot.fetchedAt as Long) + 30000L)
+        def late = modernCall('hub_read_diagnostics', args, stateId)
+
+        then: 'an expired state, never a refetch or an in_progress inside a completed envelope'
+        late.error.code == -32602
+        late.error.message.contains('expired requestState')
+        fetches.get() == 1
+    }
+
+    def "the sweep caps read and write records separately, so read traffic never evicts a write terminal"() {
+        given: 'sixteen write terminals still inside their replay window, and the read pool full'
+        settingsMap.enableRead = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 1)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        def pool = [:]
+        int writeCap = script._mrtrMaxRecords() as Integer
+        int readCap = script._mrtrMaxReadRecords() as Integer
+        (1..writeCap).each {
+            pool["mrtr-wterm-${it}".toString()] = fakeRecord('hub_set_rule', 1234567890000L - 100000L - it) +
+                [status: 'terminal', terminalResult: [success: true], terminalIsError: false]
+        }
+        (1..readCap).each { pool["mrtr-read-${it}".toString()] = fakeRecord('hub_get_jobs', 1234567890000L - it) }
+        atomicStateMap.mrtrRequests = pool
+        script._writeStateCacheInvalidate()
+
+        when: 'a read arrives (its reserve runs the sweep) and is refused on the read cap'
+        def refused = mcpDriver.parseInner(modernCall('hub_get_performance_stats', [limit: 1]))
+        def after = atomicStateMap.mrtrRequests as Map
+
+        then: 'every write terminal survived; the combined count is over 16 by design'
+        refused.status == 'request_state_capacity'
+        after.keySet().count { it.startsWith('mrtr-wterm-') } == writeCap
+        after.size() == writeCap + readCap
+    }
+
+    def "a budgeted read whose snapshot is already cached answers in one round trip with no request state"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 3)
+        script._logsJsonFetchAndPublish()
+
+        when:
+        def only = modernCall('hub_get_jobs', [cursor: ''])
+        def inner = mcpDriver.parseInner(only)
+
+        then:
+        only.result.resultType == 'complete'
+        inner.scheduledJobs.count == 3
+        inner.snapshot.background == false
+        inner.mrtr == null
+        fetches.get() == 1
+        runInMillisCalls.isEmpty()
+        !(atomicStateMap.mrtrRequests instanceof Map) || (atomicStateMap.mrtrRequests as Map).isEmpty()
+    }
+
+    def "a budgeted read whose fetch lands inside round zero's observe window answers in one round trip"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 2)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            // The platform runs the worker while round zero is still observing.
+            script.runLogsJsonFetch(call[2].data as Map)
+        })
+
+        when:
+        def only = modernCall('hub_get_performance_stats', [limit: 1])
+        def inner = mcpDriver.parseInner(only)
+
+        then:
+        only.result.resultType == 'complete'
+        inner.uptime == '2d'
+        inner.snapshot.background == true
+        fetches.get() == 1
+        !(atomicStateMap.mrtrRequests instanceof Map) || (atomicStateMap.mrtrRequests as Map).isEmpty()
+    }
+
+    private Map fakeRecord(String leaf, long at) {
+        [schemaVersion: 1, status: 'active', outerTool: leaf, leafTool: leaf, argDigest: "d-${at}".toString(),
+         startedAt: at, updatedAt: at, expiresAt: at + 600000L, rounds: 1, generation: 1]
+    }
+
+    def "read and write request-state records are capped separately, so neither class can starve the other"() {
+        given: 'the write pool is full and the read pool is full'
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = true
+        settingsMap.maxConcurrentWrites = 0
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 1)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        def pool = [:]
+        int writeCap = script._mrtrMaxRecords() as Integer
+        int readCap = script._mrtrMaxReadRecords() as Integer
+        (1..writeCap).each { pool["mrtr-write-${it}".toString()] = fakeRecord('hub_set_rule', 1234567890000L - it) }
+        (1..readCap).each { pool["mrtr-read-${it}".toString()] = fakeRecord('hub_get_performance_stats', 1234567890000L - it) }
+        atomicStateMap.mrtrRequests = pool
+        script._writeStateCacheInvalidate()
+
+        when: 'a new read arrives with every read slot active'
+        def readRefused = mcpDriver.parseInner(modernCall('hub_get_jobs', [cursor: '']))
+
+        then: 'it is refused on the READ cap, and the write records were untouched'
+        readRefused.status == 'request_state_capacity'
+        readRefused.limit == readCap
+        (atomicStateMap.mrtrRequests as Map).keySet().count { it.startsWith('mrtr-write-') } == writeCap
+
+        when: 'one read record finishes and a read arrives again'
+        def finished = [:] + (atomicStateMap.mrtrRequests as Map)
+        finished['mrtr-read-1'] = [:] + (finished['mrtr-read-1'] as Map) + [status: 'terminal']
+        atomicStateMap.mrtrRequests = finished
+        script._writeStateCacheInvalidate()
+        def readOk = modernCall('hub_get_jobs', [cursor: ''])
+
+        then: 'the read pool made room among reads only; the full write pool did not block it'
+        readOk.result.resultType == 'input_required'
+        (atomicStateMap.mrtrRequests as Map).keySet().count { it.startsWith('mrtr-write-') } == writeCap
+
+        when: 'a write arrives with every write slot active but read slots available'
+        def freed = [:] + (atomicStateMap.mrtrRequests as Map)
+        freed.remove('mrtr-read-2')
+        atomicStateMap.mrtrRequests = freed
+        script._writeStateCacheInvalidate()
+        def writeRefused = mcpDriver.parseInner(modernCall('hub_call_rule', [ruleId: [401, 402], action: 'stop']))
+
+        then: 'it is refused on the WRITE cap; free read slots do not count for it'
+        writeRefused.status == 'request_state_capacity'
+        writeRefused.limit == writeCap
+    }
+
+    def "a budgeted read whose fetch fails is a terminal isError result, not a successful envelope"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        hubGet.register('/logs/json') { params -> throw new RuntimeException('logs page 500') }
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        def args = [type: 'app', limit: 1]
+
+        when:
+        String stateId = modernCall('hub_get_performance_stats', args).result.requestState
+        script.runLogsJsonFetch(runInMillisCalls[0][2].data as Map)
+        def terminal = modernCall('hub_get_performance_stats', args, stateId)
+        def rec = (atomicStateMap.mrtrRequests as Map)[stateId] as Map
+
+        then:
+        terminal.result.resultType == 'complete'
+        terminal.result.isError == true
+        mcpDriver.parseInner(terminal).error.contains('logs page 500')
+        rec.terminalIsError == true
+        rec.terminalResult.isError == true
+    }
+
+    def "a read whose worker never lands ends with a read-specific timeout terminal, never the write cap text"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 1)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        def args = [cursor: '']
+
+        when: 'the client keeps continuing while the worker stays queued'
+        String stateId = modernCall('hub_get_jobs', args).result.requestState
+        def legs = []
+        int cap = script._mrtrMaxContinuationSlices() as Integer
+        (1..cap).each { legs << modernCall('hub_get_jobs', args, stateId) }
+        def last = legs[-1]
+        def inner = mcpDriver.parseInner(last)
+
+        then: 'every leg but the last continued; round zero plus the legs observed well past the fetch timeout'
+        legs[0..-2].every { it.result.resultType == 'input_required' }
+        last.result.resultType == 'complete'
+        last.result.isError == true
+        inner.status == 'slow_read_timeout'
+        inner.note.contains('No hub state was changed')
+        !inner.note.contains('committed')
+        inner.mrtr.rounds == cap
+        virtualNow.get() - 1234567890000L >= 30000L
+        fetches.get() == 0
+        runInMillisCalls.size() == 1
+
+        when: 'the worker finally lands and the client starts a fresh identical call'
+        script.runLogsJsonFetch(runInMillisCalls[0][2].data as Map)
+        String fresh = modernCall('hub_get_jobs', args).result.requestState
+        def served = mcpDriver.parseInner(modernCall('hub_get_jobs', args, fresh))
+
+        then:
+        served.scheduledJobs.count == 1
+        fetches.get() == 1
+    }
+
+    def "a read preflight is refused when the Read master is off and reserves no request state"() {
+        given:
+        settingsMap.enableRead = false
+        settingsMap.enableWrite = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+
+        when:
+        def refused = modernCall('hub_get_performance_stats', [limit: 5])
+
+        then:
+        refused.error == null
+        refused.result.isError == true
+        mcpDriver.parseInner(refused).error.contains('Read tools are disabled')
+        !(atomicStateMap.mrtrRequests instanceof Map) || (atomicStateMap.mrtrRequests as Map).isEmpty()
+    }
+
+    def "an unbudgeted read is not continuation-eligible: one modern call, inline fetch, no worker"() {
+        given:
+        settingsMap.enableRead = true
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 2)
+
+        when:
+        def only = modernCall('hub_get_performance_stats', [type: 'app', limit: 1])
+
+        then:
+        only.result.resultType == 'complete'
+        fetches.get() == 1
+        runInMillisCalls.isEmpty()
+        mcpDriver.parseInner(only).uptime == '2d'
+        !(atomicStateMap.mrtrRequests instanceof Map) || (atomicStateMap.mrtrRequests as Map).isEmpty()
+    }
+
+    def "the mandatory best-practice gate never blocks a read preflight, and still blocks a write one"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = true
+        settingsMap.enableMandatoryBPS = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+
+        when: 'a read with no bestPracticeKey'
+        def read = modernCall('hub_get_jobs', [cursor: ''])
+
+        then:
+        read.error == null
+        read.result.resultType in ['input_required', 'complete']
+        !read.result.isError
+
+        when: 'a write with no bestPracticeKey'
+        def write = modernCall('hub_call_rule', [ruleId: [401, 402], action: 'stop'])
+
+        then:
+        write.result.isError == true
+        mcpDriver.parseInner(write).error.contains('Mandatory best-practice acknowledgment')
+    }
+
+    def "modern gateway preflight validation refusal is error logged without reserving or executing"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = true
+        settingsMap.enableMandatoryBPS = true
+        settingsMap.useGateways = true
+        def executions = []
+        script.metaClass.toolRunRmRule = { a -> executions << new LinkedHashMap(a); [success: true] }
+        def args = [tool: 'hub_call_rule', args: [ruleId: [401, 402], action: 'stop']]
+        def observations = [:]
+
+        when:
+        ['error', 'debug'].each { threshold ->
+            settingsMap.mcpLogLevel = threshold
+            def buffer = script.initDebugLogs()
+            buffer.entries.clear()
+            script.log.messages.clear()
+            def response = modernCall('hub_manage_native_rules_and_apps', args)
+            def visible = script.toolGetHubLogs([mode: 'mcp', level: 'error', component: 'server'])
+            observations[threshold] = [response: response, visible: visible,
+                                       nativeLines: new ArrayList(script.log.messages)]
+        }
+
+        then:
+        observations.error.response.result.isError == true
+        mcpDriver.parseInner(observations.error.response).error == mcpDriver.parseInner(observations.debug.response).error
+        mcpDriver.parseInner(observations.error.response).error.contains('Mandatory best-practice acknowledgment')
+        observations.values().every { observation ->
+            observation.visible.entries.size() == 1 &&
+                observation.visible.entries[0].level == 'error' &&
+                observation.visible.entries[0].details.tool == 'hub_call_rule' &&
+                observation.visible.entries[0].details.gateway == 'hub_manage_native_rules_and_apps' &&
+                observation.nativeLines.any { it.startsWith('error:') }
+        }
+        executions.isEmpty()
+        !(atomicStateMap.mrtrRequests instanceof Map) || (atomicStateMap.mrtrRequests as Map).isEmpty()
+    }
+
+    def "continuation-eligible write surfaces and the server instructions carry the client-error hint in #mode mode"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = gateways
+        String hint = script._mrtrClientErrorHint() as String
+
+        when:
+        def tools = script.getToolDefinitions() as List
+        def byName = tools.collectEntries { [(it.name): it] }
+
+        Set writeLeaves = script._mrtrWriteTools() as Set
+        Map gatewayConfig = script.getGatewayConfig() as Map
+        // Every advertised surface that IS a continuation write, or a gateway that exposes one.
+        List expectedHinted = gateways
+            ? tools*.name.findAll { String n ->
+                writeLeaves.contains(n) || (gatewayConfig[n]?.tools ?: []).any { writeLeaves.contains(it) } }
+            : []
+
+        then: 'the instructions always carry the hint; gateway surfaces carry it exactly once, the size-capped flat catalog does not'
+        hint.contains('Read the target before repeating')
+        !hint.contains('joins')
+        (script.serverInstructions() as String).count(hint) == 1
+        !expectedHinted.isEmpty() == gateways
+        expectedHinted.every { (byName[it].description as String).count(hint) == 1 &&
+            (byName[it].description as String).endsWith(hint) }
+        (tools*.name - expectedHinted).every { !(byName[it].description as String).contains(hint) }
+        unhinted.every { byName[it] != null && !(byName[it].description as String).contains(hint) }
+        tools.findAll { (it.description as String).contains(hint) }.every {
+            it.annotations?.readOnlyHint != true
+        }
+
+        where:
+        mode      | gateways | unhinted
+        'gateway' | true     | ['hub_read_devices', 'hub_read_rules', 'hub_get_info', 'hub_manage_mode']
+        'flat'    | false    | ['hub_manage_virtual_device', 'hub_update_device', 'hub_set_rule',
+                               'hub_get_info', 'hub_list_devices', 'hub_call_device_command']
+    }
+
+    def "an identical call after the write completed is a new operation, not a replay"() {
+        given:
+        settingsMap.enableWrite = true
+        def ran = new AtomicInteger(0)
+        script.metaClass.toolRunRmRule = { Map a ->
+            ran.incrementAndGet()
+            [success: true, ruleIds: a.ruleId, results: a.ruleId.collect { [success: true, ruleId: it] }]
+        }
+        def args = [ruleId: [61, 62], action: 'stop']
+
+        when:
+        def first = modernCall('hub_call_rule', args)
+        def repeat = modernCall('hub_call_rule', args)
+
+        then: 'the terminal record is not a coalescing target; the client-error hint tells models to read first'
+        first.result.resultType == 'complete'
+        repeat.result.resultType == 'complete'
+        !repeat.result.containsKey('rejoined')
+        ran.get() == 2
+        (atomicStateMap.mrtrRequests as Map).size() == 2
+    }
+
+    def "a coalescing slow read carries the rejoined marker on its state-only reply"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 2)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        def args = [cursor: '']
+
+        when: 'the fetch is queued but not landed, and an identical read arrives'
+        def first = modernCall('hub_get_jobs', args)
+        def duplicate = modernCall('hub_get_jobs', args)
+
+        then:
+        first.result.resultType == 'input_required'
+        !first.result.containsKey('rejoined')
+        duplicate.result.resultType == 'input_required'
+        duplicate.result.requestState == first.result.requestState
+        duplicate.result.rejoined == true
+        runInMillisCalls.size() == 1
+    }
+
+    def "a rejoined call that observes the original finishing gets its result marked rejoined"() {
+        given:
+        settingsMap.enableWrite = true
+        mcpDriver.pushHeaders([
+            'MCP-Protocol-Version': '2026-07-28',
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': 'hub_call_rule'
+        ])
+        def entered = new CountDownLatch(1)
+        def release = new CountDownLatch(1)
+        def ran = new AtomicInteger(0)
+        script.metaClass.toolRunRmRule = { Map a ->
+            ran.incrementAndGet()
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            [success: true, ruleIds: a.ruleId, results: a.ruleId.collect { [success: true, ruleId: it] }]
+        }
+        // The duplicate's contention wait releases the owner on its first pause and waits
+        // for it to finish, so the next claim observes the retained terminal result.
+        def ownerDone = new CountDownLatch(1)
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms ->
+            release.countDown()
+            ownerDone.await(5, TimeUnit.SECONDS)
+        })
+        def args = [ruleId: [71, 72], action: 'stop']
+        def winner = new AtomicReference()
+        def failure = new AtomicReference()
+        Thread first = Thread.start {
+            try { winner.set(directCall(script, 2201, 'hub_call_rule', args)) }
+            catch (Throwable t) { failure.set(t) }
+            finally { ownerDone.countDown() }
+        }
+
+        when:
+        assert entered.await(5, TimeUnit.SECONDS)
+        def duplicate = directCall(script, 2202, 'hub_call_rule', args)
+        first.join(5000)
+        def duplicateInner = mcpDriver.parseInner(duplicate)
+
+        then: 'one execution; the duplicate receives the retained outcome and knows it did not run'
+        !first.alive
+        failure.get() == null
+        ran.get() == 1
+        winner.get().result.resultType == 'complete'
+        duplicate.result.resultType == 'complete'
+        duplicateInner.rejoined == true
+        duplicateInner.success == true
+
+        and: 'the marker is on the duplicate\'s copy only: the owner and the retained terminal stay unmarked'
+        mcpDriver.parseInner(winner.get()).rejoined == null
+        ((atomicStateMap.mrtrRequests as Map).values().first() as Map).terminalResult.rejoined == null
+
+        cleanup:
+        release.countDown()
+        first?.join(5000)
+    }
+
+
+    private List autoContinueJobs() { runInCalls.findAll { it[1] == 'runMrtrAutoContinue' } }
+
+    def "the server resumes a checkpointed detached write when no client request does"() {
+        given:
+        settingsMap.enableWrite = true
+        def leafCalls = new AtomicInteger(0)
+        script.metaClass.toolSetRule = { Map actual ->
+            leafCalls.incrementAndGet() == 1
+                ? [success: false, partial: true, status: 'in_progress', stepsRemaining: [[name: 'finish']], appId: actual.appId]
+                : [success: true, appId: actual.appId, settingsApplied: true]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+        def args = [appId: 331, confirm: true, settings: [description: 'two slices']]
+
+        when: 'the first request runs slice one and pauses at the checkpoint'
+        def first = modernCall('hub_set_rule', args)
+        String stateId = first.result.requestState
+        def jobs = autoContinueJobs()
+
+        then: 'a server-side continuation is scheduled for exactly that generation'
+        first.result.resultType == 'input_required'
+        leafCalls.get() == 1
+        jobs.size() == 1
+        jobs[0][0] == script._mrtrAutoContinueDelaySeconds()
+        jobs[0][2].overwrite == false
+        jobs[0][2].data == [stateId: stateId, generation: 1]
+
+        when: 'no client request arrives and the job fires'
+        script.runMrtrAutoContinue(new LinkedHashMap(jobs[0][2].data as Map))
+        def replay = modernCall('hub_set_rule', args, stateId)
+        def inner = mcpDriver.parseInner(replay)
+
+        then: 'the remainder ran once and a late client request gets the finished result'
+        leafCalls.get() == 2
+        runInMillisCalls.size() == 2
+        replay.result.resultType == 'complete'
+        inner.success == true
+        inner.mrtr.rounds == 2
+        autoContinueJobs().size() == 1
+    }
+
+    def "the server-side continuation does nothing once a client request has resumed"() {
+        given:
+        settingsMap.enableWrite = true
+        def leafCalls = new AtomicInteger(0)
+        script.metaClass.toolSetRule = { Map actual ->
+            leafCalls.incrementAndGet() == 1
+                ? [success: false, partial: true, status: 'in_progress', stepsRemaining: [[name: 'finish']], appId: actual.appId]
+                : [success: true, appId: actual.appId]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+        def args = [appId: 332, confirm: true, settings: [description: 'client resumes']]
+        String stateId = modernCall('hub_set_rule', args).result.requestState
+        Map job = new LinkedHashMap(autoContinueJobs()[0][2].data as Map)
+
+        when: 'the client continues first, then the stale job fires'
+        def complete = modernCall('hub_set_rule', args, stateId)
+        script.runMrtrAutoContinue(job)
+
+        then:
+        complete.result.resultType == 'complete'
+        leafCalls.get() == 2
+        runInMillisCalls.size() == 2
+        (atomicStateMap.mrtrRequests as Map)[stateId].status == 'terminal'
+    }
+
+    def "the server resumes a paused synchronous multi-rule write inline"() {
+        given:
+        settingsMap.enableWrite = true
+        def ranWith = []
+        script.metaClass.toolRunRmRule = { Map a ->
+            ranWith << new LinkedHashMap(a)
+            ranWith.size() == 1
+                ? [success: false, partial: true, ruleIds: [81, 82], results: [[success: true, ruleId: 81]], remainingRuleIds: [82]]
+                : [success: true, partial: false, ruleIds: [82], results: [[success: true, ruleId: 82]]]
+        }
+        def args = [ruleId: [81, 82], action: 'stop']
+
+        when:
+        def first = modernCall('hub_call_rule', args)
+        String stateId = first.result.requestState
+        def jobs = autoContinueJobs()
+        script.runMrtrAutoContinue(new LinkedHashMap(jobs[0][2].data as Map))
+        def replay = modernCall('hub_call_rule', args, stateId)
+        def inner = mcpDriver.parseInner(replay)
+
+        then:
+        first.result.resultType == 'input_required'
+        jobs.size() == 1
+        ranWith.size() == 2
+        ranWith[1].ruleId == [82]
+        !ranWith[1].containsKey('__reqT0')
+        replay.result.resultType == 'complete'
+        inner.success == true
+        inner.results*.ruleId == [81, 82]
+        inner.mrtr.rounds == 2
+    }
+
+    def "an expired or already-terminal record is not resumed by the server"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+        def args = [ruleId: [91, 92], action: 'stop']
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        Map job = new LinkedHashMap(autoContinueJobs()[0][2].data as Map)
+        int ranBefore = 0
+        script.metaClass.toolRunRmRule = { Map a -> ranBefore++; [success: true] }
+
+        when: 'the record expired while nobody resumed it'
+        atomicStateMap.mrtrRequests[stateId].expiresAt = 1L
+        script._writeStateCacheInvalidate()
+        script.runMrtrAutoContinue(job)
+
+        then:
+        ranBefore == 0
+    }
+
+    def "a validation refusal keeps the rejoined marker on both rendering paths"() {
+        given: 'the marker is set by the reservation, then a post-claim gate refuses the call'
+        settingsMap.enableWrite = true
+
+        when: 'the shared validation renderer is told the call had coalesced'
+        def refusal = mcpDriver.decodeToolCallResponse(script._renderValidationError(
+            41, 'hub_call_rule', 'hub_call_rule', [ruleId: [95, 96], action: 'stop'],
+            'Write tools are disabled.', true) as Map)
+
+        then: 'it is a validation result that still identifies itself as a rejoin'
+        refusal.error == null
+        refusal.result.isError == true
+        mcpDriver.parseInner(refusal).rejoined == true
+        mcpDriver.parseInner(refusal).error.contains('Write tools are disabled')
+
+        when: 'a terminal device-validation result carrying the marker is re-rendered'
+        def device = mcpDriver.decodeToolCallResponse(script._renderToolResult(
+            42, 'hub_manage_virtual_device', 'hub_manage_virtual_device', [confirm: true],
+            [__deviceValidation: 'Device not found: 999', rejoined: true], true) as Map)
+
+        then: 'the recursive render preserves it too'
+        device.error == null
+        device.result.isError == true
+        mcpDriver.parseInner(device).rejoined == true
+        mcpDriver.parseInner(device).error.contains('Device not found: 999')
+
+        and: 'a protocol fault is unaffected by the marker and stays a JSON-RPC error'
+        script._renderValidationError(43, 'hub_call_rule', 'hub_call_rule', [:],
+            'Unknown tool: nope', true).error.code == -32602
+    }
+
+    def "a capped terminal that cannot be stored says it is not replayable"() {
+        given: 'a bulk edit one slice below the cap whose record vanishes before storage'
+        settingsMap.enableWrite = true
+        Map claim = [claimId: 'cap-unstorable', generation: 1]
+        Map rec = [status: 'active', claimId: 'cap-unstorable', claimedGeneration: 1, generation: 1,
+                   rounds: script._mrtrMaxContinuationSlices() - 1,
+                   outerTool: 'hub_manage_rule_machine', leafTool: 'hub_call_rule',
+                   startedAt: script.now(), expiresAt: script.now() + 60000L,
+                   aggregate: [kind: 'call_rule', results: [[ruleId: 11, success: true]], ruleIds: [11]]]
+        atomicStateMap.mrtrRequests = ['cap-unstorable': rec]
+        script._writeStateCacheInvalidate()
+        // The durable record is gone by the time the cap tries to retain its outcome, so the
+        // real _mrtrStoreTerminal cannot own it. Stubbing is not an option: it is private, and
+        // Groovy dispatches an internal call to a private method without the metaClass.
+        atomicStateMap.mrtrRequests = [:]
+        script._writeStateCacheInvalidate()
+        Map execArgs = [tool: 'hub_call_rule', args: [ruleId: [13, 14], action: 'stop']]
+        Map slice = [success: true, ruleIds: [13, 14], results: [[ruleId: 13, success: true]],
+                     remainingRuleIds: [14], partial: true]
+
+        when:
+        def outcome = script._mrtrCommitSlice('cap-unstorable', rec, claim, execArgs, slice)
+
+        then: 'the ledger still comes back, and the caller is told the state will not replay it'
+        outcome.outcome == 'terminal'
+        outcome.result.status == 'continuation_limit'
+        outcome.result.results*.ruleId.collect { it.toString() } == ['11', '13']
+        outcome.result.note.contains('could not be retained for replay')
+    }
+
+    def "a failed auto-continue schedule retries once before giving up"() {
+        given:
+        settingsMap.enableWrite = true
+        def attempts = []
+        RUN_IN_OVERRIDE.set({ List call -> attempts << call; throw new IllegalStateException('scheduler saturated') })
+
+        when:
+        script._mrtrScheduleAutoContinue('mrtr-sched-retry-0001',
+            [leafTool: 'hub_set_rule', generation: 2, nextArguments: [appId: 1, confirm: true]])
+
+        then: 'two bounded attempts at increasing delays, then it stops'
+        attempts.size() == 2
+        attempts*.getAt(1) == ['runMrtrAutoContinue', 'runMrtrAutoContinue']
+        attempts[0][0] == script._mrtrAutoContinueDelaySeconds()
+        attempts[1][0] == script._mrtrAutoContinueDelaySeconds() * 2
+        attempts.every { it[2].data == [stateId: 'mrtr-sched-retry-0001', generation: 2] }
+
+        cleanup:
+        RUN_IN_OVERRIDE.set(null)
+    }
+
+    def "a paused slow read schedules no server-side continuation"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.relayBudgetMs = 6000
+        script.metaClass._isCloudRequest = { -> true }
+        def fetches = new AtomicInteger(0)
+        registerLogsJson(fetches, 3)
+        def virtualNow = new AtomicLong(1234567890000L)
+        NOW_OVERRIDE.set({ -> virtualNow.get() })
+        PAUSE_EXECUTION_OVERRIDE.set({ Long ms -> virtualNow.addAndGet(ms) })
+        def args = [cursor: '']
+
+        when: 'the fetch is still pending, so the read pauses with a checkpoint'
+        def first = modernCall('hub_get_jobs', args)
+        def paused = modernCall('hub_get_jobs', args, first.result.requestState as String)
+
+        then: 'the read waits for its own background fetch, not for a resumption job'
+        paused.result.resultType == 'input_required'
+        autoContinueJobs().isEmpty()
+        runInMillisCalls.count { it[1] == 'runLogsJsonFetch' } == 1
+    }
+
+    def "every continuation-eligible read is a canonical read-only tool"() {
+        expect:
+        (script._mrtrReadTools() as Set).every { (script.getReadOnlyToolNames() as Set).contains(it) }
+        (script._mrtrReadTools() as Set).every { (script._budgetAwareTools() as Set).contains(it) }
+        (script._mrtrReadTools() as Set).intersect(script._mrtrWriteTools() as Set).isEmpty()
+    }
+
+
+    /** First call pauses with a remainder; the second throws whatever the caller hands in. */
+    private Closure pauseThenThrow(Throwable failure) {
+        int calls = 0
+        return { Map a ->
+            if (++calls == 1) {
+                return [success: false, partial: true, ruleIds: a.ruleId,
+                        results: [[success: true, ruleId: a.ruleId[0]]], remainingRuleIds: a.ruleId.drop(1)]
+            }
+            throw failure
+        }
+    }
+
+    def "a first slice whose record vanishes before commit reports its real result, not a failure"() {
+        given: 'a multi-rule write whose leaf sweeps the durable record while it runs'
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = { Map a ->
+            atomicStateMap.mrtrRequests = [:]
+            script._writeStateCacheInvalidate()
+            [success: false, partial: true, ruleIds: a.ruleId,
+             results: [[success: true, ruleId: a.ruleId[0]]], remainingRuleIds: a.ruleId.drop(1)]
+        }
+
+        when:
+        def response = modernCall('hub_call_rule', [ruleId: [61, 62], action: 'stop'])
+        def inner = mcpDriver.parseInner(response)
+
+        then: 'the slice outcome comes back with the loss stated, instead of a generic failure'
+        response.error == null
+        response.result.resultType == 'complete'
+        inner.results*.ruleId == [61]
+        inner.note.contains('continuation record was lost')
+        !inner.containsKey('rejoined')
+        !(inner.error?.toString()?.startsWith('Tool error'))
+
+        and: 'the paused remainder never ran, so the operation is reported unfinished, not done'
+        response.result.isError == true
+        inner.success == false
+        inner.remainingRuleIds == [62]
+        inner.note.contains('Do not repeat the whole operation')
+    }
+
+    def "a validation refusal on a later slice hands back the committed ledger"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pauseThenThrow(new IllegalArgumentException('Rule 72 is locked by another editor'))
+        def args = [ruleId: [71, 72], action: 'stop']
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+
+        when:
+        def response = modernCall('hub_call_rule', args, stateId)
+        def inner = mcpDriver.parseInner(response)
+
+        then: 'the refusal is a validation result that still carries what already committed'
+        response.error == null
+        response.result.isError == true
+        inner.error.contains('Rule 72 is locked')
+        inner.aggregate.results*.ruleId == [71]
+        inner.note.contains('Do not repeat the whole operation')
+        (atomicStateMap.mrtrRequests as Map)[stateId].status == 'abandoned'
+    }
+
+    def "a runtime failure on a later request-path slice hands back the committed ledger"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pauseThenThrow(new RuntimeException('hub timed out'))
+        def args = [ruleId: [75, 76], action: 'stop']
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+
+        when:
+        def response = modernCall('hub_call_rule', args, stateId)
+        def inner = mcpDriver.parseInner(response)
+
+        then:
+        response.error == null
+        response.result.isError == true
+        inner.error.contains('Tool error: hub timed out')
+        inner.aggregate.results*.ruleId == [75]
+        inner.note.contains('Do not repeat the whole operation')
+    }
+
+    def "a server-side continuation the leaf refuses stores the refusal with its ledger for the client"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pauseThenThrow(new IllegalArgumentException('Rule 74 is locked by another editor'))
+        def args = [ruleId: [73, 74], action: 'stop']
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        Map job = new LinkedHashMap(autoContinueJobs()[0][2].data as Map)
+
+        when: 'nobody has a request in flight, so the stored terminal is the only channel'
+        script.runMrtrAutoContinue(job)
+        def stored = new LinkedHashMap((atomicStateMap.mrtrRequests as Map)[stateId] as Map)
+        def replay = modernCall('hub_call_rule', args, stateId)
+        def inner = mcpDriver.parseInner(replay)
+
+        then:
+        stored.status == 'terminal'
+        stored.terminalIsError == true
+        replay.error == null
+        replay.result.isError == true
+        inner.error.contains('Rule 74 is locked')
+        inner.aggregate.results*.ruleId == [73]
+        inner.note.contains('Do not repeat the whole operation')
+    }
+
+    def "a server-side continuation that fails at runtime stores the failure with its ledger"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pauseThenThrow(new RuntimeException('hub timed out'))
+        def args = [ruleId: [77, 78], action: 'stop']
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        Map job = new LinkedHashMap(autoContinueJobs()[0][2].data as Map)
+
+        when:
+        script.runMrtrAutoContinue(job)
+        def replay = modernCall('hub_call_rule', args, stateId)
+        def inner = mcpDriver.parseInner(replay)
+
+        then:
+        (atomicStateMap.mrtrRequests as Map)[stateId].status == 'terminal'
+        replay.result.isError == true
+        inner.error.contains('Tool error: hub timed out')
+        inner.aggregate.results*.ruleId == [77]
+        inner.note.contains('Do not repeat the whole operation')
+    }
+
+    def "a stale server-side continuation job does not run a slice the client has already advanced past"() {
+        given: 'a three-rule write paused at generation 1, then resumed by the client to generation 2'
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+        def args = [ruleId: [51, 52, 53], action: 'stop']
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        Map staleJob = new LinkedHashMap(autoContinueJobs()[0][2].data as Map)
+        def second = modernCall('hub_call_rule', args, stateId)
+        int ranAfter = 0
+        Closure pausing = pausingMultiRuleWrite()
+        script.metaClass.toolRunRmRule = { Map a -> ranAfter++; pausing(a) }
+
+        when: 'the generation-1 job fires late'
+        script.runMrtrAutoContinue(staleJob)
+
+        then: 'it runs nothing: the record is at generation 2 and a stale job may not claim it'
+        second.result.resultType == 'input_required'
+        ranAfter == 0
+        (atomicStateMap.mrtrRequests as Map)[stateId].status == 'active'
+        autoContinueJobs().size() == 2
+
+        when: 'the generation-2 job is the one entitled to resume'
+        script.runMrtrAutoContinue(new LinkedHashMap(autoContinueJobs()[1][2].data as Map))
+
+        then:
+        ranAfter == 1
+    }
+
+    def "a gateway whose continuation writes are all hidden advertises no client-error hint"() {
+        given:
+        settingsMap.enableRead = true
+        settingsMap.enableWrite = true
+        settingsMap.useGateways = true
+        Set writeLeaves = script._mrtrWriteTools() as Set
+        List gatewayWrites = ((script.getGatewayConfig() as Map)['hub_manage_devices'].tools as List)
+            .findAll { writeLeaves.contains(it) }
+        script.metaClass.getHiddenToolNames = { -> gatewayWrites as Set }
+        String hint = script._mrtrClientErrorHint() as String
+
+        when:
+        def byName = (script.getToolDefinitions() as List).collectEntries { [(it.name): it] }
+        def gateway = byName['hub_manage_devices']
+
+        then: 'the gateway is still advertised for its reads but exposes no write surface to hint about'
+        !gatewayWrites.isEmpty()
+        gateway != null
+        !(gateway.inputSchema.properties.tool.enum as List).any { writeLeaves.contains(it) }
+        !(gateway.description as String).contains(hint)
+    }
+
+    def "a capped slow read that cannot be stored says it is not replayable"() {
+        given: 'a slow read one slice below the cap whose record vanishes before storage'
+        settingsMap.enableRead = true
+        Map claim = [claimId: 'read-cap-unstorable', generation: 1]
+        Map rec = [status: 'active', claimId: 'read-cap-unstorable', claimedGeneration: 1, generation: 1,
+                   rounds: script._mrtrMaxContinuationSlices() - 1,
+                   outerTool: 'hub_get_jobs', leafTool: 'hub_get_jobs',
+                   startedAt: script.now(), expiresAt: script.now() + 60000L]
+        atomicStateMap.mrtrRequests = ['read-cap-unstorable': rec]
+        script._writeStateCacheInvalidate()
+        // Same technique as the write cap: the durable record is gone before the cap stores it.
+        atomicStateMap.mrtrRequests = [:]
+        script._writeStateCacheInvalidate()
+
+        when:
+        def outcome = script._mrtrCommitSlice('read-cap-unstorable', rec, claim, [:],
+            [status: 'in_progress', tool: 'hub_get_jobs'])
+
+        then: 'the timeout still comes back, and the caller is told the state will not replay it'
+        outcome.outcome == 'terminal'
+        outcome.result.status == 'slow_read_timeout'
+        outcome.result.note.contains('could not be retained for replay')
+    }
+
+    def "a clone whose record vanishes at its first checkpoint returns a clean error, never the checkpoint"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            nativeRuleConfig(100, 'Source Rule', 21)
+        }
+        hubGet.register('/apps/api/4242/app/100') { params -> '<html>source-context</html>' }
+        hubGet.register('/installedapp/configure/json/4242/main') { params ->
+            clonerPageState('importRule', 0)
+        }
+        int parentReads = 0
+        hubGet.register('/installedapp/configure/json/21') { params ->
+            parentReads++
+            parentReads == 1
+                ? nativeParentConfig(21, [[id: 100, label: 'Source Rule']])
+                : nativeParentConfig(21, [[id: 100, label: 'Source Rule'],
+                                          [id: 250, label: 'Source Rule clone']])
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            // The cloner is being initialized, i.e. the first slice is mid-flight: sweep the
+            // durable record so the checkpoint has nowhere to go.
+            atomicStateMap.mrtrRequests = [:]
+            script._writeStateCacheInvalidate()
+            [status: 302, location: '/apps/api/4242/app/100', data: '']
+        }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: decodeForm(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        def args = [sourceAppId: 100, confirm: true]
+
+        when:
+        def response = modernCall('hub_clone_native_app', args)
+        String wire = groovy.json.JsonOutput.toJson(response)
+        def inner = mcpDriver.parseInner(response)
+
+        then: 'an unfinished operation, reported as such'
+        response.error == null
+        response.result.resultType == 'complete'
+        response.result.isError == true
+        inner.success == false
+        inner.tool == 'hub_clone_native_app'
+        inner.error.contains('clone_native_app checkpoint')
+        inner.note.contains('continuation record was lost')
+
+        and: 'no control sentinel or checkpoint internals reach the client'
+        !inner.containsKey('__mrtrContinue')
+        !wire.contains('__mrtrContinue')
+        !wire.contains('clonerAppId')
+        !wire.contains('preIds')
+    }
+
+    def "a state-only reply and an unresumed expiry are visible in the MCP log without debug logging"() {
+        given: 'the default operator level, not debug'
+        settingsMap.enableWrite = true
+        settingsMap.mcpLogLevel = 'info'
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+        def args = [ruleId: [95, 96], action: 'stop']
+
+        when: 'the first slice pauses'
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        def pendingLine = script.getDebugLogEntries().find {
+            it.message?.toString()?.contains("returned requestState ${stateId}") }
+
+        then: 'an info line names the tool, the state and what a client should do'
+        pendingLine != null
+        pendingLine.level == 'info'
+        pendingLine.message.toString().startsWith('hub_call_rule:')
+        pendingLine.message.toString().contains('this slice finished with work remaining')
+        pendingLine.message.toString().contains('read the target before repeating')
+
+        when: 'nobody resumes it and the record expires'
+        atomicStateMap.mrtrRequests[stateId].expiresAt = 1L
+        script._writeStateCacheInvalidate()
+        script.runMrtrCleanup()
+        def expiredLine = script.getDebugLogEntries().find {
+            it.message?.toString()?.contains("requestState ${stateId} expired without being resumed") }
+
+        then: 'a warn line says the remainder never ran'
+        expiredLine != null
+        expiredLine.level == 'warn'
+        expiredLine.message.toString().startsWith('hub_call_rule:')
+        expiredLine.message.toString().contains('1 slice(s) had committed')
+    }
+
+    def "a clone that no client ever resumes is finished by the server's own continuation"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+        hubGet.register('/installedapp/configure/json/100') { params ->
+            nativeRuleConfig(100, 'Source Rule', 21)
+        }
+        hubGet.register('/apps/api/4242/app/100') { params -> '<html>source-context</html>' }
+        hubGet.register('/installedapp/configure/json/4242/main') { params ->
+            clonerPageState('importRule', 0)
+        }
+        int parentReads = 0
+        hubGet.register('/installedapp/configure/json/21') { params ->
+            parentReads++
+            parentReads == 1
+                ? nativeParentConfig(21, [[id: 100, label: 'Source Rule']])
+                : nativeParentConfig(21, [[id: 100, label: 'Source Rule'],
+                                          [id: 250, label: 'Source Rule clone']])
+        }
+        script.metaClass.hubInternalGetRaw = { String path, Map query = null, Integer timeout = 30 ->
+            [status: 302, location: '/apps/api/4242/app/100', data: '']
+        }
+        def posts = []
+        script.metaClass.hubInternalPostForm = { String path, Map body, Integer timeout = 420 ->
+            posts << [path: path, body: new LinkedHashMap(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        script.metaClass.hubInternalPostFormRaw = { String path, String body, Integer timeout = 420 ->
+            posts << [path: path, body: decodeForm(body)]
+            [status: 200, location: null, data: '{"status":"success"}']
+        }
+        def args = [sourceAppId: 100, confirm: true]
+
+        when: 'the first request checkpoints; each server-side job runs the next phase'
+        def initialized = modernCall('hub_clone_native_app', args)
+        String requestState = initialized.result.requestState
+        int fired = 0
+        while (fired < 6 && autoContinueJobs().size() > fired) {
+            script.runMrtrAutoContinue(new LinkedHashMap(autoContinueJobs()[fired][2].data as Map))
+            fired++
+        }
+        def cloneClicks = posts.findAll { it.path == '/installedapp/btn' && it.body.name == 'cloneRuleButton' }
+        def replay = modernCall('hub_clone_native_app', args, requestState)
+        def inner = mcpDriver.parseInner(replay)
+
+        then: 'the clone landed without a single state-bearing client request'
+        initialized.result.resultType == 'input_required'
+        fired >= 2
+        cloneClicks.size() == 2
+        posts.any { it.path == '/installedapp/btn' && it.body.name == 'importNow' }
+        atomicStateMap.mrtrRequests[requestState].status == 'terminal'
+        replay.result.resultType == 'complete'
+        inner.success == true
+        inner.newAppId == 250
+    }
+
+    def "hub_get_info recentWrites reports a paused, then finished, continuation write"() {
+        given:
+        settingsMap.enableWrite = true
+        script.metaClass.toolRunRmRule = pausingMultiRuleWrite()
+        def args = [ruleId: [97, 98], action: 'stop']
+
+        when: 'the first slice pauses'
+        String stateId = modernCall('hub_call_rule', args).result.requestState
+        List paused = script._mrtrRecentOperations() as List
+
+        then:
+        paused.size() == 1
+        paused[0].tool == 'hub_call_rule'
+        paused[0].status == 'paused_resuming'
+        paused[0].slices == 1
+
+        when: 'the server finishes it'
+        script.metaClass.toolRunRmRule = { Map a -> [success: true, ruleIds: a.ruleId, results: a.ruleId.collect { [success: true, ruleId: it] }] }
+        script.runMrtrAutoContinue(new LinkedHashMap(autoContinueJobs()[0][2].data as Map))
+        List done = script._mrtrRecentOperations() as List
+
+        then:
+        done.size() == 1
+        done[0].status == 'finished'
+        done[0].success == true
+        (atomicStateMap.mrtrRequests as Map)[stateId].status == 'terminal'
+    }
+
+    def "a bulk trigger stop in a later slice is restated in the original request's trigger indices"() {
+        given: 'two triggers ran in earlier slices; this slice fails its second trigger'
+        String stopText = 'not attempted: bulk stopped after addTriggers[1] failed or was partial'
+        Map rec = [aggregate: [kind: 'bulk_edit', triggers: [[success: true], [success: true]], actions: []]]
+        Map lastSlice = [success: false, partial: true, bulkStoppedAfter: 'addTriggers[1]', finalisationNotAttempted: true,
+                         error: 'Stopped after addTriggers[1] failed: boom. Later items were not attempted and finalisation was not fired.',
+                         repairHints: ['Stopped fail-closed after addTriggers[1]: later items were not attempted.'],
+                         triggers: [[success: true], [success: false, error: 'boom'],
+                                    [success: false, notAttempted: true, error: stopText]],
+                         actions: [[success: false, notAttempted: true, error: stopText]]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then: 'every reference names trigger 3 of the original request'
+        out.bulkStoppedAfter == 'addTriggers[3]'
+        out.error == 'Stopped after addTriggers[3] failed: boom. Later items were not attempted and finalisation was not fired.'
+        out.repairHints == ['Stopped fail-closed after addTriggers[3]: later items were not attempted.']
+        out.triggers.size() == 5
+        out.triggers[4].error == 'not attempted: bulk stopped after addTriggers[3] failed or was partial'
+        out.actions[0].error == 'not attempted: bulk stopped after addTriggers[3] failed or was partial'
+        out.success == false
+        out.finalisationNotAttempted == true
+    }
+
+    def "a bulk action stop in a later slice is restated in the original request's action indices"() {
+        given: 'two triggers and three actions ran in earlier slices; this slice fails its first action'
+        Map rec = [aggregate: [kind: 'bulk_edit', triggers: [[success: true], [success: true]],
+                               actions: [[success: true], [success: true], [success: true]]]]
+        Map lastSlice = [success: false, partial: true, bulkStoppedAfter: 'addActions[0]', finalisationNotAttempted: true,
+                         error: 'Stopped after addActions[0] failed: bad cap. Later items were not attempted and finalisation was not fired.',
+                         triggers: [],
+                         actions: [[success: false, error: 'bad cap'],
+                                   [success: false, notAttempted: true, error: 'not attempted: bulk stopped after addActions[0] failed or was partial']]]
+
+        when:
+        def out = script._mrtrAggregateTerminal(rec, lastSlice)
+
+        then: 'the action offset applies, and the trigger offset does not leak into action references'
+        out.bulkStoppedAfter == 'addActions[3]'
+        out.error.startsWith('Stopped after addActions[3] failed: bad cap.')
+        out.actions.size() == 5
+        out.actions[4].error == 'not attempted: bulk stopped after addActions[3] failed or was partial'
+    }
+
+    def "a patches stop after a mid-op pause is restated in the original op and inner indices"() {
+        given: 'slice one ran op 0 and two inner triggers of op 1, then paused mid-op'
+        Map rec = [aggregate: [kind: 'patches', patchResults: [
+            [success: true, op: 'addLocalVariable'],
+            [success: true, op: 'addTriggers', pausedMidOp: true, results: [[success: true], [success: true]]]
+        ]]]
+        Map innerStop = [success: false, partial: true, bulkStoppedAfter: 'patches[0].addTriggers[1]', finalisationNotAttempted: true,
+                         error: 'Stopped after patches[0].addTriggers[1] failed: boom. Later items were not attempted and finalisation was not fired.',
+                         patches: [
+                             [success: false, op: 'addTriggers', results: [[success: true], [success: false, error: 'boom'],
+                                 [success: false, notAttempted: true, error: 'not attempted: bulk stopped after patches[0].addTriggers[1] failed or was partial']]],
+                             [op: 'addAction', success: false, notAttempted: true,
+                              error: 'not attempted: bulk stopped after patches[0].addTriggers[1] failed or was partial']
+                         ]]
+
+        when: 'the continuation slice fails the second trigger it ran'
+        def out = script._mrtrAggregateTerminal(rec, innerStop)
+
+        then: 'the stop names op 1 and its fourth inner trigger'
+        out.bulkStoppedAfter == 'patches[1].addTriggers[3]'
+        out.error.startsWith('Stopped after patches[1].addTriggers[3] failed: boom.')
+        out.patchResults.size() == 4
+        out.patchResults[3].error == 'not attempted: bulk stopped after patches[1].addTriggers[3] failed or was partial'
+        out.patchResults[2].results[2].error == 'not attempted: bulk stopped after patches[1].addTriggers[3] failed or was partial'
+
+        and: 'the internal pause marker never reaches the caller'
+        !out.patchResults.any { it instanceof Map && it.containsKey('pausedMidOp') }
+
+        when: 'the continuation slice instead stops on the op after the resumed one'
+        Map opStop = [success: false, partial: true, bulkStoppedAfter: 'patches[1]', finalisationNotAttempted: true,
+                      error: 'Stopped after patches[1] failed: nope. Later items were not attempted and finalisation was not fired.',
+                      patches: [[success: true, op: 'addTriggers', results: [[success: true]]],
+                                [success: false, op: 'addAction', error: 'nope']]]
+        def opOut = script._mrtrAggregateTerminal(rec, opStop)
+
+        then: 'only the op offset applies'
+        opOut.bulkStoppedAfter == 'patches[2]'
+        opOut.error.startsWith('Stopped after patches[2] failed: nope.')
+    }
+
+    def "a stopped continuation slice ends the request with no further server continuation and recentWrites names the stop"() {
+        given:
+        settingsMap.enableWrite = true
+        List leafArgs = []
+        script.metaClass.toolSetRule = { Map actual ->
+            leafArgs << actual
+            leafArgs.size() == 1
+                ? [success: true, partial: false, status: 'in_progress', appId: actual.appId, triggers: [],
+                   actions: [[success: true]], addTriggersRemaining: [], addActionsRemaining: [[a: 2], [a: 3]]]
+                : [success: false, partial: true, appId: actual.appId, bulkStoppedAfter: 'addActions[0]',
+                   finalisationNotAttempted: true,
+                   error: 'Stopped after addActions[0] failed: bad cap. Later items were not attempted and finalisation was not fired.',
+                   triggers: [],
+                   actions: [[success: false, error: 'bad cap'],
+                             [success: false, notAttempted: true, error: 'not attempted: bulk stopped after addActions[0] failed or was partial']]]
+        }
+        RUN_IN_MILLIS_OVERRIDE.set({ List call ->
+            runInMillisCalls << call
+            script.runMrtrSlice(new LinkedHashMap(call[2].data as Map))
+        })
+        def args = [appId: 341, confirm: true, addActions: [[a: 1], [a: 2], [a: 3]]]
+
+        when: 'slice one pauses and no client request follows'
+        def first = modernCall('hub_set_rule', args)
+        String stateId = first.result.requestState
+        script.runMrtrAutoContinue(new LinkedHashMap(autoContinueJobs()[0][2].data as Map))
+        Map record = (atomicStateMap.mrtrRequests as Map)[stateId] as Map
+        List recent = script._mrtrRecentOperations() as List
+
+        then: 'the server ran only the remainder, and the stop ended the request'
+        first.result.resultType == 'input_required'
+        leafArgs.size() == 2
+        leafArgs[1].addActions == [[a: 2], [a: 3]]
+        autoContinueJobs().size() == 1
+        record.status == 'terminal'
+
+        and: 'the terminal result names the stop in the original request'
+        record.terminalResult.bulkStoppedAfter == 'addActions[1]'
+        record.terminalResult.finalisationNotAttempted == true
+        record.terminalResult.actions.size() == 3
+
+        and: 'recentWrites carries the failure and its reason'
+        recent.size() == 1
+        recent[0].success == false
+        recent[0].error == 'Stopped after addActions[1] failed: bad cap. Later items were not attempted and finalisation was not fired.'
+    }
+}

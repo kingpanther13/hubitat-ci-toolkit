@@ -1,0 +1,38 @@
+plugins { id 'groovy' }
+
+repositories {
+    mavenCentral()
+    maven {
+        url = 'https://jitpack.io'
+        content { includeGroup 'com.github.eighty20results' }
+        // JitPack's .module omits transitive dependencies; consume the POM instead.
+        metadataSources { mavenPom() }
+    }
+}
+
+dependencies {
+    testImplementation 'org.codehaus.groovy:groovy-all:3.0.25'
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-3.0'
+    testImplementation 'com.github.eighty20results:hubitat_ci:v0.28.6'
+    // HubitatCI exposes these types in public bytecode but its POM marks them runtime-only.
+    testImplementation 'org.codehaus.groovy.modules.http-builder:http-builder:0.7.1'
+    testImplementation 'org.quartz-scheduler:quartz:2.5.2'
+    // 0.11.3 has a discontinuous Jackson version range Gradle cannot resolve.
+    testImplementation 'su.litvak.chromecast:api-v2:0.11.1'
+    testImplementation 'net.bytebuddy:byte-buddy:1.18.14'
+    constraints {
+        testImplementation('commons-collections:commons-collections:3.2.2') {
+            because 'Patched version of the test-only http-builder transitive dependency'
+        }
+    }
+}
+
+java { toolchain { languageVersion = JavaLanguageVersion.of(11) } }
+
+test {
+    useJUnitPlatform()
+    workingDir = rootDir
+    maxParallelForks = 1
+    systemProperty 'hubitatCiFork', 'eighty20results'
+    testLogging { events 'passed', 'skipped', 'failed'; exceptionFormat = 'full' }
+}

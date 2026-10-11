@@ -1,0 +1,944 @@
+package server
+
+import support.ToolSpecBase
+import groovy.json.JsonSlurper
+
+/**
+ * Spec for the hub-DB (whole-hub database) backup surface added in issue #259 item #1
+ * (McpItemBackupsLib): hub_create_backup (+ folded schedule), the hub-DB scopes of
+ * hub_list_backups / hub_restore_backup, and hub_delete_backup. The source-code backup
+ * behavior of list/get/restore is unchanged and covered by the existing item-backup specs.
+ *
+ * GET endpoints are stubbed via hubGet.register (the mock keys on path; the query Map is
+ * recorded, not matched). The schedule POST is captured via a hubInternalPostJson override.
+ * The upload path's httpGet/httpPost are overridden on the metaClass (no real I/O). enableWrite()
+ * + lastBackupTimestamp satisfies the destructive-confirm gate (24h backup).
+ */
+class ToolBackupSpec extends ToolSpecBase {
+
+    private Map posted
+
+    def setup() {
+        posted = [:]
+        hubGet.register('/hub2/localBackups') { params -> '[{"name":"local-1.lzf","createTime":"2026-06-01","createTimeOrig":"2026-06-01T00:00:00","size":1024}]' }
+        hubGet.register('/hub2/cloudBackups') { params -> '{"backups":[{"path":"cloud/abc.lzf","createTime":"2026-06-02","hubVersion":"2.5.0","hubName":"CrameHub"}]}' }
+        ['/hub2/restoreLocalBackup', '/hub2/restoreCloudBackup', '/hub2/restoreUploadedBackup',
+         '/hub2/deleteLocalBackup', '/hub2/deleteCloudBackup'].each { p ->
+            hubGet.register(p) { params -> '{"success":true}' }
+        }
+        hubGet.register('/hub/backup/statusJson') { params -> '{"backupInProgress":false,"cloudBackupInProgress":false}' }
+        // current schedule (read-merge source); cloud DISABLED by default so schedule tests need no password
+        hubGet.register('/hub2/backup/json') { params -> '{"localBackupFrequency":1,"cloudBackupFrequency":0,"databaseCleanupTimeHour":3,"databaseCleanupJobMinute":0,"backupPassword":null}' }
+        // schedule POST capture
+        script.metaClass.hubInternalPostJson = { String path, String body, int t = 420, boolean r = false ->
+            posted.path = path; posted.body = new JsonSlurper().parseText(body); return [success: true]
+        }
+        // create-backup plumbing: no real async trigger, no real sleeps, no hub-security lookup
+        script.metaClass.asynchttpGet = { String handler, Map params -> null }
+        script.metaClass.pauseExecution = { long ms -> null }
+        script.metaClass.getHubSecurityCookie = { -> null }
+    }
+
+    private void enableWrite() {
+        settingsMap.enableWrite = true
+        stateMap.lastBackupTimestamp = 1234567890000L
+    }
+
+    // ---------- hub_list_backups scope ----------
+
+    def "scope=hub_local fetches /hub2/localBackups into hubLocalBackups and folds in the schedule"() {
+        when:
+        def r = script.toolListItemBackups([scope: 'hub_local'])
+
+        then:
+        r.scope == 'hub_local'
+        r.hubLocalBackups.size() == 1
+        r.hubLocalBackups[0].name == 'local-1.lzf'
+        r.hubCloudBackups == null
+
+        and: 'the automatic-backup schedule is folded in (and never carries the password)'
+        r.schedule.localBackupFrequency == 1
+        r.schedule.cloudBackupFrequency == 0
+        r.schedule.hour == 3                 // from databaseCleanupTimeHour
+        r.schedule.minute == 0               // from databaseCleanupJobMinute
+        r.schedule.localBackupEnabled == true
+        r.schedule.cloudBackupEnabled == false
+        !r.schedule.keySet().any { it.toLowerCase().contains('password') }
+    }
+
+    def "scope=hub_local reads the hub's fileSize and marks full local backups"() {
+        given: "the 2.5.2 list shape: size as fileSize, plus the full-backup fields"
+        hubGet.register('/hub2/localBackups') { params ->
+            '[{"name":"db.lzf","fileSize":"3 MB","platformVersion":"2.5.2.129","fullBackup":false,"hasZWave":false,"hasZigbee":false,"createTime":"t1","createTimeOrig":"t1"},' +
+            '{"name":"full_x.tar.gz","fileSize":"40 MB","platformVersion":"2.5.2.129","fullBackup":true,"hasZWave":true,"hasZigbee":true,"createTime":"t2","createTimeOrig":"t2"}]'
+        }
+
+        when:
+        def r = script.toolListItemBackups([scope: 'hub_local'])
+
+        then: 'the fileSize/full-backup marking holds AND the schedule still folds in'
+        r.hubLocalBackups.collect { it['size'] } == ['3 MB', '40 MB']
+        r.hubLocalBackups.collect { it.fullBackup } == [false, true]
+        r.hubLocalBackups[1].hasZigbee == true
+        r.hubLocalBackups[1].hasZWave == true
+        r.hubLocalBackups[0].platformVersion == '2.5.2.129'
+        r.schedule.localBackupFrequency == 1
+        r.schedule.hour == 3
+    }
+
+    def "scope=hub_cloud fetches /hub2/cloudBackups into hubCloudBackups and folds in the schedule"() {
+        when:
+        def r = script.toolListItemBackups([scope: 'hub_cloud'])
+
+        then:
+        r.hubCloudBackups.size() == 1
+        r.hubCloudBackups[0].path == 'cloud/abc.lzf'
+        r.schedule.localBackupFrequency == 1
+    }
+
+    def "scope=all returns the source section AND both hub-DB sections AND the schedule"() {
+        when:
+        def r = script.toolListItemBackups([scope: 'all'])
+
+        then:
+        r.containsKey('backups')          // source-code section preserved
+        r.hubLocalBackups != null
+        r.hubCloudBackups != null
+        r.schedule != null
+        r.schedule.hour == 3
+    }
+
+    def "a non-numeric schedule field preserves the backups and reports partial (does not abort the listing)"() {
+        given: 'the hub returns a malformed (non-numeric) frequency in /hub2/backup/json'
+        hubGet.register('/hub2/backup/json') { params -> '{"localBackupFrequency":"oops","cloudBackupFrequency":0,"databaseCleanupTimeHour":3,"databaseCleanupJobMinute":0}' }
+
+        when:
+        def r = script.toolListItemBackups([scope: 'hub_local'])
+
+        then: 'the malformed schedule becomes a partial/error, not a thrown abort that loses the backups'
+        noExceptionThrown()
+        r.hubLocalBackups.size() == 1
+        r.schedule == null
+        r.partial == true
+        r.hubBackupErrors.any { it.toLowerCase().contains('schedule') }
+    }
+
+    def "a failed schedule read folds into hubBackupErrors + partial, never failing the listing"() {
+        given:
+        hubGet.register('/hub2/backup/json') { params -> throw new RuntimeException('boom') }
+
+        when:
+        def r = script.toolListItemBackups([scope: 'hub_local'])
+
+        then: 'the listing still returns the hub-DB backups; the schedule failure is recorded as partial'
+        r.hubLocalBackups.size() == 1
+        !r.containsKey('schedule')
+        r.partial == true
+        r.hubBackupErrors.any { it.toLowerCase().contains('schedule') }
+    }
+
+    def "default scope=source does not touch the hub-DB endpoints (no schedule block)"() {
+        when:
+        def r = script.toolListItemBackups([:])
+
+        then:
+        r.containsKey('backups')
+        r.hubLocalBackups == null
+        !r.containsKey('schedule')
+        hubGet.calls.every { !(it.path in ['/hub2/localBackups', '/hub2/cloudBackups', '/hub2/backup/json']) }
+    }
+
+    def "an invalid scope is rejected"() {
+        when:
+        script.toolListItemBackups([scope: 'bogus'])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    // ---------- hub_create_backup + folded schedule ----------
+
+    def "hub_create_backup catalog leaves confirm conditional for schedule-only calls"() {
+        when:
+        def toolDef = script.getAllToolDefinitions().find {
+            it.name == 'hub_create_backup'
+        }
+        def required = script.requiredParamsByTool()
+
+        then: 'the catalog and its derived prevalidation memo permit the documented shape'
+        toolDef != null
+        toolDef.inputSchema.properties?.containsKey('confirm')
+        toolDef.inputSchema.properties?.containsKey('scheduleOnly')
+        toolDef.inputSchema.properties?.containsKey('schedule')
+        !(toolDef.inputSchema.required ?: []).contains('confirm')
+        !required.containsKey('hub_create_backup')
+    }
+
+    def "scheduleOnly without confirm succeeds through the MCP dispatch surface"() {
+        given:
+        def backupCalls = []
+        script.metaClass.asynchttpGet = { String handler, Map params ->
+            backupCalls << [handler: handler, params: params]
+            null
+        }
+
+        when:
+        def response = mcpDriver.callTool('hub_create_backup', [
+            schedule: [hour: 1, minute: 0], scheduleOnly: true
+        ])
+        def inner = mcpDriver.parseInner(response)
+
+        then:
+        response.error == null
+        response.result?.isError != true
+        inner.success == true
+        inner.scheduleUpdated == true
+        posted.path == '/hub2/updateBackupSchedule'
+        posted.body.hour == 1
+        posted.body.minute == 0
+        backupCalls.isEmpty()
+    }
+
+    def "create with a schedule POSTs /hub2/updateBackupSchedule and reports scheduleUpdated"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true, schedule: [hour: 3, minute: 30, localBackupFrequency: 1, cloudBackupFrequency: 0, cloudBackupPassword: 'pw']])
+
+        then:
+        r.success == true
+        r.scheduleUpdated == true
+        posted.path == '/hub2/updateBackupSchedule'
+        posted.body.hour == 3
+        posted.body.minute == 30
+        posted.body.cloudBackupPassword == 'pw'
+    }
+
+    def "scheduleOnly sets the schedule WITHOUT creating a backup and needs no confirm"() {
+        when:
+        def r = script.toolCreateHubBackup([schedule: [hour: 1, minute: 0], scheduleOnly: true])
+
+        then:
+        r.success == true
+        r.scheduleUpdated == true
+        r.message.toLowerCase().contains('schedule')
+        posted.path == '/hub2/updateBackupSchedule'
+    }
+
+    // ---------- folded schedule block on hub_list_backups (read-only) ----------
+
+    def "the schedule block reports cloudBackupEnabled + entitlements when cloud is on, and never the password"() {
+        given: 'a schedule with cloud backup enabled and entitlements present'
+        hubGet.register('/hub2/backup/json') { params ->
+            '{"localBackupFrequency":7,"cloudBackupFrequency":14,"databaseCleanupTimeHour":2,"databaseCleanupJobMinute":30,"backupPassword":"s3cret","hasCloudBackupEntitlements":true,"hasCloudRestoreEntitlements":true}'
+        }
+
+        when:
+        def r = script.toolListItemBackups([scope: 'hub'])
+
+        then:
+        r.schedule.cloudBackupFrequency == 14
+        r.schedule.cloudBackupEnabled == true
+        r.schedule.hour == 2
+        r.schedule.minute == 30
+        r.schedule.hasCloudBackupEntitlements == true
+        r.schedule.hasCloudRestoreEntitlements == true
+
+        and: 'the cloud-backup password is never surfaced even when the hub returns one'
+        !r.schedule.keySet().any { it.toLowerCase().contains('password') }
+        !r.schedule.values().contains('s3cret')
+    }
+
+    def "the schedule block reaches the hub through the MCP dispatch surface"() {
+        when:
+        def response = mcpDriver.callTool('hub_list_backups', [scope: 'hub_local'])
+        def inner = mcpDriver.parseInner(response)
+
+        then:
+        response.error == null
+        response.result?.isError != true
+        inner.schedule.localBackupFrequency == 1
+        inner.schedule.hour == 3
+        !inner.schedule.keySet().any { it.toLowerCase().contains('password') }
+    }
+
+    def "create without confirm throws"() {
+        when:
+        script.toolCreateHubBackup([:])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def "a schedule with confirm:false is rejected BEFORE the schedule is written (no partial side effect)"() {
+        given:
+        settingsMap.enableWrite = true
+
+        when:
+        script.toolCreateHubBackup([schedule: [hour: 5, minute: 0], confirm: false])
+
+        then:
+        thrown(IllegalArgumentException)
+        posted.isEmpty()   // the /hub2/updateBackupSchedule POST never happened
+    }
+
+    def "a schedule with an out-of-range hour fails as a structured error (no throw, no backup)"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true, schedule: [hour: 99, minute: 0]])
+
+        then:
+        r.success == false
+        r.error.toLowerCase().contains('schedule')
+    }
+
+    // ---------- hub_restore_backup hub-DB scopes ----------
+
+    def "scope=hub_local restores by fileName (confirm-gated; warns about the reboot)"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'local-1.lzf', confirm: true])
+
+        then:
+        r.success == true
+        r.type == 'hub-db'
+        r.location == 'hub_local'
+        r.message.toLowerCase().contains('reboot')
+    }
+
+    // A full local backup never reaches the database restore: it is read off the hub, uploaded to
+    // the full-restore endpoint, and restored with the fullRestore choices (issue #490).
+    private Map stubFullRestore() {
+        def seen = [:]
+        script.metaClass.hubInternalBytes = { String method, String path, Map query = null, Map form = null, int t = 300 ->
+            seen.download = [method: method, path: path, query: query]; [status: 200, bytes: ([0x1f, 0x8b, 8, 0] as byte[])]
+        }
+        script.metaClass._postMultipartBackup = { String path, String field, String fileName, byte[] bytes ->
+            seen.upload = [path: path, field: field, fileName: fileName, size: bytes.length]; [success: true]
+        }
+        hubGet.register('/hub2/restoreFullLocalBackup') { params -> seen.restoreQuery = params; '{"success":true}' }
+        return seen
+    }
+
+    def "scope=hub_local routes a full local backup through the full-restore flow"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/localBackups') { params -> '[{"name":"full_x.tar.gz","fullBackup":true,"fileSize":"7 MB"}]' }
+        def seen = stubFullRestore()
+
+        when:
+        def r = script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'full_x.tar.gz', confirm: true,
+                                              fullRestore: [restoreZigbee: true, restoreFiles: true]])
+
+        then: 'downloaded, uploaded to the full endpoint, restored with the choices; never the database restore'
+        r.success == true
+        r.type == 'hub-full'
+        seen.download.path == '/hub2/downloadLocalBackup'
+        seen.download.query == [fileName: 'full_x.tar.gz']
+        seen.upload.path == '/hub2/uploadFullLocalBackup'
+        seen.upload.field == 'uploadFile'
+        hubGet.calls.find { it.path == '/hub2/restoreFullLocalBackup' }.params.subMap(['restoreZb', 'restoreZw', 'restoreFiles', 'deleteExistingFiles', 'suppressZWaveFirmwareMismatchHubNewer']) ==
+            [restoreZb: true, restoreZw: false, restoreFiles: true, deleteExistingFiles: false, suppressZWaveFirmwareMismatchHubNewer: false]
+        !hubGet.calls.any { it.path == '/hub2/restoreLocalBackup' }
+    }
+
+    @spock.lang.Unroll
+    def "scope=hub_local full-backup check: #label"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/localBackups') { params ->
+            if (listBody == null) throw new RuntimeException("list unreadable")
+            listBody
+        }
+        stubFullRestore()
+
+        when:
+        def r = script.toolRestoreItemBackup([scope: 'hub_local', fileName: fileName, confirm: true])
+
+        then:
+        r.success == ok
+        (r.type == 'hub-full') == full
+        hubGet.calls.any { it.path == '/hub2/restoreLocalBackup' } == !full
+        // A full backup with no listed size is refused before it is downloaded.
+        hubGet.calls.any { it.path == '/hub2/restoreFullLocalBackup' } == (full && ok)
+
+        where:
+        label                                     | fileName      | listBody                                                     | full  | ok
+        'the list marks it full (any name)'       | 'odd.lzf'     | '[{"name":"odd.lzf","fullBackup":true,"fileSize":"7 MB"}]'  | true  | true
+        'the list wins over a .tar.gz name'       | 'db.tar.gz'   | '[{"name":"db.tar.gz","fullBackup":false}]'                  | false | true
+        'list unreadable, .tar.gz name'           | 'x.tar.gz'    | null                                                         | true  | false
+        'list unreadable, .lzf name'              | 'x.lzf'       | null                                                         | false | true
+        'list readable without it, .tar.gz name'  | 'gone.tar.gz' | '[]'                                                         | true  | false
+    }
+
+    def "fullRestore on a database backup is refused before anything is sent"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'local-1.lzf', confirm: true, fullRestore: [restoreFiles: true]])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains('fullRestore applies only to a full backup')
+        !hubGet.calls.any { it.path == '/hub2/restoreLocalBackup' }
+    }
+
+    def "an unknown fullRestore field and deleteExistingFiles without restoreFiles are refused before anything is sent"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/localBackups') { params -> '[{"name":"full_x.tar.gz","fullBackup":true,"fileSize":"7 MB"}]' }
+        def seen = stubFullRestore()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'full_x.tar.gz', confirm: true, fullRestore: opts])
+
+        then:
+        def ex = thrown(IllegalArgumentException)
+        ex.message.contains(msg)
+        seen.download == null
+
+        where:
+        opts                          | msg
+        [restoreRadios: true]         | 'Unknown fullRestore field'
+        [deleteExistingFiles: true]   | 'deleteExistingFiles applies only with restoreFiles'
+    }
+
+    @spock.lang.Unroll
+    def "a Z-Wave mismatch from the full restore is reported with its remedy: #flag"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/localBackups') { params -> '[{"name":"full_x.tar.gz","fullBackup":true,"fileSize":"7 MB"}]' }
+        stubFullRestore()
+        hubGet.register('/hub2/restoreFullLocalBackup') { params -> body }
+
+        when:
+        def r = script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'full_x.tar.gz', confirm: true])
+
+        then:
+        r.success == false
+        r.note.contains(remedy)
+
+        where:
+        flag                                 | body                                                                                  | remedy
+        'zwaveFirmwareMismatchHubNewer'      | '{"success":false,"zwaveFirmwareMismatchHubNewer":true}'                              | 'allowZwaveFirmwareMismatch=true'
+        'zwaveFirmwareMismatchBackupNewer'   | '{"success":false,"zwaveFirmwareMismatchBackupNewer":true}'                           | 'Update the hub'
+        'zwaveStackMismatch'                 | '{"success":false,"zwaveStackMismatch":true,"backupZWaveStack":"js","activeZWaveStack":"legacy"}' | 'hub_set_zwave(zwave_js'
+    }
+
+    @spock.lang.Unroll
+    def "the full-backup route reaches a client through the gateway and flat dispatch (useGateways=#useGateways)"() {
+        given:
+        enableWrite()
+        settingsMap.useGateways = useGateways
+        hubGet.register('/hub2/localBackups') { params -> '[{"name":"full_x.tar.gz","fullBackup":true,"fileSize":"7 MB"}]' }
+        stubFullRestore()
+
+        when:
+        def r = useGateways ?
+            script.handleGateway('hub_manage_backup', 'hub_restore_backup', [scope: 'hub_local', fileName: 'full_x.tar.gz', confirm: true]) :
+            script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'full_x.tar.gz', confirm: true])
+
+        then:
+        r.success == true
+        r.type == 'hub-full'
+        !hubGet.calls.any { it.path == '/hub2/restoreLocalBackup' }
+
+        where:
+        useGateways << [true, false]
+    }
+
+    def "scope=hub_local without confirm throws the destructive gate"() {
+        given:
+        settingsMap.enableWrite = true   // Write master on, but NO recent backup -> confirm gate fails
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'x.lzf'])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def "scope=hub_local without fileName throws"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_local', confirm: true])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def "scope=hub_cloud requires path"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_cloud', cloudBackupPassword: 'pw', confirm: true])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def "scope=hub_cloud requires cloudBackupPassword"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_cloud', path: 'cloud/abc.lzf', confirm: true])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def "scope=hub_cloud with path + password succeeds (sends fileName + restorePassword)"() {
+        given:
+        enableWrite()
+        def q = [:]
+        hubGet.register('/hub2/restoreCloudBackup') { params -> q.putAll(params ?: [:]); '{"success":true}' }
+
+        when:
+        def r = script.toolRestoreItemBackup([scope: 'hub_cloud', path: 'cloud/abc.lzf', cloudBackupPassword: 'pw', confirm: true])
+
+        then:
+        r.success == true
+        r.location == 'hub_cloud'
+        q.fileName == 'cloud/abc.lzf'        // the cloud backup is identified by its path, sent as fileName
+        q.restorePassword == 'pw'            // NOT "p"
+    }
+
+    def "an invalid restore scope throws"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'bogus', confirm: true])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    // ---------- hub_restore_backup scope=hub_uploaded (upload-from-URL) ----------
+
+    def "scope=hub_uploaded fetches the URL, uploads it, then restores"() {
+        given:
+        enableWrite()
+        // The fetch + multipart helpers do real HTTP I/O the harness can't exercise (and the path
+        // is unverifiable live anyway); mock them and assert the ORCHESTRATION (fetch -> upload ->
+        // restoreUploaded GET -> success).
+        def calls = [:]
+        script.metaClass._probeUrl = { String url, long cap -> [size: 26L] }
+        script.metaClass._fetchBytesFromUrl = { String url, long cap -> calls.fetched = url; '-- H2 0.5/B -- BACKUPBYTES'.getBytes('UTF-8') }
+        script.metaClass._postMultipartBackup = { String path, String field, String fileName, byte[] bytes ->
+            calls.uploaded = path; calls.bytes = bytes.length; return [success: true]
+        }
+
+        when:
+        def r = script.toolRestoreItemBackup([scope: 'hub_uploaded', backupUrl: 'https://host/b.lzf', confirm: true])
+
+        then:
+        r.success == true
+        r.location == 'hub_uploaded'
+        calls.fetched == 'https://host/b.lzf'
+        calls.uploaded == '/hub2/uploadBackup'
+        calls.bytes == 26
+    }
+
+    def "scope=hub_uploaded requires backupUrl"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_uploaded', confirm: true])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def "scope=hub_uploaded rejects a non-http(s) backupUrl"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolRestoreItemBackup([scope: 'hub_uploaded', backupUrl: 'ftp://x/y.lzf', confirm: true])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    // ---------- hub_delete_backup ----------
+
+    def "delete local removes by fileName"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolDeleteHubBackup([location: 'local', fileName: 'local-1.lzf', confirm: true])
+
+        then:
+        r.success == true
+        r.location == 'local'
+    }
+
+    def "delete cloud removes by path"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolDeleteHubBackup([location: 'cloud', path: 'cloud/abc.lzf', confirm: true])
+
+        then:
+        r.success == true
+        r.location == 'cloud'
+    }
+
+    def "delete without confirm throws"() {
+        given:
+        settingsMap.enableWrite = true   // no recent backup
+
+        when:
+        script.toolDeleteHubBackup([location: 'local', fileName: 'x'])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    def "delete with an invalid location throws"() {
+        given:
+        enableWrite()
+
+        when:
+        script.toolDeleteHubBackup([location: 'bogus', confirm: true])
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+    // ---------- failure envelopes (structured, no throw) ----------
+
+    def "a failing hub-DB restore returns the structured error envelope (does NOT throw)"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/restoreLocalBackup') { params -> '{"success":false,"message":"relay down"}' }
+
+        when:
+        def r = script.toolRestoreItemBackup([scope: 'hub_local', fileName: 'x.lzf', confirm: true])
+
+        then:
+        r.success == false
+        r.error.contains('relay down')
+        r.note != null
+    }
+
+    def "a failing hub-DB delete returns the structured error envelope"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/deleteLocalBackup') { params -> '{"success":false,"message":"not found"}' }
+
+        when:
+        def r = script.toolDeleteHubBackup([location: 'local', fileName: 'x.lzf', confirm: true])
+
+        then:
+        r.success == false
+        r.error.contains('not found')
+        r.note != null
+    }
+
+    def "a list with a failing hub-DB source surfaces hubBackupErrors + partial (never silently complete)"() {
+        given:
+        hubGet.register('/hub2/cloudBackups') { params -> throw new RuntimeException('cloud unreachable') }
+
+        when:
+        def r = script.toolListItemBackups([scope: 'hub'])
+
+        then:
+        r.hubLocalBackups != null            // the local store still returned
+        r.hubBackupErrors.any { it.contains('cloud') }
+        r.partial == true
+    }
+
+    def "scope=hub lists BOTH DB stores and omits the source section"() {
+        when:
+        def r = script.toolListItemBackups([scope: 'hub'])
+
+        then:
+        r.hubLocalBackups != null
+        r.hubCloudBackups != null
+        !r.containsKey('backups')
+    }
+
+    def "a schedule omitting hour/minute read-merges them from the current schedule"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true, schedule: [localBackupFrequency: 2]])
+
+        then:
+        r.success == true
+        r.scheduleUpdated == true
+        posted.body.hour == 3                  // merged from /hub2/backup/json databaseCleanupTimeHour
+        posted.body.minute == 0                // merged from databaseCleanupJobMinute
+        posted.body.localBackupFrequency == 2  // caller override
+        posted.body.cloudBackupFrequency == 0  // merged from current (cloud disabled)
+    }
+
+    def "a schedule with cloud backup enabled but no cloudBackupPassword is refused (won't blank the password)"() {
+        given:
+        enableWrite()
+        hubGet.register('/hub2/backup/json') { params -> '{"localBackupFrequency":1,"cloudBackupFrequency":7,"databaseCleanupTimeHour":3,"databaseCleanupJobMinute":0,"backupPassword":null}' }
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true, schedule: [hour: 4, minute: 0]])
+
+        then:
+        r.success == false
+        r.error.toLowerCase().contains('cloud')
+    }
+
+    def "a schedule with a non-numeric hour fails as a structured error (no NumberFormatException leak)"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true, schedule: [hour: 'abc', minute: 0]])
+
+        then:
+        r.success == false
+        r.error.toLowerCase().contains('integer') || r.error.toLowerCase().contains('schedule')
+    }
+
+    def "a create that never confirms returns success:false and does NOT stamp the destructive-confirm gate"() {
+        given:
+        settingsMap.enableWrite = true            // Write master on, but NO prior backup stamp
+        stateMap.remove('lastBackupTimestamp')
+        // statusJson never reports completion -> the backup is unverified (and the list fixture
+        // never gains a new entry, so the ground-truth signal stays silent too)
+        hubGet.register('/hub/backup/statusJson') { params -> '{"backupInProgress":true,"cloudBackupInProgress":false}' }
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true])
+
+        then:
+        r.success == false
+        r.confirmed == false
+        stateMap.lastBackupTimestamp == null      // the 24h gate is NOT satisfied by an unverified backup
+        r.note.toLowerCase().contains('not')
+    }
+
+    // -------- issue #361: list-based completion + mockEpoch lever --------
+
+    def "a create confirms via a NEW entry in the hub's backup list even while cloudBackupInProgress stays true (issue #361)"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.remove('lastBackupTimestamp')
+        // Hub Protect upload in progress: statusJson never settles (the pre-#361 wedge)
+        hubGet.register('/hub/backup/statusJson') { params -> '{"backupInProgress":false,"cloudBackupInProgress":true}' }
+        // First read = pre-trigger snapshot (old entry only); later reads show the new backup file
+        int listReads = 0
+        hubGet.register('/hub2/localBackups') { params ->
+            listReads++
+            listReads == 1 ? '[{"name":"old.lzf","createTimeOrig":"2026-06-01T00:00:00"}]'
+                           : '[{"name":"old.lzf","createTimeOrig":"2026-06-01T00:00:00"},{"name":"new.lzf","createTimeOrig":"2026-06-02T00:00:00+0000"}]'
+        }
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true])
+
+        then:
+        r.success == true
+        r.confirmed == true
+        stateMap.lastBackupTimestamp != null      // the 24h gate IS satisfied: the backup file exists
+    }
+
+    def "a create with an unsettled cloud upload and NO new list entry stays unconfirmed and unstamped"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.remove('lastBackupTimestamp')
+        hubGet.register('/hub/backup/statusJson') { params -> '{"backupInProgress":false,"cloudBackupInProgress":true}' }
+        // the setup fixture list never changes -> no new entry appears
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true])
+
+        then:
+        r.success == false
+        r.confirmed == false
+        stateMap.lastBackupTimestamp == null
+        r.error.toLowerCase().contains('did not confirm')
+    }
+
+    def "a create bails as statusUnreadable when statusJson AND the backup list are both unreadable"() {
+        given:
+        settingsMap.enableWrite = true
+        stateMap.remove('lastBackupTimestamp')
+        hubGet.register('/hub/backup/statusJson') { params -> '<html>login</html>' }
+        hubGet.register('/hub2/localBackups') { params -> '<html>login</html>' }
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true])
+
+        then: 'three consecutive both-signals-unreadable rounds end the loop with the distinct error'
+        r.success == false
+        r.confirmed == false
+        stateMap.lastBackupTimestamp == null
+        r.error.contains('both unreadable')
+        hubGet.calls.count { it.path == '/hub/backup/statusJson' } == 3
+    }
+
+    // Virtual clock (mirrors ToolPollComparatorStableSpec): pauseExecution advances the clock by
+    // advanceMs (more than the requested pause = simulated slow rounds); now() reads it via the
+    // base mock's NOW_OVERRIDE holder, which HarnessSpec.setup() resets.
+    private List installVirtualClock(long start, long advanceMs) {
+        def clock = [start]
+        script.metaClass.pauseExecution = { long ms -> clock[0] = clock[0] + advanceMs }
+        NOW_OVERRIDE.set({ clock[0] })
+        return clock
+    }
+
+    @spock.lang.IgnoreIf({ System.getProperty('harnessStrictMetaClass') == 'true' })  // virtual clock needs the pauseExecution metaClass override + NOW_OVERRIDE, which the strict-metaClass groovy2x lane disallows; full coverage runs in the primary test lanes
+    def "the confirm loop is wall-clock capped: slow rounds exit early instead of grinding all 20 iterations"() {
+        given: 'a virtual clock where each round costs 30s (slow status/list reads on a loaded hub)'
+        settingsMap.enableWrite = true
+        stateMap.remove('lastBackupTimestamp')
+        installVirtualClock(1234567890000L, 30000L)
+        hubGet.register('/hub/backup/statusJson') { params -> '{"backupInProgress":true,"cloudBackupInProgress":false}' }
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true])
+
+        then: 'the ~57s cap ends the loop on round 2 -- not the 20-iteration count'
+        r.success == false
+        r.confirmed == false
+        stateMap.lastBackupTimestamp == null
+        r.error.contains('did not confirm')
+        hubGet.calls.count { it.path == '/hub/backup/statusJson' } == 2
+    }
+
+    def "a create whose PRE-trigger list read failed only confirms on an entry newer than the trigger window"() {
+        given: 'preEpoch is null (unreadable pre-trigger list), so only a fresh-looking entry may confirm'
+        settingsMap.enableWrite = true
+        stateMap.remove('lastBackupTimestamp')
+        hubGet.register('/hub/backup/statusJson') { params -> '{"backupInProgress":false,"cloudBackupInProgress":true}' }
+        int listReads = 0
+        hubGet.register('/hub2/localBackups') { params ->
+            listReads++
+            // fixed harness now() = 1234567890000 (2009-02-13T23:31:30Z); this entry is 30s old --
+            // inside the confirmT0-60s window, so it confirms even with no pre-trigger baseline
+            listReads == 1 ? '<html>login</html>'
+                           : '[{"name":"new.lzf","createTimeOrig":"2009-02-13T23:31:00+0000"}]'
+        }
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true])
+
+        then:
+        r.success == true
+        r.confirmed == true
+        stateMap.lastBackupTimestamp != null
+    }
+
+    def "mock=true with mockEpoch stamps the given epoch (developer-mode test lever)"() {
+        given:
+        settingsMap.enableWrite = true
+        settingsMap.enableDeveloperMode = true
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true, mock: true, mockEpoch: 1234000000000L])
+
+        then:
+        r.success == true
+        r.mocked == true
+        r.backupTimestampEpoch == 1234000000000L
+        stateMap.lastBackupTimestamp == 1234000000000L
+    }
+
+    // ---------- dispatch envelopes ----------
+
+    def "hub_delete_backup via dispatch returns the success envelope"() {
+        given:
+        enableWrite()
+
+        when:
+        def resp = mcpDriver.callTool('hub_delete_backup', [location: 'local', fileName: 'local-1.lzf', confirm: true])
+
+        then:
+        mcpDriver.parseInner(resp).success == true
+    }
+
+    def "hub_create_backup via dispatch returns the success envelope"() {
+        given:
+        enableWrite()
+
+        when:
+        def resp = mcpDriver.callTool('hub_create_backup', [confirm: true])
+
+        then:
+        mcpDriver.parseInner(resp).success == true
+    }
+
+    def "hub_delete_backup via dispatch surfaces a validation-error envelope for a bad location"() {
+        given:
+        enableWrite()
+
+        when:
+        def resp = mcpDriver.callTool('hub_delete_backup', [location: 'bogus', confirm: true])
+
+        then: 'an IllegalArgumentException maps to a isError validation result (or isError) envelope, not a success'
+        resp.error == null
+        resp.result?.isError == true
+    }
+
+    def "scheduleOnly without a schedule object falls through to a normal create (scheduleOnly is a no-op)"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.toolCreateHubBackup([confirm: true, scheduleOnly: true])
+
+        then:
+        r.success == true
+        r.scheduleUpdated == false
+    }
+
+    // ---------- through the hub_manage_backup gateway (not just flat dispatch) ----------
+    // The full-e2e break was a backup tool reached via the wrong gateway; flat-dispatch tests can't
+    // catch gateway-membership drift, so route the backup tools THROUGH hub_manage_backup here too.
+
+    def "the hub_manage_backup gateway catalog lists every backup sub-tool (membership)"() {
+        when:
+        def cat = script.handleGateway('hub_manage_backup', null, null)
+
+        then:
+        cat.tools*.name.containsAll(['hub_list_backups', 'hub_get_backup', 'hub_restore_backup', 'hub_delete_backup'])
+    }
+
+    def "hub_restore_backup routes THROUGH the hub_manage_backup gateway"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.handleGateway('hub_manage_backup', 'hub_restore_backup', [scope: 'hub_local', fileName: 'local-1.lzf', confirm: true])
+
+        then:
+        r.success == true
+        r.location == 'hub_local'
+    }
+
+    def "hub_delete_backup routes THROUGH the hub_manage_backup gateway"() {
+        given:
+        enableWrite()
+
+        when:
+        def r = script.handleGateway('hub_manage_backup', 'hub_delete_backup', [location: 'local', fileName: 'local-1.lzf', confirm: true])
+
+        then:
+        r.success == true
+    }
+}
