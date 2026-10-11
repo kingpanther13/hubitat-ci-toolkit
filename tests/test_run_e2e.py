@@ -164,6 +164,14 @@ class RunnerTests(unittest.TestCase):
                     self.load(data)
         self.assertEqual(self.hub.calls, [])
 
+    def test_checked_in_scenarios_resolve_without_network(self):
+        root = Path(__file__).resolve().parents[1]
+        for scenario in ("lease-smoke", "deploy-readback"):
+            loaded = load_config(root / "e2e" / (scenario + ".json"), root,
+                                 dict(ENV, APP_CODE_ID="42"))
+            self.assertTrue(loaded["test"])
+        self.assertEqual(self.hub.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

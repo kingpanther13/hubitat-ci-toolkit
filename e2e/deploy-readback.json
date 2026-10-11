@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "setup": [
+    {
+      "id": "snapshot",
+      "endpoint": "watchdog",
+      "tool": "hub_get_source",
+      "arguments": {"type": "app", "id": "${ENV:APP_CODE_ID}", "noSave": true},
+      "assertions": [
+        {"path": "/success", "op": "equals", "value": true},
+        {"path": "/hasMore", "op": "equals", "value": false},
+        {"path": "/source", "op": "type", "value": "string"}
+      ]
+    },
+    {
+      "id": "deploy",
+      "endpoint": "watchdog",
+      "tool": "hub_update_app",
+      "arguments": {
+        "appId": "${ENV:APP_CODE_ID}",
+        "source": {"$file": "apps/example-app.groovy"},
+        "confirm": true
+      },
+      "assertions": [
+        {"path": "/success", "op": "equals", "value": true}
+      ]
+    }
+  ],
+  "test": [
+    {
+      "id": "readback",
+      "endpoint": "watchdog",
+      "tool": "hub_get_source",
+      "arguments": {"type": "app", "id": "${ENV:APP_CODE_ID}", "noSave": true},
+      "assertions": [
+        {"path": "/success", "op": "equals", "value": true},
+        {"path": "/hasMore", "op": "equals", "value": false},
+        {"path": "/source", "op": "equals", "value": {"$file": "apps/example-app.groovy"}}
+      ]
+    }
+  ],
+  "cleanup": [
+    {
+      "id": "restore",
+      "endpoint": "watchdog",
+      "tool": "hub_update_app",
+      "arguments": {
+        "appId": "${ENV:APP_CODE_ID}",
+        "source": {"$result": "snapshot#/source"},
+        "confirm": true
+      },
+      "assertions": [
+        {"path": "/success", "op": "equals", "value": true}
+      ]
+    },
+    {
+      "id": "restored_readback",
+      "endpoint": "watchdog",
+      "tool": "hub_get_source",
+      "arguments": {"type": "app", "id": "${ENV:APP_CODE_ID}", "noSave": true},
+      "assertions": [
+        {"path": "/success", "op": "equals", "value": true},
+        {"path": "/hasMore", "op": "equals", "value": false},
+        {"path": "/source", "op": "equals", "value": {"$result": "snapshot#/source"}}
+      ]
+    }
+  ]
+}

@@ -9,6 +9,7 @@ permissions:
 jobs:
   python-and-packaging:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -31,6 +32,7 @@ jobs:
           path: dist/
   groovy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +65,7 @@ jobs:
             ci/*/build/reports/
   reference-watchdog:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: reference/hubitat-local-mcp-server
@@ -84,6 +87,7 @@ jobs:
           path: reference/hubitat-local-mcp-server/build/reports/
   reference-infrastructure:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: reference/hubitat-local-mcp-server

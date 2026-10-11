@@ -44,6 +44,18 @@ class BundleTests(unittest.TestCase):
                 self.assertEqual(z.read('update.txt'), expected)
                 self.assertEqual(z.read('app.groovy'), (root/'app.groovy').read_bytes())
 
+    def test_bundle_preserves_project_license(self):
+        build = self.load_builder()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest, _ = self.fixture(root)
+            license_text = 'MIT License\nCopyright sample contributors\n'
+            (root / 'LICENSE').write_text(license_text)
+            out = root / 'sample.zip'
+            build(manifest, out)
+            with zipfile.ZipFile(out) as archive:
+                self.assertEqual(archive.read('LICENSE').decode(), license_text)
+
     def test_rejects_escaping_paths_without_touching_existing_output(self):
         build = self.load_builder()
         with tempfile.TemporaryDirectory() as tmp:
