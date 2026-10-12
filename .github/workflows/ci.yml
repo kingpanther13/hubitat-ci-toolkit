@@ -105,3 +105,25 @@ jobs:
         run: |
           bash -n scripts/lease_acquire.sh
           bash -n scripts/lease_release.sh
+
+  toolkit-ci:
+    name: Toolkit CI required
+    if: always()
+    needs: [python-and-packaging, groovy, reference-watchdog, reference-infrastructure]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every offline lane to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          import os
+          results = json.loads(os.environ['RESULTS'])
+          failed = {name: job['result'] for name, job in results.items()
+                    if job['result'] != 'success'}
+          if failed:
+              raise SystemExit(f'Required lanes did not succeed: {failed}')
+          print('All offline lanes passed.')
+          PYCODE

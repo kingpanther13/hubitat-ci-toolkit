@@ -42,6 +42,8 @@ Change `apps/example-app.groovy`, `drivers/example-driver.groovy`, and the share
 
 Live testing is a separate, manually dispatched **Test hub E2E** workflow. Configure your own `test-hub` environment and watchdog endpoint using [the E2E guide](docs/e2e.md). The default smoke configuration only reads the watchdog; the deploy/readback example updates and restores a dedicated Apps Code class. No test hub, credentials, or shared hub access comes with this template.
 
+Dependency updates use Renovate for Gradle and HubitatCI forks and Dependabot for GitHub Actions, with automatic merging after required offline checks. See [dependency maintenance](docs/dependency-updates.md) for compatibility limits and the repository settings adopters must recreate.
+
 See the [validation record](docs/validation.md) for the initial CI results and test scope.
 
 ## Credits and license
