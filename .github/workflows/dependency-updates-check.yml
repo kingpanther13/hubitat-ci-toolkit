@@ -25,7 +25,7 @@ jobs:
       - name: Install the pinned Renovate validator
         run: npm install --prefix "$RUNNER_TEMP/renovate" --no-audit --no-fund "renovate@$RENOVATE_VERSION"
       - name: Validate configuration
-        run: "$RUNNER_TEMP/renovate/node_modules/.bin/renovate-config-validator --strict .github/renovate.json"
+        run: '"$RUNNER_TEMP/renovate/node_modules/.bin/renovate-config-validator" --strict .github/renovate.json'
       - name: Exercise dependency discovery and update selection without writes
         env:
           GITHUB_COM_TOKEN: ${{ github.token }}
