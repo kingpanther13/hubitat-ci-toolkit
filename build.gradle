@@ -57,6 +57,7 @@ tasks.register('watchdogTest', Test) {
     workingDir = rootDir
     maxParallelForks = 1
     maxHeapSize = '1g'
+    testLogging.showStandardStreams = true
     testLogging { events 'passed', 'skipped', 'failed'; exceptionFormat = 'full' }
 }
 tasks.named('check') { dependsOn tasks.named('watchdogTest') }

@@ -81,7 +81,7 @@ class WatchdogV31CacheSpec extends WatchdogV31Spec {
         when:
         def second = fresh()
         then:
-        second.PACKAGE_PROGRESS.job.requestId == 'in-flight'
+        second.PACKAGE_PROGRESS.job?.requestId == 'in-flight'
         first.PACKAGE_DEPLOY_LOCK.is(second.PACKAGE_DEPLOY_LOCK)
     }
 }
