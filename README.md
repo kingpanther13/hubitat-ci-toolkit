@@ -1,5 +1,7 @@
 # Hubitat CI Toolkit
 
+[![Toolkit CI](https://github.com/kingpanther13/hubitat-ci-toolkit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kingpanther13/hubitat-ci-toolkit/actions/workflows/ci.yml)
+
 A reusable GitHub Actions testing suite for Hubitat apps and drivers, with a **standalone watchdog MCP server** for installing code and administering a hub.
 
 Extracted from [Hubitat-local-MCP-server](https://github.com/kingpanther13/Hubitat-local-MCP-server) at [`0e6094bf`](https://github.com/kingpanther13/Hubitat-local-MCP-server/tree/0e6094bf688d7edefd18d1f52ffe7b0ee7ab2018). This repository is independent: adopting it requires **no changes to that project**.
@@ -39,6 +41,10 @@ python3 tools/build_bundle.py
 Change `apps/example-app.groovy`, `drivers/example-driver.groovy`, and the shared library to your project. Update `bundle.json` to declare your bundle and installation order. Follow [unit testing](docs/unit-testing.md) for harness setup and [packaging](docs/packaging.md) for distribution.
 
 Live testing is a separate, manually dispatched **Test hub E2E** workflow. Configure your own `test-hub` environment and watchdog endpoint using [the E2E guide](docs/e2e.md). The default smoke configuration only reads the watchdog; the deploy/readback example updates and restores a dedicated Apps Code class. No test hub, credentials, or shared hub access comes with this template.
+
+Dependency updates use Renovate for Gradle and HubitatCI forks and Dependabot for GitHub Actions, with automatic merging after required offline checks. See [dependency maintenance](docs/dependency-updates.md) for compatibility limits and the repository settings adopters must recreate.
+
+See the [validation record](docs/validation.md) for the initial CI results and test scope.
 
 ## Credits and license
 

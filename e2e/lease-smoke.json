@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "setup": [],
+  "test": [
+    {
+      "id": "watchdog_info",
+      "endpoint": "watchdog",
+      "tool": "hub_get_info",
+      "arguments": {},
+      "assertions": [
+        {"path": "/firmwareVersion", "op": "type", "value": "string"}
+      ]
+    }
+  ],
+  "cleanup": []
+}

@@ -9,6 +9,7 @@ permissions:
 jobs:
   python-and-packaging:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -31,6 +32,7 @@ jobs:
           path: dist/
   groovy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +65,7 @@ jobs:
             ci/*/build/reports/
   reference-watchdog:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: reference/hubitat-local-mcp-server
@@ -84,6 +87,7 @@ jobs:
           path: reference/hubitat-local-mcp-server/build/reports/
   reference-infrastructure:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: reference/hubitat-local-mcp-server
@@ -101,3 +105,25 @@ jobs:
         run: |
           bash -n scripts/lease_acquire.sh
           bash -n scripts/lease_release.sh
+
+  toolkit-ci:
+    name: Toolkit CI required
+    if: always()
+    needs: [python-and-packaging, groovy, reference-watchdog, reference-infrastructure]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every offline lane to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          import os
+          results = json.loads(os.environ['RESULTS'])
+          failed = {name: job['result'] for name, job in results.items()
+                    if job['result'] != 'success'}
+          if failed:
+              raise SystemExit(f'Required lanes did not succeed: {failed}')
+          print('All offline lanes passed.')
+          PYCODE

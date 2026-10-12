@@ -1,0 +1,81 @@
+name: Test hub E2E
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Scenario on your configured test hub'
+        type: choice
+        options:
+          - lease-smoke
+          - deploy-readback
+        default: lease-smoke
+permissions:
+  contents: read
+  actions: read
+# One repository must own a shared hub. GitHub concurrency does not span repositories.
+concurrency:
+  group: hubitat-test-hub
+  cancel-in-progress: false
+jobs:
+  e2e:
+    # Never run arbitrary branches with test-hub secrets. Adopt PR testing using the
+    # reference's separate trusted orchestration, fork scanning and approval gates.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: test-hub
+    env:
+      WATCHDOG_URL: ${{ secrets.WATCHDOG_URL }}
+      TARGET_MCP_URL: ${{ secrets.TARGET_MCP_URL }}
+      APP_CODE_ID: ${{ vars.APP_CODE_ID }}
+      HUBITAT_TEST_HUB: ${{ vars.HUBITAT_TEST_HUB }}
+      GH_TOKEN: ${{ github.token }}
+      LEASE_WAIT_TIMEOUT_S: '120'
+      LEASE_UNREACHABLE_TIMEOUT_S: '60'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Validate configuration and mask endpoint tokens
+        run: |
+          python3 - <<'PY'
+          import os
+          from urllib.parse import parse_qs, urlsplit
+          for name in ('WATCHDOG_URL', 'TARGET_MCP_URL'):
+              value = os.environ.get(name, '')
+              if value:
+                  print('::add-mask::' + value.replace('\r', '%0D').replace('\n', '%0A'))
+                  for token in parse_qs(urlsplit(value).query).get('access_token', []):
+                      print('::add-mask::' + token.replace('\r', '%0D').replace('\n', '%0A'))
+          if os.environ.get('HUBITAT_TEST_HUB') != 'true':
+              raise SystemExit('Set test-hub environment variable HUBITAT_TEST_HUB=true.')
+          if not os.environ.get('WATCHDOG_URL'):
+              raise SystemExit('Set the test-hub WATCHDOG_URL secret.')
+          PY
+      - name: Validate the scenario before taking the lease
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+        run: python3 scripts/run_e2e.py --config "e2e/${SCENARIO}.json" --validate-only
+      - name: Acquire the hub lease
+        id: lease
+        # The preserved upstream scripts can print remote lease values. Keep their
+        # output out of public logs while preserving the acquisition exit status.
+        run: |
+          if bash scripts/lease_acquire.sh "ci-run-${GITHUB_RUN_ID}" >/dev/null 2>&1; then
+            echo 'Hub lease acquired.'
+          else
+            echo '::error::Lease acquisition failed. Check watchdog reachability and the lease Hub Variable.'
+            exit 1
+          fi
+      - name: Run configured scenario and cleanup
+        env:
+          SCENARIO: ${{ inputs.scenario }}
+        run: python3 scripts/run_e2e.py --config "e2e/${SCENARIO}.json"
+      - name: Release our lease
+        if: always() && steps.lease.outcome == 'success'
+        run: |
+          bash scripts/lease_release.sh "ci-run-${GITHUB_RUN_ID}" >/dev/null 2>&1
+          echo 'Lease release attempted. Unconfirmed releases remain bounded by the 30-minute TTL.'

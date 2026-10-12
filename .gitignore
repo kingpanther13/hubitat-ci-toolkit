@@ -12,3 +12,5 @@ dist/
 **/e2e_config.json
 *.local.json
 *-result.json
+# Opt-in MCP result files can contain private hub data.
+e2e-results/

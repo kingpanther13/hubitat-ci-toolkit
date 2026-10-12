@@ -1,5 +1,7 @@
 package apps
 
+import me.biocomp.hubitat_ci.api.Attribute
+import me.biocomp.hubitat_ci.api.common_api.DeviceWrapper
 import me.biocomp.hubitat_ci.api.app_api.AppExecutor
 import me.biocomp.hubitat_ci.app.HubitatAppSandbox
 import me.biocomp.hubitat_ci.app.HubitatAppScript
@@ -14,13 +16,15 @@ import support.TestDevice
 class ExampleAppSpec extends Specification {
     HubitatAppScript script
     final SubscriptionRecorder subscriptions = new SubscriptionRecorder()
-    final TestDevice sensor = new TestDevice(id: 1, label: 'Hall motion')
+    DeviceWrapper sensor
     final TestDevice lamp = new TestDevice(id: 2, label: 'Hall light')
-    final Map settings = [motionSensors: [sensor], targetSwitches: [lamp]]
+    final Map settings = [motionSensors: [], targetSwitches: [lamp]]
     final Map state = [:]
     int unsubscribes = 0
 
     def setup() {
+        sensor = motionSensor('1', 'Hall motion')
+        settings.motionSensors = [sensor]
         def api = Mock(AppExecutor) {
             getState() >> state
             getSettings() >> settings
@@ -47,6 +51,21 @@ class ExampleAppSpec extends Specification {
             }
         }
         script = sandbox.run(options)
+    }
+
+    private DeviceWrapper motionSensor(String id, String label) {
+        // Subscription validation runs before AppExecutor's recording stub. Model the actual
+        // platform input type so device, attribute, and handler validation remain enabled.
+        def motion = Stub(Attribute) {
+            getName() >> 'motion'
+            getDataType() >> 'ENUM'
+            getValues() >> ['active', 'inactive']
+        }
+        Stub(DeviceWrapper) {
+            getId() >> id
+            getLabel() >> label
+            getSupportedAttributes() >> [motion]
+        }
     }
 
     def 'install subscribes the selected sensor and active motion turns the selected switch on'() {
@@ -78,7 +97,7 @@ class ExampleAppSpec extends Specification {
     def 'update replaces old subscriptions and repeated updates do not duplicate handlers'() {
         given:
         script.installed()
-        def replacement = new TestDevice(id: 4)
+        def replacement = motionSensor('4', 'Replacement motion')
         settings.motionSensors = [replacement]
 
         when:

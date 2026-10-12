@@ -8,7 +8,7 @@ python3 tools/build_bundle.py
 python3 tools/build_bundle.py --manifest bundle.json --output dist/my-project.zip
 ```
 
-The builder writes `install.txt` and `update.txt` in the Hubitat bundle format demonstrated by the [original suite's fixture](../reference/hubitat-local-mcp-server/tests/fixtures/mcp-e2e-throwaway-bundle.zip). Their entries preserve the manifest order. Timestamps and permissions are fixed for reproducible ZIP bytes. Inputs are validated before replacing an existing artifact. Source files remain unchanged; Hubitat resolves `#include` using the bundled libraries.
+The builder writes `install.txt` and `update.txt` in the Hubitat bundle format demonstrated by the [original suite's fixture](../reference/hubitat-local-mcp-server/tests/fixtures/mcp-e2e-throwaway-bundle.zip). Their entries preserve the manifest order. Timestamps and permissions are fixed for reproducible ZIP bytes. Inputs are validated before replacing an existing artifact. A `LICENSE` file next to the manifest is included when present. Source files remain unchanged; Hubitat resolves `#include` using the bundled libraries.
 
 The **Toolkit CI** packaging job uploads the ZIP and checksum as a GitHub Actions artifact. Download it to import through **Developer Tools → Bundles**, or publish it at a stable HTTPS URL your hub can fetch, then use the standalone watchdog's `hub_install_bundle` tool. Actions artifact download URLs require GitHub authentication and are not suitable as direct hub import URLs.
 
