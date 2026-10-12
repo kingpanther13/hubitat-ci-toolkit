@@ -31,6 +31,7 @@ Java 17 runs the Gradle wrapper; the Groovy compatibility lanes also need Java 1
 
 ```sh
 ./gradlew test
+./gradlew watchdogTest
 ./gradlew -p ci/groovy2x-spock test
 ./gradlew -p ci/groovy24-parse parse24
 python3 -m unittest discover -s tests -v
@@ -39,6 +40,8 @@ python3 tools/build_bundle.py
 ```
 
 Change `apps/example-app.groovy`, `drivers/example-driver.groovy`, and the shared library to your project. Update `bundle.json` to declare your bundle and installation order. Follow [unit testing](docs/unit-testing.md) for harness setup and [packaging](docs/packaging.md) for distribution.
+
+The [watchdog unit-test guide](docs/watchdog-testing.md) describes the active v3.1 suite, compilation cache, isolation checks, and retained test inventory.
 
 Live testing is a separate, manually dispatched **Test hub E2E** workflow. Configure your own `test-hub` environment and watchdog endpoint using [the E2E guide](docs/e2e.md). The default smoke configuration only reads the watchdog; the deploy/readback example updates and restores a dedicated Apps Code class. No test hub, credentials, or shared hub access comes with this template.
 

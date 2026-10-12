@@ -43,3 +43,7 @@ The parse task first runs the copied checker fixture suite. It resolves `#includ
 The helpers and parse checker carry provenance comments linking them to the pinned MIT-licensed reference. `IncludeResolver` and the parse checker are compatible with Groovy 2.4 so all three lanes can share the same library expansion. The starter does not import the reference project's MCP-specific harness, child-app factories, request drivers, or tool schema validators. Platform helper stubs and the pass-through sandbox validator are available in that complete reference if your project needs them.
 
 Test results are written to `build/test-results/test/` and `build/reports/tests/test/`; the optional runtime lane writes the same paths under `ci/groovy2x-spock/build/`.
+
+## Watchdog v3.1
+
+Run `./gradlew watchdogTest` for the standalone watchdog. See [watchdog testing](watchdog-testing.md) for compilation caching, per-test isolation and the complete retained regression inventory. The `reference/` archive is historical material; its older watchdog apps are not selected by current CI.

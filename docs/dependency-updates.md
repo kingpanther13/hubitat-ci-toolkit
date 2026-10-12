@@ -37,7 +37,8 @@ These settings are outside the template files and must be recreated by adopters:
    pushes and branch deletion disabled. Do not give the bots a bypass of checks.
 
 The aggregate `Toolkit CI required` check rejects failed, cancelled or skipped
-Python/packaging, Groovy matrix, watchdog and infrastructure jobs.
+Python/packaging, Groovy matrix, active v3.1 watchdog and infrastructure jobs.
+The watchdog job checks all retained test cases and rejects skipped or older-version executions.
 `dependency-updates` validates the Renovate schema and performs read-only real
 lookups from current and deliberately stale fixtures. It verifies discovery of
 both forks, correct Groovy/Spock variants, immutable SHA updates and exclusion
