@@ -36,3 +36,27 @@ test {
     systemProperty 'hubitatCiFork', 'eighty20results'
     testLogging { events 'passed', 'skipped', 'failed'; exceptionFormat = 'full' }
 }
+
+// The active v3.1 suite has its own sources; archived watchdog versions are never compiled here.
+sourceSets {
+    watchdogTest {
+        compileClasspath += sourceSets.test.output
+        runtimeClasspath += sourceSets.test.output
+    }
+}
+configurations {
+    watchdogTestImplementation.extendsFrom testImplementation
+    watchdogTestRuntimeOnly.extendsFrom testRuntimeOnly
+}
+tasks.register('watchdogTest', Test) {
+    description = 'Run isolated, hub-free watchdog v3.1 regression tests.'
+    group = 'verification'
+    testClassesDirs = sourceSets.watchdogTest.output.classesDirs
+    classpath = sourceSets.watchdogTest.runtimeClasspath
+    useJUnitPlatform()
+    workingDir = rootDir
+    maxParallelForks = 1
+    maxHeapSize = '1g'
+    testLogging { events 'passed', 'skipped', 'failed'; exceptionFormat = 'full' }
+}
+tasks.named('check') { dependsOn tasks.named('watchdogTest') }
