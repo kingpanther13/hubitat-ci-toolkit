@@ -10,7 +10,7 @@ Scope: the reference snapshot's original app/library sources, CI workflows/build
 
 ## Gradle wrapper — Apache-2.0
 
-Scope: `gradlew`, `gradlew.bat`, `gradle/wrapper/gradle-wrapper.jar`, and the corresponding files in the reference snapshot. The scripts retain `Copyright © 2015 the original authors.` and their Apache-2.0 headers. The JAR contains `META-INF/LICENSE`. [licenses/Gradle-LICENSE.txt](licenses/Gradle-LICENSE.txt) supplies the complete Gradle license text, verified against [Gradle v9.8.0](https://github.com/gradle/gradle/blob/v9.8.0/LICENSE), the configured distribution version. The downloaded Gradle distribution has its own included notices; it is not bundled here beyond the wrapper.
+Scope: `gradlew`, `gradlew.bat`, `gradle/wrapper/gradle-wrapper.jar`, and the corresponding files in the reference snapshot. The scripts retain `Copyright © 2015 the original authors.` and their Apache-2.0 headers. The JAR contains `META-INF/LICENSE`. [licenses/Gradle-LICENSE.txt](licenses/Gradle-LICENSE.txt) supplies the complete Gradle license text, verified against [Gradle v9.8.0](https://github.com/gradle/gradle/blob/v9.8.0/LICENSE), the original extraction distribution version. The active wrapper may be updated independently; the reference wrapper remains pinned to that snapshot. The downloaded Gradle distribution has its own included notices; it is not bundled here beyond the wrapper.
 
 ## Vendored MCP JSON schemas
 

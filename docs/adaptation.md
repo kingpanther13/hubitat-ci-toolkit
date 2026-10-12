@@ -18,7 +18,7 @@ Local HubitatCI is a simulation, not the Hubitat firmware. Groovy 2.4 parsing ca
 
 Replace the app/driver filenames and `definition`/`metadata` identities in your project. In the upstream suite, `IncludeResolver`, `HarnessSpec`, `RuleHarnessSpec`, helper mocks, and the two additive builds assume the original root app files and `libraries/`. Decide which includes, mocks, production files, scaffold overrides, and specs apply to your project. Remove irrelevant original MCP assertions from your adopted corpus; changing names alone will not make those tests test your app.
 
-Keep the Gradle daemon/toolchain distinction: the preserved wrapper is Gradle 9.8.0, its daemon uses Java 17, and these Groovy builds target a Java 11 toolchain. Verify the selected Java/toolchain and dependency versions when intentionally upgrading. The original default harness uses eighty20results/hubitat_ci v0.28.6 with Groovy 3.0.25; its additive runtime lane uses joelwetzel/hubitat_ci `a62a351eed` with Groovy 2.5.23; the parse lane uses Groovy 2.4.21. Preserve the required framework-specific scaffold where you reuse those APIs.
+Keep the Gradle daemon/toolchain distinction: the archived wrapper is Gradle 9.8.0, the active wrapper is maintained by Renovate, the CI daemon uses Java 17, and these Groovy builds target a Java 11 toolchain. Verify the selected Java/toolchain and dependency versions when intentionally upgrading. The original default harness uses eighty20results/hubitat_ci v0.28.6 with Groovy 3.0.25; its additive runtime lane uses joelwetzel/hubitat_ci `a62a351eed` with Groovy 2.5.23; the parse lane uses Groovy 2.4.21. Preserve the required framework-specific scaffold where you reuse those APIs.
 
 ## Adapt GitHub Actions
 

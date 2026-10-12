@@ -12,14 +12,12 @@ for entry in manifest['files']:
     path = REFERENCE / entry['path']
     if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry['sha256']:
         errors.append(entry['path'])
+# The active Gradle wrapper evolves independently; its archived originals above
+# remain protected by provenance hashes. Other exact copies stay immutable.
 copies = {
     'watchdog/e2e-deadman-watchdog-v3-1.groovy': 'e2e-deadman-watchdog-v3-1.groovy',
     'scripts/lease_acquire.sh': '.github/scripts/lease_acquire.sh',
     'scripts/lease_release.sh': '.github/scripts/lease_release.sh',
-    'gradlew': 'gradlew',
-    'gradlew.bat': 'gradlew.bat',
-    'gradle/wrapper/gradle-wrapper.jar': 'gradle/wrapper/gradle-wrapper.jar',
-    'gradle/wrapper/gradle-wrapper.properties': 'gradle/wrapper/gradle-wrapper.properties',
     'LICENSE': 'LICENSE',
 }
 for dest, source in copies.items():
