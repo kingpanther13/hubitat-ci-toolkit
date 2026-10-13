@@ -19,7 +19,7 @@ dependencies {
     testImplementation 'org.quartz-scheduler:quartz:2.5.2'
     // 0.11.3 has a discontinuous Jackson version range Gradle cannot resolve.
     testImplementation 'su.litvak.chromecast:api-v2:0.11.1'
-    testImplementation 'net.bytebuddy:byte-buddy:1.18.14'
+    testImplementation 'net.bytebuddy:byte-buddy:1.18.15'
     constraints {
         testImplementation('commons-collections:commons-collections:3.2.2') {
             because 'Patched version of the test-only http-builder transitive dependency'
