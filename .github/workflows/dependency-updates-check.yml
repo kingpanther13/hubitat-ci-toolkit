@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      RENOVATE_VERSION: '44.175.5'
+      RENOVATE_VERSION: '44.176.2'
     steps:
       - uses: actions/checkout@v7
         with:
