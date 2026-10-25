@@ -44,7 +44,7 @@ lookups from current and deliberately stale fixtures. It verifies discovery of
 both forks, correct Groovy/Spock variants, immutable SHA updates and exclusion
 of archived manifests. It does not run Gradle or modify repository dependencies.
 
-The Dependabot workflow uses `pull_request_target` solely to enable auto-merge for
+The Dependabot workflow runs on `pull_request` solely to enable auto-merge for
 same-repository PRs authored by `dependabot[bot]`. It never checks out or executes
 PR code. Renovate uses its own app identity to merge. A changed PR head must pass
 checks again; neither bot receives an unconditional merge bypass.
