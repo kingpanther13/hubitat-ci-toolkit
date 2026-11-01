@@ -45,7 +45,7 @@ jobs:
           java-version: |
             11
             17
-      - uses: gradle/actions/setup-gradle@v6.4.0
+      - uses: gradle/actions/setup-gradle@v6.4.1
       - name: Primary Groovy 3 Spock tests
         if: matrix.lane == 'primary'
         run: ./gradlew test --no-daemon
@@ -74,7 +74,7 @@ jobs:
           java-version: |
             11
             17
-      - uses: gradle/actions/setup-gradle@v6.4.0
+      - uses: gradle/actions/setup-gradle@v6.4.1
       - name: Watchdog v3.1 regression suite
         run: ./gradlew watchdogTest --no-daemon
       - name: Require the complete v3.1 test inventory with zero skips
